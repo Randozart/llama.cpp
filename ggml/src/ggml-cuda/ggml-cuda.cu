@@ -2633,6 +2633,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src0_slice.view_src = dst->src[0]; // non-const pointer to src0
         src0_slice.data     = (char *) src0->data + i02*nb02;
 
+        if (vitriol_is_stream_enabled()) {
+            CUdeviceptr vram_ptr = vitriol_lru_ensure(
+                src0->data,              // tensor_base
+                (int)i02,                // expert_idx
+                (const void *)((char *) src0->data + i02*nb02),  // expert_data
+                (size_t)nb02,             // expert_size
+                stream                   // compute_stream
+            );
+            if (vram_ptr != 0) {
+                src0_slice.data = reinterpret_cast<char *>(vram_ptr);
+            }
+        }
+
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));
         src1_slice.buffer = src1->buffer;
