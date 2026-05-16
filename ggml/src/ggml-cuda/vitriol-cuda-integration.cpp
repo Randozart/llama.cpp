@@ -105,9 +105,13 @@ static bool lru_ensure_stream(void) {
     return true;
 }
 
-/* (Re-)initialize VRAM pool.  If already allocated and the new
- * min_expert_size exceeds the current slot, free and reallocate. */
+/* Initialize VRAM pool once.  Slot size is fixed at first allocation;
+ * if a later tensor has larger experts they bypass the cache (return 0
+ * → host RAM read).  This prevents pool thrashing from resizing. */
 static bool lru_init_pool(size_t min_expert_size) {
+    if (g_lru_pool != 0)
+        return true;
+
     const char* pool_env = getenv("VITRIOL_LRU_MB");
     size_t pool_size = VITRIOL_LRU_POOL_SIZE;
     if (pool_env) {
@@ -119,18 +123,6 @@ static bool lru_init_pool(size_t min_expert_size) {
     int    needed_slots = (int)(pool_size / needed_slot);
     if (needed_slots > VITRIOL_LRU_MAX_SLOTS) needed_slots = VITRIOL_LRU_MAX_SLOTS;
     if (needed_slots < 1) needed_slots = 1;
-
-    /* Already allocated with at least the needed slot size? */
-    if (g_lru_pool != 0 && needed_slot <= g_lru_slot_size)
-        return true;
-
-    /* Reallocate */
-    if (g_lru_pool != 0) {
-        cuMemFree(g_lru_pool);
-        g_lru_pool = 0;
-        g_lru_map.clear();
-        g_lru_order.clear();
-    }
 
     CUresult err = cuMemAlloc(&g_lru_pool, pool_size);
     if (err != CUDA_SUCCESS) {
@@ -168,7 +160,7 @@ CUdeviceptr vitriol_lru_ensure(
     if (!lru_init_pool(expert_size))
         return 0;
 
-    /* If expert doesn't fit even after realloc, skip cache. */
+    /* Expert doesn't fit in fixed-size slot → bypass cache, read from host. */
     if (expert_size > g_lru_slot_size)
         return 0;
 
