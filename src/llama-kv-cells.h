@@ -37,6 +37,7 @@ public:
             ext[i].reset();
             shift[i] =  0;
             seq[i].reset();
+            score[i] =  0.0f;
         }
 
         has_shift = false;
@@ -65,6 +66,7 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
+        score.resize(n);
 
         reset();
     }
@@ -130,6 +132,7 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+            res.score[j] = score[idx];
 
             assert(shift[idx] == 0);
         }
@@ -149,6 +152,7 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+            res.score[j] = score[idx];
 
             assert(shift[idx] == 0);
         }
@@ -229,6 +233,7 @@ public:
         pos[i] = -1;
         ext[i].reset();
         shift[i] = 0;
+        score[i] = 0.0f;
 
         used.erase(i);
     }
@@ -248,6 +253,7 @@ public:
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            score[i] = 0.0f;
 
             used.erase(i);
 
@@ -278,6 +284,7 @@ public:
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            score[i] = 0.0f;
 
             used.erase(i);
 
@@ -303,6 +310,20 @@ public:
         assert(seq_id >= 0);
 
         return seq[i].test(seq_id);
+    }
+
+    // VITRIOL attention score tracking for sparse KV caching
+    float score_get(uint32_t i) const {
+        assert(i < pos.size());
+        return score[i];
+    }
+    void score_set(uint32_t i, float s) {
+        assert(i < pos.size());
+        score[i] = s;
+    }
+    void score_add(uint32_t i, float s) {
+        assert(i < pos.size());
+        score[i] += s;
     }
 
     // note: call only if the cell is not empty and the seq_id is not in the cell
@@ -482,6 +503,9 @@ private:
     //   }
     //
     std::vector<llama_pos> shift;
+
+    // VITRIOL: cumulative attention score per cell for sparse KV eviction
+    std::vector<float> score;
 
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 

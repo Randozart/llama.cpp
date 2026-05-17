@@ -5,6 +5,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -207,9 +209,16 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
 
-            dev_name = ggml_backend_dev_name(dev);
+            // VITRIOL: check for KV cache offload mode (page-locked host RAM)
+            const char * vitriol_kv_mode = std::getenv("VITRIOL_KV_MODE");
+            if (vitriol_kv_mode && strcmp(vitriol_kv_mode, "offload") == 0) {
+                buft = ggml_backend_dev_host_buffer_type(dev);
+                dev_name = "VITRIOL-KV (host RAM)";
+            } else {
+                buft = ggml_backend_dev_buffer_type(dev);
+                dev_name = ggml_backend_dev_name(dev);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -750,7 +759,17 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     for (const auto & ubatch : ubatches) {
         // only find a suitable slot for the ubatch. don't modify the cells yet
-        const auto sinfo_new = find_slot(ubatch, false);
+        auto sinfo_new = find_slot(ubatch, false);
+        if (sinfo_new.empty()) {
+            // VITRIOL: try sparse eviction before giving up
+            const char * vitriol_kv_mode = std::getenv("VITRIOL_KV_MODE");
+            if (vitriol_kv_mode && strcmp(vitriol_kv_mode, "sparse") == 0) {
+                uint32_t n_evicted = evict_sparse(ubatch.n_tokens, 4);
+                if (n_evicted > 0) {
+                    sinfo_new = find_slot(ubatch, false);
+                }
+            }
+        }
         if (sinfo_new.empty()) {
             success = false;
             break;
@@ -872,6 +891,57 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     }
 
     return updated;
+}
+
+// VITRIOL: evict low-attention cells to free slots for new tokens
+// Uses position-based heuristic: always keep sinks (first n_sinks) and
+// recent window (last n_needed*2). Evict middle cells with lowest scores.
+uint32_t llama_kv_cache::evict_sparse(uint32_t n_needed, uint32_t n_sinks) {
+    uint32_t total = 0;
+
+    for (auto & cells : v_cells) {
+        if (cells.get_used() + n_needed <= cells.size()) {
+            continue; // enough free space in this stream
+        }
+
+        const uint32_t n_evict = cells.get_used() + n_needed - cells.size();
+        uint32_t evicted = 0;
+
+        // Build list of evictable cell indices (skip sinks, prefer low score)
+        std::vector<std::pair<float, uint32_t>> candidates;
+        uint32_t n_found = 0;
+
+        for (uint32_t i = n_sinks; i < cells.size() && evicted < n_evict; i++) {
+            if (cells.is_empty(i)) {
+                continue;
+            }
+            // Preserve the most recent n_needed*2 positions
+            if (cells.pos_get(i) >= cells.seq_pos_max(0) - (int32_t)(n_needed * 2)) {
+                continue;
+            }
+            candidates.push_back({cells.score_get(i), i});
+            n_found++;
+        }
+
+        if (candidates.empty()) {
+            continue;
+        }
+
+        // Sort by score ascending (evict lowest first)
+        std::sort(candidates.begin(), candidates.end(),
+            [](const auto & a, const auto & b) { return a.first < b.first; });
+
+        // Evict from lowest score
+        for (auto & [sc, idx] : candidates) {
+            if (evicted >= n_evict) break;
+            cells.rm(idx);
+            evicted++;
+        }
+
+        total += evicted;
+    }
+
+    return total;
 }
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {

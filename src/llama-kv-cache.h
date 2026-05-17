@@ -184,6 +184,11 @@ public:
     // return empty slot_info on failure
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
+    // VITRIOL: evict low-importance KV cells to make room (sparse mode)
+    // Preserves attention sinks (first N cells) and recent tokens.
+    // Returns number of cells evicted.
+    uint32_t evict_sparse(uint32_t n_needed, uint32_t n_sinks);
+
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
