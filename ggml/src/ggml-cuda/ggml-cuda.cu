@@ -2585,6 +2585,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
+    // ── Predictive Prefetch (before ids copy, overlapping with async DMA) ──
+    vitriol_predictor_prefetch(src0->data, (size_t)nb02, stream);
+
     std::vector<char> ids_host(ggml_nbytes(ids));
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -2685,6 +2688,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+
+    // ── Predictive Prefetch: record actual expert IDs for next layer ──
+    // Collect unique expert indices from the sorted loop above
+    int n_used_experts = 0;
+    int32_t used_experts[256];
+    for (int64_t i02 = 0; i02 < ne02 && n_used_experts < 256; ++i02) {
+        if (tokens_per_expert[i02] > 0) {
+            used_experts[n_used_experts++] = (int32_t)i02;
+        }
+    }
+    vitriol_predictor_update(src0->data, (size_t)nb02, used_experts, n_used_experts);
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
