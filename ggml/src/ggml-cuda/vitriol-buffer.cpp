@@ -22,6 +22,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <cuda_runtime.h>
 
 /* ── Buffer type interface ────────────────────────────────────── */
@@ -106,40 +107,89 @@ static const struct ggml_backend_buffer_i vitriol_buffer_interface = {
 /* ── Buffer type allocation ───────────────────────────────────── */
 
 static bool vitriol_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
-    return true;  // page-locked host RAM, GPU accesses via PCIe DMA
+    return true;  // page-locked host RAM (or disk offload with cudaHostRegister), GPU via DMA
 }
 
 static ggml_backend_buffer_t vitriol_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-    if (ptr == MAP_FAILED) {
-        fprintf(stderr, "VITRIOL: mmap(%zu) failed: %m\n", size);
-        return nullptr;
-    }
+    bool disk_offload = g_vitriol_config.disk_offload;
+    void * ptr = nullptr;
 
-    /* Touch each page to ensure it's backed by physical RAM */
-    {
-        volatile char * touch = (volatile char *)ptr;
-        for (size_t offset = 0; offset < size; offset += 4096) {
-            touch[offset] = 0;
+    if (disk_offload) {
+        const char * model_path = getenv("VITRIOL_MODEL_PATH");
+        if (!model_path || !*model_path) {
+            fprintf(stderr, "VITRIOL: disk offload requires VITRIOL_MODEL_PATH\n");
+            return nullptr;
         }
-    }
+        int fd = open(model_path, O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "VITRIOL: cannot open model %s: %m\n", model_path);
+            return nullptr;
+        }
+        off_t file_size = lseek(fd, 0, SEEK_END);
+        if (file_size < 0) {
+            fprintf(stderr, "VITRIOL: lseek failed: %m\n");
+            close(fd);
+            return nullptr;
+        }
+        if ((size_t)file_size < size) {
+            fprintf(stderr, "VITRIOL: file smaller (%lld) than requested (%zu)\n",
+                    (long long)file_size, size);
+            close(fd);
+            return nullptr;
+        }
+        ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_POPULATE, fd, 0);
+        close(fd);
+        if (ptr == MAP_FAILED) {
+            fprintf(stderr, "VITRIOL: file mmap(%zu) failed: %m\n", size);
+            return nullptr;
+        }
+        madvise(ptr, size, MADV_HUGEPAGE);
 
-    /* Hint: coalesce into transparent hugepages (2 MB) for lower TLB pressure */
-    madvise(ptr, size, MADV_HUGEPAGE);
+        /* cudaHostRegister pins pages for GPU DMA access.
+         * No mlock — pages can be evicted by OS if not accessed by GPU. */
+        cudaError_t err = cudaHostRegister(ptr, size, 0);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "VITRIOL: disk offload cudaHostRegister(%zu) failed: %s\n",
+                    size, cudaGetErrorString(err));
+            munmap(ptr, size);
+            return nullptr;
+        }
 
-    /* Pin in RAM — never swap */
-    if (mlock(ptr, size) != 0) {
-        fprintf(stderr, "VITRIOL: mlock(%zu) failed: %m — continuing without mlock (may cause swap stutter)\n", size);
-        // Continue without mlock — pages may be swapped but model still works
-    }
+        if (g_vitriol_config.verbose)
+            printf("VITRIOL: disk offload — file-backed mmap (%zu MiB)\n",
+                   size / 1024 / 1024);
+    } else {
+        ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        if (ptr == MAP_FAILED) {
+            fprintf(stderr, "VITRIOL: mmap(%zu) failed: %m\n", size);
+            return nullptr;
+        }
 
-    /* Register for GPU DMA access — makes it accessible from CUDA kernels */
-    cudaError_t err = cudaHostRegister(ptr, size, 0);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "VITRIOL: cudaHostRegister(%zu) failed: %s\n", size, cudaGetErrorString(err));
-        munmap(ptr, size);
-        return nullptr;
+        /* Touch each page to ensure it's backed by physical RAM */
+        {
+            volatile char * touch = (volatile char *)ptr;
+            for (size_t offset = 0; offset < size; offset += 4096) {
+                touch[offset] = 0;
+            }
+        }
+
+        /* Hint: coalesce into transparent hugepages (2 MB) for lower TLB pressure */
+        madvise(ptr, size, MADV_HUGEPAGE);
+
+        /* Pin in RAM — never swap */
+        if (mlock(ptr, size) != 0) {
+            fprintf(stderr, "VITRIOL: mlock(%zu) failed: %m — continuing without mlock (may cause swap stutter)\n", size);
+        }
+
+        /* Register for GPU DMA access — makes it accessible from CUDA kernels */
+        cudaError_t err = cudaHostRegister(ptr, size, 0);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "VITRIOL: cudaHostRegister(%zu) failed: %s\n", size, cudaGetErrorString(err));
+            munmap(ptr, size);
+            return nullptr;
+        }
     }
 
     auto * ctx = new vitriol_buffer_context{ptr, size};

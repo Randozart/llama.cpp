@@ -90,6 +90,10 @@ void vitriol_cuda_init(void) {
     if (pf_env && strcmp(pf_env, "1") == 0)
         g_vitriol_config.async_prefetch = true;
 
+    const char* disk_env = getenv("VITRIOL_DISK_OFFLOAD");
+    if (disk_env && strcmp(disk_env, "1") == 0)
+        g_vitriol_config.disk_offload = true;
+
     if (g_vitriol_config.mode == VITRIOL_MODE_STREAM) {
         if (g_vitriol_config.verbose)
             printf("VITRIOL: stream mode — page-locked host RAM + LRU VRAM cache\n");
@@ -98,6 +102,11 @@ void vitriol_cuda_init(void) {
     if (g_vitriol_config.async_prefetch) {
         if (g_vitriol_config.verbose)
             printf("VITRIOL: predictive prefetching enabled\n");
+    }
+
+    if (g_vitriol_config.disk_offload) {
+        if (g_vitriol_config.verbose)
+            printf("VITRIOL: disk offload mode — file-backed mmap, no page-lock\n");
     }
 
     memset(&g_lru_stats, 0, sizeof(g_lru_stats));

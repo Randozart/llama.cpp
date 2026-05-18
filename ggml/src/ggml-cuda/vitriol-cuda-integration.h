@@ -40,6 +40,7 @@ typedef struct {
     int buffer_count;
     bool verbose;
     bool benchmark;
+    bool disk_offload;
 } vitriol_config_t;
 
 extern vitriol_config_t g_vitriol_config;
