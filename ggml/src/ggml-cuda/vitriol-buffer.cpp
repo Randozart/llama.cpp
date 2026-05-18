@@ -111,10 +111,18 @@ static bool vitriol_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
 
 static ggml_backend_buffer_t vitriol_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     void * ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
     if (ptr == MAP_FAILED) {
         fprintf(stderr, "VITRIOL: mmap(%zu) failed: %m\n", size);
         return nullptr;
+    }
+
+    /* Touch each page to ensure it's backed by physical RAM */
+    {
+        volatile char * touch = (volatile char *)ptr;
+        for (size_t offset = 0; offset < size; offset += 4096) {
+            touch[offset] = 0;
+        }
     }
 
     /* Hint: coalesce into transparent hugepages (2 MB) for lower TLB pressure */
@@ -122,9 +130,8 @@ static ggml_backend_buffer_t vitriol_buffer_type_alloc_buffer(ggml_backend_buffe
 
     /* Pin in RAM — never swap */
     if (mlock(ptr, size) != 0) {
-        fprintf(stderr, "VITRIOL: mlock(%zu) failed: %m (try: sudo setcap cap_ipc_lock=+ep ./llama-server)\n", size);
-        munmap(ptr, size);
-        return nullptr;
+        fprintf(stderr, "VITRIOL: mlock(%zu) failed: %m — continuing without mlock (may cause swap stutter)\n", size);
+        // Continue without mlock — pages may be swapped but model still works
     }
 
     /* Register for GPU DMA access — makes it accessible from CUDA kernels */

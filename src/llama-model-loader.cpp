@@ -1191,19 +1191,23 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (!buft) {
             std::string tensor_name = tn.str();
             if (tensor_name.find("exps") != std::string::npos) {
-                // Use dlsym to find the VITRIOL expert buffer type at runtime
-                // (avoids link-time dependency on libggml-cuda)
+                LLAMA_LOG_INFO("VITRIOL: tensor '%s' matched 'exps' pattern\n", tensor_name.c_str());
                 typedef ggml_backend_buffer_type_t (*buft_getter_t)(void);
                 static buft_getter_t vitriol_getter = nullptr;
                 static bool looked_up = false;
                 if (!looked_up) {
                     looked_up = true;
-                    // Ensure libggml-cuda symbols are visible to dlsym
-                    // (turbo-tan fork statically links backends without RTLD_GLOBAL)
+                    LLAMA_LOG_INFO("VITRIOL: attempting dlopen libggml-cuda.so\n");
                     void * dl = dlopen("libggml-cuda.so", RTLD_NOW | RTLD_GLOBAL);
-                    LLAMA_LOG_DEBUG("VITRIOL: dlopen libggml-cuda.so = %p, dlerror = %s\n", dl, dlerror());
+                    LLAMA_LOG_INFO("VITRIOL: dlopen = %p, dlerror = %s\n", dl, dlerror());
+                    // Initialize VITRIOL config (reads VITRIOL_MODE env var)
+                    void (*init_fn)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "vitriol_cuda_init");
+                    if (init_fn) {
+                        init_fn();
+                        LLAMA_LOG_INFO("VITRIOL: vitriol_cuda_init called\n");
+                    }
                     void * sym = dlsym(RTLD_DEFAULT, "vitriol_get_expert_buffer_type");
-                    LLAMA_LOG_DEBUG("VITRIOL: dlsym vitriol_get_expert_buffer_type = %p\n", sym);
+                    LLAMA_LOG_INFO("VITRIOL: dlsym vitriol_get_expert_buffer_type = %p\n", sym);
                     if (sym) {
                         vitriol_getter = (buft_getter_t)sym;
                     }
