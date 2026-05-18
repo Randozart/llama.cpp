@@ -1198,7 +1198,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 static bool looked_up = false;
                 if (!looked_up) {
                     looked_up = true;
+                    // Ensure libggml-cuda symbols are visible to dlsym
+                    // (turbo-tan fork statically links backends without RTLD_GLOBAL)
+                    void * dl = dlopen("libggml-cuda.so", RTLD_NOW | RTLD_GLOBAL);
+                    LLAMA_LOG_DEBUG("VITRIOL: dlopen libggml-cuda.so = %p, dlerror = %s\n", dl, dlerror());
                     void * sym = dlsym(RTLD_DEFAULT, "vitriol_get_expert_buffer_type");
+                    LLAMA_LOG_DEBUG("VITRIOL: dlsym vitriol_get_expert_buffer_type = %p\n", sym);
                     if (sym) {
                         vitriol_getter = (buft_getter_t)sym;
                     }
