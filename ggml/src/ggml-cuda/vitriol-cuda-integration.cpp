@@ -27,7 +27,7 @@ static struct vitriol_config_init {
 /* ── LRU Cache ──────────────────────────────────────────────────── */
 
 #define VITRIOL_LRU_POOL_SIZE  (2048ULL * 1024 * 1024)  // default 2 GB VRAM pool (env VITRIOL_LRU_MB overrides)
-#define VITRIOL_LRU_MAX_SLOTS  1024
+#define VITRIOL_LRU_MAX_SLOTS  65536
 
 static CUdeviceptr g_lru_pool = 0;
 static size_t      g_lru_pool_size = 0;
@@ -109,13 +109,13 @@ void vitriol_cuda_init(void) {
             printf("VITRIOL: disk offload mode — file-backed mmap, no page-lock\n");
     }
 
-    memset(&g_lru_stats, 0, sizeof(g_lru_stats));
+    static bool first_init = true;
+    if (first_init) {
+        memset(&g_lru_stats, 0, sizeof(g_lru_stats));
+        first_init = false;
 
-    /* Register atexit handler for stats dump */
-    static bool atexit_registered = false;
-    if (!atexit_registered) {
+        /* Register atexit handler for stats dump */
         atexit(vitriol_cuda_print_stats);
-        atexit_registered = true;
     }
 }
 
