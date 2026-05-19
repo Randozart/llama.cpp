@@ -16,9 +16,9 @@ static struct vitriol_config_init {
     vitriol_config_init() {
         memset(&g_vitriol_config, 0, sizeof(g_vitriol_config));
         g_vitriol_config.mode = VITRIOL_MODE_DISABLED;
-        g_vitriol_config.prefetch_ahead = 1;
+        g_vitriol_config.prefetch_ahead = 2;
         g_vitriol_config.static_layers = 15;
-        g_vitriol_config.window_size_mb = 256;
+        g_vitriol_config.window_size_mb = 2048;
         g_vitriol_config.use_double_buffer = true;
         g_vitriol_config.buffer_count = 2;
     }
@@ -26,8 +26,8 @@ static struct vitriol_config_init {
 
 /* ── LRU Cache ──────────────────────────────────────────────────── */
 
-#define VITRIOL_LRU_POOL_SIZE  (512ULL * 1024 * 1024)  // 512 MB VRAM pool
-#define VITRIOL_LRU_MAX_SLOTS  128
+#define VITRIOL_LRU_POOL_SIZE  (2048ULL * 1024 * 1024)  // default 2 GB VRAM pool (env VITRIOL_LRU_MB overrides)
+#define VITRIOL_LRU_MAX_SLOTS  1024
 
 static CUdeviceptr g_lru_pool = 0;
 static size_t      g_lru_pool_size = 0;
@@ -101,7 +101,7 @@ void vitriol_cuda_init(void) {
 
     if (g_vitriol_config.async_prefetch) {
         if (g_vitriol_config.verbose)
-            printf("VITRIOL: predictive prefetching enabled\n");
+            printf("VITRIOL: predictive prefetching enabled (cross-layer + temporal)\n");
     }
 
     if (g_vitriol_config.disk_offload) {
@@ -110,15 +110,74 @@ void vitriol_cuda_init(void) {
     }
 
     memset(&g_lru_stats, 0, sizeof(g_lru_stats));
+
+    /* Register atexit handler for stats dump */
+    static bool atexit_registered = false;
+    if (!atexit_registered) {
+        atexit(vitriol_cuda_print_stats);
+        atexit_registered = true;
+    }
 }
 
-/* ── Predictive Prefetching ───────────────────────────────────────── */
-
-/* Buffer for predictor state: expert indices from previous call.
- * Mutex-protected since ggml_cuda_mul_mat_id may be called concurrently. */
+/* Fallback predictor state (used when per-layer tracking hasn't stabilized) */
 static std::mutex            g_pred_mtx;
-static int                   g_pred_experts[256]; // expert_idx per expert
-static int                    g_pred_count;        // number of stored indices
+static int                   g_pred_experts[256];
+static int                    g_pred_count;
+
+/* ── Temporal + Cross-Layer Tracking ─────────────────────────────────
+ * Per-layer expert selection history across tokens.
+ * Combined predictor: prefetch union of
+ *   (a) cross-layer:  cur[this_layer - 1]  (experts from previous layer, same token)
+ *   (b) temporal:     prev[this_layer]      (experts from same layer, previous token)
+ *
+ * Token boundary is detected when a previously-seen tensor_base reappears
+ * at an index lower than the highest index seen so far (i.e., sequential
+ * layer processing wraps back to layer 0).
+ */
+#define VITRIOL_MAX_LAYERS 128
+
+/* Map tensor_base address → sequential layer index (0, 1, 2, ...) */
+static uintptr_t g_layer_bases[VITRIOL_MAX_LAYERS];
+static int       g_n_layers = 0;   // total distinct layers seen
+static int       g_last_layer = -1; // last layer index seen
+
+/* Current token */
+static int  g_cur_exp[VITRIOL_MAX_LAYERS][256];
+static int  g_cur_cnt[VITRIOL_MAX_LAYERS];
+
+/* Previous token (boundary: wrap detected) */
+static int  g_prev_exp[VITRIOL_MAX_LAYERS][256];
+static int  g_prev_cnt[VITRIOL_MAX_LAYERS];
+
+/* ── Layer Index Map ──────────────────────────────────────────────── */
+
+/* Resolve tensor_base → sequential layer index (or -1 if at capacity).
+ * This is NOT a direct hardware-layer mapping — it's an ordinal index
+ * in order of first appearance (layer 0 → 0, layer 1 → 1, ...), which
+ * matches sequential layer execution in autoregressive decode. */
+static int get_layer_index(uintptr_t tensor_base) {
+    for (int i = 0; i < g_n_layers && i < VITRIOL_MAX_LAYERS; i++) {
+        if (g_layer_bases[i] == tensor_base) return i;
+    }
+    if (g_n_layers >= VITRIOL_MAX_LAYERS) return -1;
+    g_layer_bases[g_n_layers] = tensor_base;
+    return g_n_layers++;
+}
+
+/* Check for token boundary: when layer index wrapped back to an earlier
+ * value (e.g., 0 after 39), the current token's per-layer data becomes
+ * the "previous token" for the next call. */
+static void detect_token_boundary(int layer_idx) {
+    if (g_last_layer >= 0 && layer_idx <= g_last_layer) {
+        // Swap cur → prev for all layers
+        for (int i = 0; i < VITRIOL_MAX_LAYERS; i++) {
+            g_prev_cnt[i] = g_cur_cnt[i];
+            memcpy(g_prev_exp[i], g_cur_exp[i], g_cur_cnt[i] * sizeof(int));
+            g_cur_cnt[i] = 0;
+        }
+    }
+    g_last_layer = layer_idx;
+}
 
 void vitriol_predictor_prefetch(
     const void    *tensor_base,
@@ -131,22 +190,49 @@ void vitriol_predictor_prefetch(
     if (!lru_ensure_stream())
         return;
 
-    std::lock_guard<std::mutex> lock(g_pred_mtx);
-    if (g_pred_count == 0)
+    int layer_idx = get_layer_index((uintptr_t)tensor_base);
+    if (layer_idx < 0) return;
+
+    detect_token_boundary(layer_idx);
+
+    /* Collect predicted expert set (union of cross-layer + temporal) */
+    int predicted[256];
+    int n_predicted = 0;
+
+    auto add_prediction = [&](int e) {
+        if (e < 0) return;
+        for (int i = 0; i < n_predicted; i++)
+            if (predicted[i] == e) return;
+        predicted[n_predicted++] = e;
+    };
+
+    /* (a) Cross-layer: experts from the previous layer of current token */
+    if (layer_idx > 0) {
+        for (int i = 0; i < g_cur_cnt[layer_idx - 1]; i++)
+            add_prediction(g_cur_exp[layer_idx - 1][i]);
+    }
+
+    /* (b) Temporal: experts from the same layer of previous token */
+    for (int i = 0; i < g_prev_cnt[layer_idx]; i++)
+        add_prediction(g_prev_exp[layer_idx][i]);
+
+    if (n_predicted == 0)
         return;
 
-    // Compute live data pointers from current tensor_base + predicted expert idx
-    // This is correct because each layer's experts are at the same relative offset
-    // within their respective tensors (tensor_base + expert_idx * expert_size).
-    for (int i = 0; i < g_pred_count; i++) {
-        int e = g_pred_experts[i];
+    /* Also fall through to the old g_pred_experts from the last call
+     * (for pre-existing behavior on the very first few layers before
+     *  per-layer tracking builds up). */
+    {
+        std::lock_guard<std::mutex> lock(g_pred_mtx);
+        for (int i = 0; i < g_pred_count && n_predicted < 256; i++)
+            add_prediction(g_pred_experts[i]);
+    }
+
+    /* Submit async prefetches for the combined prediction set */
+    for (int i = 0; i < n_predicted; i++) {
+        int e = predicted[i];
         const void *expert_data = (const char *)tensor_base + (size_t)e * expert_size;
-        vitriol_lru_prefetch(
-            tensor_base,
-            e,
-            expert_data,
-            expert_size,
-            compute_stream);
+        vitriol_lru_prefetch(tensor_base, e, expert_data, expert_size, compute_stream);
     }
 }
 
@@ -162,23 +248,44 @@ void vitriol_predictor_update(
     if (!g_vitriol_config.async_prefetch)
         return;
 
-    std::lock_guard<std::mutex> lock(g_pred_mtx);
-    g_pred_count = 0;
-
-    if (!expert_ids || n_experts == 0)
+    int layer_idx = get_layer_index((uintptr_t)tensor_base);
+    if (layer_idx < 0) {
+        /* Fallback: store in old flat buffer */
+        std::lock_guard<std::mutex> lock(g_pred_mtx);
+        g_pred_count = 0;
+        for (int i = 0; i < n_experts; i++) {
+            int e = expert_ids[i];
+            if (e < 0) continue;
+            bool dup = false;
+            for (int j = 0; j < g_pred_count; j++)
+                if (g_pred_experts[j] == e) { dup = true; break; }
+            if (dup) continue;
+            g_pred_experts[g_pred_count++] = e;
+        }
         return;
+    }
 
-    // Store unique expert indices from the actual selection
-    for (int i = 0; i < n_experts; i++) {
+    detect_token_boundary(layer_idx);
+
+    /* Store current layer's expert indices (deduplicated) */
+    int count = 0;
+    for (int i = 0; i < n_experts && count < 256; i++) {
         int e = expert_ids[i];
         if (e < 0) continue;
-        // Deduplicate
         bool dup = false;
-        for (int j = 0; j < g_pred_count; j++) {
-            if (g_pred_experts[j] == e) { dup = true; break; }
-        }
+        for (int j = 0; j < count; j++)
+            if (g_cur_exp[layer_idx][j] == e) { dup = true; break; }
         if (dup) continue;
-        g_pred_experts[g_pred_count++] = e;
+        g_cur_exp[layer_idx][count++] = e;
+    }
+    g_cur_cnt[layer_idx] = count;
+
+    /* Also update the old flat buffer as a fallback predictor
+     * (used during the first pass before per-layer tracking stabilizes) */
+    {
+        std::lock_guard<std::mutex> lock(g_pred_mtx);
+        g_pred_count = count;
+        memcpy(g_pred_experts, g_cur_exp[layer_idx], count * sizeof(int));
     }
 }
 
@@ -321,6 +428,8 @@ ggml_backend_buffer_type_t vitriol_get_expert_buffer_type(void) {
 }
 
 void vitriol_cuda_print_stats(void) {
+    uint64_t total = g_lru_stats.hits + g_lru_stats.misses;
+    float hr = (total > 0) ? 100.0f * (float)g_lru_stats.hits / (float)total : 0.0f;
     printf("=== VITRIOL Statistics ===\n");
     printf("Mode: %d\n", g_vitriol_config.mode);
     printf("LRU Cache: pool=%llu MB, slots=%d, slot_size=%zu\n",
@@ -328,7 +437,9 @@ void vitriol_cuda_print_stats(void) {
            g_lru_num_slots, g_lru_slot_size);
     printf("LRU Hits: %llu\n", g_lru_stats.hits);
     printf("LRU Misses: %llu\n", g_lru_stats.misses);
+    printf("LRU Hit Rate: %.2f%%\n", hr);
     printf("LRU Evictions: %llu\n", g_lru_stats.evictions);
+    printf("Predictor: %s\n", g_vitriol_config.async_prefetch ? "cross-layer + temporal" : "none");
     printf("Strategy: RAM Shot + LRU VRAM cache\n");
     printf("===============================\n");
 }

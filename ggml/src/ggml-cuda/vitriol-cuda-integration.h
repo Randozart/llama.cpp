@@ -74,10 +74,16 @@ void vitriol_lru_prefetch(
     CUstream       compute_stream);
 
 /* ── Predictive Prefetching ──────────────────────────────────────────
- * Heuristic: MoE routing is layer-correlated.  Store the actual expert
- * IDs from one ggml_cuda_mul_mat_id call; before the next call, prefetch
- * those same experts via the LRU stream.  Hit rate is 60-70% for typical
- * MoE LLMs, and the async DMA overlaps with the ids device→host copy.
+ * Combined cross-layer + temporal prediction (Fate-style heuristic).
+ *
+ * Cross-layer: experts that fired in layer N are likely to fire again in
+ *              layer N+1 of the same token (~40-60% overlap).
+ * Temporal:    experts that fired at layer N of the previous token are
+ *              likely to fire at layer N of the current token (~50% overlap).
+ *
+ * Both are free — no training, no profiling, no offline data.
+ * Union of both predictions is prefetched into the LRU VRAM pool on a
+ * dedicated CUDA stream, async with GPU compute.
  *
  * Controlled by env VITRIOL_PREDICTIVE_PREFETCH=1.
  * ────────────────────────────────────────────────────────────────────*/
