@@ -41,6 +41,7 @@ typedef struct {
     bool verbose;
     bool benchmark;
     bool disk_offload;
+    bool output_cache;
 } vitriol_config_t;
 
 extern vitriol_config_t g_vitriol_config;
@@ -112,6 +113,51 @@ void vitriol_cuda_print_stats(void);
 
 __attribute__((visibility("default")))
 struct ggml_backend_buffer_type * vitriol_get_expert_buffer_type(void);
+
+/* ── Expert Output Cache (approximate) ──────────────────────────────
+ * During single-token generation, caches each expert's FFN output
+ * vector (n_embd floats) keyed by (tensor_base, expert_id).
+ *
+ * On the next token, if the same (layer, expert) is selected again,
+ * the cached output is reused instead of recomputing. This is
+ * APPROXIMATE — cached outputs are from a different token's input.
+ * However, consecutive tokens are often similar, so quality impact
+ * may be acceptable in practice.
+ *
+ * Controlled by env VITRIOL_OUTPUT_CACHE=1.
+ * ──────────────────────────────────────────────────────────────────*/
+
+/* Initialize the output cache. Allocates one ring buffer per layer. */
+void vitriol_output_cache_init(
+    int    n_layers,
+    size_t n_embd);
+
+/* Look up cached output for (tensor_base, expert_id).
+ * Returns pointer to cached float[n_embd] data, or NULL on miss. */
+const float * vitriol_output_cache_lookup(
+    const void *tensor_base,
+    int         expert_id);
+
+/* Store output for (tensor_base, expert_id) into the cache.
+ * output_data: float[n_embd] vector on the device (dst_slice.data). */
+void vitriol_output_cache_store(
+    const void *tensor_base,
+    int         expert_id,
+    const float *output_data,
+    size_t       n_embd,
+    CUstream     stream);
+
+/* Advance to next token: marks all cached entries as stale
+ * (first call stores per-layer expert masks; second call discards). */
+void vitriol_output_cache_advance_token(void);
+
+/* Returns true if output caching is enabled and initialized. */
+static inline bool vitriol_output_cache_active(void) {
+    return g_vitriol_config.output_cache;
+}
+
+/* Print output cache stats. */
+void vitriol_output_cache_print_stats(void);
 
 #ifdef __cplusplus
 }

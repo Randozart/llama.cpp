@@ -42,6 +42,8 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    int32_t n_expert_used_override = 0; // 0 = use model default
+
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 

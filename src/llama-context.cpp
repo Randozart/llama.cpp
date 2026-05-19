@@ -85,6 +85,17 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    // Read expert count override from env (VITRIOL_EXPERT_COUNT) or llama_context_params
+    {
+        const char * expert_env = getenv("VITRIOL_EXPERT_COUNT");
+        if (expert_env) {
+            int val = atoi(expert_env);
+            if (val >= 0 && val <= 256) {
+                cparams.n_expert_used_override = val;
+            }
+        }
+    }
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.

@@ -2536,25 +2536,34 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
-                    return;
+                    // Output cache requires the sorted path (per-expert loop with cache hooks)
+                    if (!vitriol_output_cache_active() || ne12 != 1) {
+                        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                        return;
+                    }
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
-                    return;
+                    if (!vitriol_output_cache_active() || ne12 != 1) {
+                        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                        return;
+                    }
                 }
             }
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
-            return;
+            if (!vitriol_output_cache_active() || ne12 != 1) {
+                ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+                return;
+            }
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-            ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
-            return;
+            if (!vitriol_output_cache_active() || ne12 != 1) {
+                ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+                return;
+            }
         }
     }
 
@@ -2624,6 +2633,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
+    const bool is_single_token = (ne12 == 1);
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
         if (tokens_per_expert[i02] == 0) {
             continue;
@@ -2677,8 +2687,29 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
         dst_slice.data   = dst_data_cur;
 
-        ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
-        CUDA_CHECK(cudaGetLastError());
+        // ── Output Cache Check (skip compute if output cached from previous token) ──
+        if (vitriol_output_cache_active() && is_single_token) {
+            const float * cached = vitriol_output_cache_lookup(src0->data, (int)i02);
+            if (cached) {
+                // D2D copy cached output to dst_slice location (skip matmul)
+                CUDA_CHECK(cudaMemcpyAsync(dst_data_cur, cached,
+                    (size_t)ne0 * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+                // But we still need to advance src1_data_cur past this expert's input.
+                // However, since we skip ggml_cuda_mul_mat, we don't consume src1.
+                // Advance pointers below handles src1_data_cur.
+            } else {
+                ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+                CUDA_CHECK(cudaGetLastError());
+                vitriol_output_cache_store(
+                    src0->data, (int)i02,
+                    (const float *)dst_data_cur,
+                    (size_t)ne0,
+                    stream);
+            }
+        } else {
+            ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+            CUDA_CHECK(cudaGetLastError());
+        }
 
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];

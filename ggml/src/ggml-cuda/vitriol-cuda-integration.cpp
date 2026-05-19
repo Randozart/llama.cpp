@@ -64,6 +64,154 @@ static struct LRUStats {
     unsigned long long evictions;
 } g_lru_stats;
 
+/* ── Expert Output Cache (approximate) ───────────────────────────── */
+
+#define VITRIOL_MAX_CACHE_EXPERTS_PER_LAYER 256
+#define VITRIOL_MAX_CACHE_LAYERS            128
+
+static struct {
+    uintptr_t tensor_base;
+    int       expert_id;
+    float    *data_dev;   // GPU buffer, n_embd floats
+    bool      valid;
+} g_output_cache[VITRIOL_MAX_CACHE_LAYERS][VITRIOL_MAX_CACHE_EXPERTS_PER_LAYER];
+
+static bool   g_output_cache_initialized = false;
+static size_t g_output_cache_n_embd      = 0;
+static int    g_output_cache_n_layers    = 0;
+static CUdeviceptr g_output_cache_pool   = 0;
+static size_t g_output_cache_pool_size   = 0;
+
+static struct {
+    unsigned long long hits;
+    unsigned long long misses;
+} g_output_cache_stats;
+
+void vitriol_output_cache_init(int n_layers, size_t n_embd) {
+    if (g_output_cache_initialized) return;
+
+    if (n_layers > VITRIOL_MAX_CACHE_LAYERS) n_layers = VITRIOL_MAX_CACHE_LAYERS;
+
+    // Allocate a single VRAM pool: n_layers * n_experts * n_embd * sizeof(float)
+    size_t entry_size = n_embd * sizeof(float);
+    size_t pool_size  = (size_t)n_layers * VITRIOL_MAX_CACHE_EXPERTS_PER_LAYER * entry_size;
+
+    CUresult err = cuMemAlloc(&g_output_cache_pool, pool_size);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "VITRIOL: output cache pool alloc %zu MB failed (%d)\n",
+                pool_size / 1024 / 1024, (int)err);
+        return;
+    }
+
+    // Initialize all entries
+    memset(g_output_cache, 0, sizeof(g_output_cache));
+
+    g_output_cache_pool_size = pool_size;
+    g_output_cache_n_embd    = n_embd;
+    g_output_cache_n_layers  = n_layers;
+    g_output_cache_initialized = true;
+
+    // Assign device pointers within the pool
+    for (int l = 0; l < n_layers; l++) {
+        for (int e = 0; e < VITRIOL_MAX_CACHE_EXPERTS_PER_LAYER; e++) {
+            g_output_cache[l][e].data_dev = (float *)(g_output_cache_pool +
+                (size_t)l * VITRIOL_MAX_CACHE_EXPERTS_PER_LAYER * entry_size +
+                (size_t)e * entry_size);
+        }
+    }
+
+    if (g_vitriol_config.verbose)
+        printf("VITRIOL: output cache initialized: %d layers x %d experts x %zu bytes = %zu MB\n",
+               n_layers, VITRIOL_MAX_CACHE_EXPERTS_PER_LAYER, entry_size,
+               pool_size / 1024 / 1024);
+}
+
+// Forward declarations
+static int get_layer_index(uintptr_t tensor_base);
+static void detect_token_boundary(int layer_idx);
+
+const float * vitriol_output_cache_lookup(
+    const void *tensor_base,
+    int         expert_id)
+{
+    if (!g_output_cache_initialized) return NULL;
+
+    // Find layer index using existing predictor infrastructure
+    int layer_idx = get_layer_index((uintptr_t)tensor_base);
+    if (layer_idx < 0 || layer_idx >= g_output_cache_n_layers) return NULL;
+
+    auto & entry = g_output_cache[layer_idx][expert_id];
+    if (entry.valid &&
+        entry.tensor_base == (uintptr_t)tensor_base &&
+        entry.expert_id == expert_id) {
+        g_output_cache_stats.hits++;
+        return entry.data_dev;
+    }
+
+    g_output_cache_stats.misses++;
+    return NULL;
+}
+
+void vitriol_output_cache_store(
+    const void    *tensor_base,
+    int            expert_id,
+    const float   *output_data,
+    size_t         n_embd,
+    CUstream       stream)
+{
+    if (!g_output_cache_initialized) {
+        // Lazy init: assume up to 128 layers, infer n_embd from data
+        vitriol_output_cache_init(128, n_embd);
+        if (!g_output_cache_initialized) return;
+    }
+
+    int layer_idx = get_layer_index((uintptr_t)tensor_base);
+    if (layer_idx < 0 || layer_idx >= g_output_cache_n_layers) return;
+
+    if (n_embd != g_output_cache_n_embd) return;
+
+    auto & entry = g_output_cache[layer_idx][expert_id];
+    entry.tensor_base = (uintptr_t)tensor_base;
+    entry.expert_id   = expert_id;
+    entry.valid       = true;
+
+    // D2D copy from compute buffer to cache slot
+    size_t copy_size = n_embd * sizeof(float);
+    CUresult r = cuMemcpyDtoDAsync(
+        (CUdeviceptr)entry.data_dev,
+        (CUdeviceptr)output_data,
+        copy_size,
+        stream);
+    if (r != CUDA_SUCCESS) {
+        entry.valid = false;
+    }
+}
+
+void vitriol_output_cache_advance_token(void) {
+    if (!g_output_cache_initialized) return;
+
+    // On token boundary, invalidate ALL entries from the previous token
+    // because outputs are token-dependent
+    for (int l = 0; l < g_output_cache_n_layers; l++) {
+        for (int e = 0; e < VITRIOL_MAX_CACHE_EXPERTS_PER_LAYER; e++) {
+            g_output_cache[l][e].valid = false;
+        }
+    }
+}
+
+void vitriol_output_cache_print_stats(void) {
+    uint64_t total = g_output_cache_stats.hits + g_output_cache_stats.misses;
+    float hr = (total > 0) ? 100.0f * (float)g_output_cache_stats.hits / (float)total : 0.0f;
+    printf("=== VITRIOL Output Cache ===\n");
+    printf("Enabled: %s\n", g_vitriol_config.output_cache ? "yes" : "no");
+    printf("Initialized: %s\n", g_output_cache_initialized ? "yes" : "no");
+    printf("Layers: %d, n_embd: %zu\n", g_output_cache_n_layers, g_output_cache_n_embd);
+    printf("Hits: %llu\n", g_output_cache_stats.hits);
+    printf("Misses: %llu\n", g_output_cache_stats.misses);
+    printf("Hit Rate: %.2f%%\n", hr);
+    printf("==============================\n");
+}
+
 static bool lru_init_pool(size_t min_expert_size);
 static bool lru_ensure_stream(void);
 
@@ -93,6 +241,10 @@ void vitriol_cuda_init(void) {
     const char* disk_env = getenv("VITRIOL_DISK_OFFLOAD");
     if (disk_env && strcmp(disk_env, "1") == 0)
         g_vitriol_config.disk_offload = true;
+
+    const char* oc_env = getenv("VITRIOL_OUTPUT_CACHE");
+    if (oc_env && strcmp(oc_env, "1") == 0)
+        g_vitriol_config.output_cache = true;
 
     if (g_vitriol_config.mode == VITRIOL_MODE_STREAM) {
         if (g_vitriol_config.verbose)
@@ -440,6 +592,14 @@ void vitriol_cuda_print_stats(void) {
     printf("LRU Hit Rate: %.2f%%\n", hr);
     printf("LRU Evictions: %llu\n", g_lru_stats.evictions);
     printf("Predictor: %s\n", g_vitriol_config.async_prefetch ? "cross-layer + temporal" : "none");
+    printf("Output Cache: %s\n", g_vitriol_config.output_cache ? "enabled (approximate)" : "none");
+    if (g_vitriol_config.output_cache) {
+        uint64_t oc_total = g_output_cache_stats.hits + g_output_cache_stats.misses;
+        float oc_hr = (oc_total > 0) ? 100.0f * (float)g_output_cache_stats.hits / (float)oc_total : 0.0f;
+        printf("Output Cache Hits: %llu\n", g_output_cache_stats.hits);
+        printf("Output Cache Misses: %llu\n", g_output_cache_stats.misses);
+        printf("Output Cache Hit Rate: %.2f%%\n", oc_hr);
+    }
     printf("Strategy: RAM Shot + LRU VRAM cache\n");
     printf("===============================\n");
 }
