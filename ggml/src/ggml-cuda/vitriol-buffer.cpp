@@ -48,14 +48,52 @@ struct vitriol_buffer_context {
     size_t size;
 };
 
+/* ── Atexit cleanup guard ──────────────────────────────────────── */
+/* If the process exits without vitriol_buffer_free being called
+ * (e.g., SIGTERM during model load, or exit() before ggml teardown),
+ * this handler ensures cudaHostUnregister + munlock + munmap still run.
+ * This prevents the NVIDIA driver from retaining DMA mappings that
+ * would hang the system on shutdown and trigger fsck on next boot. */
+
+static vitriol_buffer_context * g_pending_cleanup = nullptr;
+static std::mutex              g_cleanup_mtx;
+
+static void vitriol_buffer_atexit_cleanup(void) {
+    std::lock_guard<std::mutex> lock(g_cleanup_mtx);
+    if (g_pending_cleanup && g_pending_cleanup->base) {
+        fprintf(stderr, "VITRIOL: atexit cleanup — releasing DMA mappings\n");
+        cudaError_t err = cudaHostUnregister(g_pending_cleanup->base);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "VITRIOL: atexit cudaHostUnregister failed: %s\n", cudaGetErrorString(err));
+        }
+        if (munlock(g_pending_cleanup->base, g_pending_cleanup->size) != 0) {
+            fprintf(stderr, "VITRIOL: atexit munlock failed\n");
+        }
+        munmap(g_pending_cleanup->base, g_pending_cleanup->size);
+        g_pending_cleanup->base = nullptr;
+        fprintf(stderr, "VITRIOL: Memory locks released. Safe to shutdown.\n");
+    }
+}
+
 static void vitriol_buffer_free(ggml_backend_buffer_t buffer) {
     auto * ctx = (vitriol_buffer_context *)buffer->context;
     if (ctx->base && ctx->size) {
+        /* Clear the atexit guard so it doesn't double-free */
+        {
+            std::lock_guard<std::mutex> lock(g_cleanup_mtx);
+            if (g_pending_cleanup == ctx) {
+                g_pending_cleanup = nullptr;
+            }
+        }
         cudaError_t err = cudaHostUnregister(ctx->base);
         if (err != cudaSuccess) {
             fprintf(stderr, "VITRIOL: cudaHostUnregister failed: %s\n", cudaGetErrorString(err));
         }
+        if (munlock(ctx->base, ctx->size) != 0) {
+            fprintf(stderr, "VITRIOL: munlock failed\n");
+        }
         munmap(ctx->base, ctx->size);
+        fprintf(stderr, "VITRIOL: Memory locks released. Safe to shutdown.\n");
     }
     delete ctx;
 }
@@ -193,6 +231,14 @@ static ggml_backend_buffer_t vitriol_buffer_type_alloc_buffer(ggml_backend_buffe
     }
 
     auto * ctx = new vitriol_buffer_context{ptr, size};
+
+    /* Register atexit cleanup guard (first allocation only) */
+    {
+        static std::once_flag flag;
+        std::call_once(flag, [] { atexit(vitriol_buffer_atexit_cleanup); });
+    }
+    g_pending_cleanup = ctx;
+
     return ggml_backend_buffer_init(buft, vitriol_buffer_interface, ctx, size);
 }
 

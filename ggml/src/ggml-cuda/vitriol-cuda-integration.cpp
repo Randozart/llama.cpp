@@ -217,6 +217,8 @@ static bool lru_ensure_stream(void);
 
 /* ── Initialization ──────────────────────────────────────────────── */
 
+static void vitriol_cuda_cleanup_vram(void);
+
 void vitriol_cuda_init(void) {
     const char* mode_env = getenv("VITRIOL_MODE");
     if (mode_env) {
@@ -266,7 +268,8 @@ void vitriol_cuda_init(void) {
         memset(&g_lru_stats, 0, sizeof(g_lru_stats));
         first_init = false;
 
-        /* Register atexit handler for stats dump */
+        /* Register atexit handlers */
+        atexit(vitriol_cuda_cleanup_vram);
         atexit(vitriol_cuda_print_stats);
     }
 }
@@ -577,6 +580,23 @@ ggml_backend_buffer_type_t vitriol_get_expert_buffer_type(void) {
     if (g_vitriol_config.mode != VITRIOL_MODE_STREAM)
         return NULL;
     return vitriol_get_buffer_type(0);
+}
+
+void vitriol_cuda_cleanup_vram(void) {
+    if (g_lru_pool != 0) {
+        CUresult r = cuMemFree(g_lru_pool);
+        if (r != CUDA_SUCCESS) {
+            fprintf(stderr, "VITRIOL: cuMemFree(LRU pool) failed: %d\n", (int)r);
+        }
+        g_lru_pool = 0;
+    }
+    if (g_output_cache_pool != 0) {
+        CUresult r = cuMemFree(g_output_cache_pool);
+        if (r != CUDA_SUCCESS) {
+            fprintf(stderr, "VITRIOL: cuMemFree(output cache pool) failed: %d\n", (int)r);
+        }
+        g_output_cache_pool = 0;
+    }
 }
 
 void vitriol_cuda_print_stats(void) {
