@@ -570,6 +570,9 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // Early exit: build only the first N layers (0 = build all)
+    int32_t n_build_layers = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -632,7 +635,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            n_build_layers == other.n_build_layers;
     }
 };
 
@@ -686,6 +690,10 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
 
     std::vector<llm_graph_input_ptr> inputs;
+
+    // VITRIOL Early Exit: per-layer residual delta tensors
+    std::vector<ggml_tensor *> ee_delta;      // ||layer_out - layer_in||²
+    std::vector<ggml_tensor *> ee_delta_norm; // ||layer_in||²
 
     ggml_context_ptr ctx_compute;
 

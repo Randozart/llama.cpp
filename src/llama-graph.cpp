@@ -817,6 +817,9 @@ void llm_graph_result::reset() {
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
+    ee_delta.clear();
+    ee_delta_norm.clear();
+
     ggml_init_params params = {
         /*.mem_size   =*/ buf_compute_meta.size(),
         /*.mem_buffer =*/ buf_compute_meta.data(),
@@ -917,7 +920,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cparams          (params.cparams),
     ubatch           (params.ubatch),
     n_embd           (hparams.n_embd),
-    n_layer          (hparams.n_layer),
+    n_layer          (params.n_build_layers > 0 ? (uint32_t)std::min((int32_t)hparams.n_layer, params.n_build_layers) : hparams.n_layer),
     n_rot            (hparams.n_rot()),
     n_ctx            (cparams.n_ctx),
     n_head           (hparams.n_head()),

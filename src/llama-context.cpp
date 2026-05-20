@@ -1348,6 +1348,59 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // ── VITRIOL Early Exit Detection ──
+    {
+        const char * ee_act = getenv("VITRIOL_EARLY_EXIT");
+        if (ee_act && ee_act[0] == '1' && !cparams.warmup && n_build_layers == 0 && !res->ee_delta.empty()) {
+            const int n_layers = (int)res->ee_delta.size();
+            float threshold = 0.001f;
+            const char * ee_th = getenv("VITRIOL_EARLY_EXIT_THRESHOLD");
+            if (ee_th) threshold = atof(ee_th);
+            int stagnation_req = 3;
+            const char * ee_st = getenv("VITRIOL_EARLY_EXIT_STAGNATION");
+            if (ee_st) stagnation_req = atoi(ee_st);
+            int min_layers = 10;
+            const char * ee_ml = getenv("VITRIOL_EARLY_EXIT_MIN_LAYERS");
+            if (ee_ml) min_layers = atoi(ee_ml);
+            LLAMA_LOG_INFO("VITRIOL: EE check — %d layers, threshold=%.4f, stagnation=%d, min_layers=%d\n",
+                    n_layers, threshold, stagnation_req, min_layers);
+            layer_deltas.resize(n_layers);
+
+            int stagnation = 0;
+            int exit_layer = n_layers;
+            for (int il = 0; il < n_layers; il++) {
+                if (!res->ee_delta[il] || !res->ee_delta_norm[il]) {
+                    layer_deltas[il] = 0.0f;
+                    continue;
+                }
+                float delta_sum = 0.0f, norm_sum = 0.0f;
+                ggml_backend_tensor_get(res->ee_delta[il], &delta_sum, 0, sizeof(float));
+                ggml_backend_tensor_get(res->ee_delta_norm[il], &norm_sum, 0, sizeof(float));
+                layer_deltas[il] = (norm_sum > 1e-8f) ? delta_sum / norm_sum : 0.0f;
+
+                if (layer_deltas[il] < threshold && il >= min_layers) {
+                    stagnation++;
+                    if (stagnation >= stagnation_req) {
+                        exit_layer = il - stagnation_req + 1;
+                        break;
+                    }
+                } else {
+                    stagnation = 0;
+                }
+            }
+
+            if (exit_layer < n_layers) {
+                n_build_layers = exit_layer + 1;
+                LLAMA_LOG_INFO("VITRIOL: early exit at layer %d (delta < %.4f for %d layers, min %d)\n",
+                               exit_layer, threshold, stagnation_req, min_layers);
+            } else {
+                LLAMA_LOG_INFO("VITRIOL: early exit disabled — no stagnation detected\n");
+                n_build_layers = (int32_t)n_layers; // always rebuild full graph
+            }
+        }
+    }
+    // ────────────────────────────────
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2328,6 +2381,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.n_build_layers =*/ n_build_layers,
     };
 }
 

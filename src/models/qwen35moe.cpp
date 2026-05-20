@@ -198,6 +198,31 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        // ── VITRIOL Early Exit: residual delta detection ──
+        ggml_tensor * ee_delta = nullptr;
+        ggml_tensor * ee_delta_norm = nullptr;
+        const char * ee_act = getenv("VITRIOL_EARLY_EXIT");
+        if (ee_act && ee_act[0] == '1') {
+            if (ggml_are_same_shape(cur, inpL)) {
+                ggml_tensor * diff = ggml_sub(ctx0, cur, inpL);
+                ggml_tensor * diff_sq = ggml_sqr(ctx0, diff);
+                ee_delta       = ggml_sum_rows(ctx0, diff_sq);
+                ggml_tensor * inp_sq = ggml_sqr(ctx0, inpL);
+                ee_delta_norm  = ggml_sum_rows(ctx0, inp_sq);
+                ggml_set_output(ee_delta);
+                ggml_set_output(ee_delta_norm);
+                ggml_build_forward_expand(gf, ee_delta);
+                ggml_build_forward_expand(gf, ee_delta_norm);
+                res->ee_delta.push_back(ee_delta);
+                res->ee_delta_norm.push_back(ee_delta_norm);
+            } else {
+                // Shapes don't match (e.g., warmup or last-layer filtering)
+                res->ee_delta.push_back(nullptr);
+                res->ee_delta_norm.push_back(nullptr);
+            }
+        }
+        // ─────────────────────────────────────────────────
+
         // Input for next layer
         inpL = cur;
     }

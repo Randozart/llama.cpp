@@ -280,6 +280,13 @@ private:
 
     llama_cparams cparams;
 
+    // Early exit: number of layers to build (0 = all, otherwise first N)
+    int32_t n_build_layers = 0;
+    // Per-layer residual delta norms (filled after graph compute)
+    std::vector<float> layer_deltas;
+    // Early exit: exit after this layer once detected (0 = not yet)
+    int32_t early_exit_layer = 0;
+
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 
