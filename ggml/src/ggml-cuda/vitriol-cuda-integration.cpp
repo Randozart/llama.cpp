@@ -516,6 +516,8 @@ CUdeviceptr vitriol_lru_ensure(
 
     LRUKey key = { (uintptr_t)tensor_base, expert_idx };
 
+    CUstream cstream = compute_stream;
+
     /* Check cache */
     {
         std::lock_guard<std::mutex> lock(g_lru_mtx);
@@ -524,6 +526,8 @@ CUdeviceptr vitriol_lru_ensure(
             g_lru_order.remove(key);
             g_lru_order.push_front(key);
             g_lru_stats.hits++;
+            /* Wait for any in-flight prefetch DMA on the LRU stream */
+            cuStreamWaitEvent(cstream, g_lru_event, 0);
             return g_lru_pool + (size_t)it->second * g_lru_slot_size;
         }
     }
@@ -558,10 +562,63 @@ CUdeviceptr vitriol_lru_ensure(
     r = cuEventRecord(g_lru_event, g_lru_stream);
     if (r != CUDA_SUCCESS) return 0;
 
-    r = cuStreamWaitEvent(compute_stream, g_lru_event, 0);
+    r = cuStreamWaitEvent(cstream, g_lru_event, 0);
     if (r != CUDA_SUCCESS) return 0;
 
     return dst;
+}
+
+static void vitriol_lru_prefetch_async(
+    const void    *tensor_base,
+    int            expert_idx,
+    const void    *expert_data,
+    size_t         expert_size)
+{
+    /* Fire-and-forget: submit DMA on LRU stream but do NOT block
+     * any compute stream.  The per-expert loop's vitriol_lru_ensure
+     * will wait on the event when it actually needs the data. */
+    if (!expert_data || expert_size == 0 || !tensor_base)
+        return;
+    if (!lru_ensure_stream())
+        return;
+    if (!lru_init_pool(expert_size))
+        return;
+    if (expert_size > g_lru_slot_size)
+        return;
+
+    LRUKey key = { (uintptr_t)tensor_base, expert_idx };
+
+    /* Check cache — if already present, DMA was already submitted */
+    {
+        std::lock_guard<std::mutex> lock(g_lru_mtx);
+        if (g_lru_map.find(key) != g_lru_map.end())
+            return;
+    }
+
+    /* Allocate or evict slot */
+    int slot;
+    {
+        std::lock_guard<std::mutex> lock(g_lru_mtx);
+        if ((int)g_lru_map.size() < g_lru_num_slots) {
+            slot = (int)g_lru_map.size();
+        } else {
+            LRUKey evict = g_lru_order.back();
+            g_lru_order.pop_back();
+            auto eit = g_lru_map.find(evict);
+            slot = (eit != g_lru_map.end()) ? eit->second : 0;
+            if (eit != g_lru_map.end()) g_lru_map.erase(eit);
+            g_lru_stats.evictions++;
+        }
+        g_lru_map[key] = slot;
+        g_lru_order.push_front(key);
+    }
+
+    CUdeviceptr dst = g_lru_pool + (size_t)slot * g_lru_slot_size;
+
+    /* Async DMA — no cuStreamWaitEvent, compute stream NOT blocked */
+    CUresult r = cuMemcpyHtoDAsync(dst, expert_data, expert_size, g_lru_stream);
+    if (r != CUDA_SUCCESS) return;
+    cuEventRecord(g_lru_event, g_lru_stream);
 }
 
 void vitriol_lru_prefetch(
@@ -571,9 +628,8 @@ void vitriol_lru_prefetch(
     size_t         expert_size,
     CUstream       compute_stream)
 {
-    /* Fire-and-forget: load into LRU but don't wait on compute_stream.
-     * If already cached this is a no-op (the lookup/promotion still happens). */
-    vitriol_lru_ensure(tensor_base, expert_idx, expert_data, expert_size, compute_stream);
+    (void)compute_stream;
+    vitriol_lru_prefetch_async(tensor_base, expert_idx, expert_data, expert_size);
 }
 
 ggml_backend_buffer_type_t vitriol_get_expert_buffer_type(void) {
