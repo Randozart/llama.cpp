@@ -21,6 +21,7 @@ static struct vitriol_config_init {
         g_vitriol_config.window_size_mb = 2048;
         g_vitriol_config.use_double_buffer = true;
         g_vitriol_config.buffer_count = 2;
+        g_vitriol_config.pin_tensors_per_layer = 2;
     }
 } s_vitriol_config_init;
 
@@ -63,6 +64,14 @@ static struct LRUStats {
     unsigned long long misses;
     unsigned long long evictions;
 } g_lru_stats;
+
+/* ── Expert Pinning Table ──────────────────────────────────────────
+ * Maps tensor_base address → deduplicated pinned VRAM buffer.
+ * Each entry covers ALL experts of that tensor (contiguous, entire tensor). */
+static std::unordered_map<uintptr_t, CUdeviceptr> g_pin_map;
+static std::mutex          g_pin_mtx;
+static size_t              g_pinned_bytes = 0;
+static bool                g_pin_init_done = false;
 
 /* ── Expert Output Cache (approximate) ───────────────────────────── */
 
@@ -248,6 +257,12 @@ void vitriol_cuda_init(void) {
     if (oc_env && strcmp(oc_env, "1") == 0)
         g_vitriol_config.output_cache = true;
 
+    const char* pin_env = getenv("VITRIOL_PIN_FIRST_N_LAYERS");
+    if (pin_env) {
+        int val = atoi(pin_env);
+        if (val > 0) g_vitriol_config.pin_first_n_layers = val;
+    }
+
     if (g_vitriol_config.mode == VITRIOL_MODE_STREAM) {
         if (g_vitriol_config.verbose)
             printf("VITRIOL: stream mode — page-locked host RAM + LRU VRAM cache\n");
@@ -256,6 +271,18 @@ void vitriol_cuda_init(void) {
     if (g_vitriol_config.async_prefetch) {
         if (g_vitriol_config.verbose)
             printf("VITRIOL: predictive prefetching enabled (cross-layer + temporal)\n");
+    }
+
+    if (g_vitriol_config.pin_first_n_layers > 0) {
+        if (g_vitriol_config.verbose)
+            printf("VITRIOL: expert pinning enabled — first %d layers will be loaded into VRAM\n",
+                   g_vitriol_config.pin_first_n_layers);
+        /* Pinning targets the fast path; disable output cache to avoid confusion */
+        if (g_vitriol_config.output_cache) {
+            g_vitriol_config.output_cache = false;
+            if (g_vitriol_config.verbose)
+                printf("VITRIOL: output cache disabled (pinning + output cache target different decode paths)\n");
+        }
     }
 
     if (g_vitriol_config.disk_offload) {
@@ -442,6 +469,86 @@ void vitriol_predictor_update(
         g_pred_count = count;
         memcpy(g_pred_experts, g_cur_exp[layer_idx], count * sizeof(int));
     }
+}
+
+/* ── Expert Pinning Operations ────────────────────────────────────── */
+
+CUdeviceptr vitriol_pin_ensure(
+    const void    *tensor_base,
+    size_t         tensor_nb02,
+    int64_t        n_experts,
+    CUstream       stream)
+{
+    if (!tensor_base || tensor_nb02 == 0 || n_experts <= 0)
+        return 0;
+
+    /* Only pin layers within the configured range.
+     * Each model layer has multiple tensor ops (e.g., gate_up + down for fused MoE).
+     * Divide by pin_tensors_per_layer to count in model-layer units. */
+    int layer_idx = get_layer_index((uintptr_t)tensor_base);
+    if (layer_idx < 0)
+        return 0;
+
+    int tensors_per_layer = g_vitriol_config.pin_tensors_per_layer;
+    if (tensors_per_layer <= 0) tensors_per_layer = 2;  // safe default
+
+    int model_layer = layer_idx / tensors_per_layer;
+    if (model_layer >= g_vitriol_config.pin_first_n_layers)
+        return 0;
+
+    /* Check if already pinned */
+    {
+        std::lock_guard<std::mutex> lock(g_pin_mtx);
+        auto it = g_pin_map.find((uintptr_t)tensor_base);
+        if (it != g_pin_map.end()) {
+            return it->second;
+        }
+    }
+
+    /* Allocate VRAM buffer for the full tensor (all experts) */
+    size_t total_size = tensor_nb02 * (size_t)n_experts;
+    CUdeviceptr vram_buf = 0;
+    CUresult err = cuMemAlloc(&vram_buf, total_size);
+    if (err != CUDA_SUCCESS) {
+        fprintf(stderr, "VITRIOL: pin alloc %zu MB failed (%d) — pinning disabled for remaining layers\n",
+                total_size / 1024 / 1024, (int)err);
+        /* Disable further pinning attempts */
+        g_vitriol_config.pin_first_n_layers = 0;
+        return 0;
+    }
+
+    /* Async H2D copy of the full tensor to VRAM */
+    err = cuMemcpyHtoDAsync(vram_buf, tensor_base, total_size, stream);
+    if (err != CUDA_SUCCESS) {
+        cuMemFree(vram_buf);
+        fprintf(stderr, "VITRIOL: pin H2D copy failed (%d)\n", (int)err);
+        return 0;
+    }
+
+    /* Synchronize so matmul can safely read from VRAM */
+    cuStreamSynchronize(stream);
+
+    /* Store in pin map */
+    {
+        std::lock_guard<std::mutex> lock(g_pin_mtx);
+        g_pin_map[(uintptr_t)tensor_base] = vram_buf;
+        g_pinned_bytes += total_size;
+        g_vitriol_config.pin_active = true;
+    }
+
+    if (g_vitriol_config.verbose)
+        printf("VITRIOL: pinned layer %d tensor %p -> VRAM %llx (%zu MB, %d experts x %zu bytes)\n",
+               layer_idx, tensor_base, (unsigned long long)vram_buf,
+               total_size / 1024 / 1024, (int)n_experts, tensor_nb02);
+
+    return vram_buf;
+}
+
+CUdeviceptr vitriol_pin_lookup(const void *tensor_base) {
+    if (!tensor_base) return 0;
+    std::lock_guard<std::mutex> lock(g_pin_mtx);
+    auto it = g_pin_map.find((uintptr_t)tensor_base);
+    return (it != g_pin_map.end()) ? it->second : 0;
 }
 
 static bool lru_ensure_stream(void) {
@@ -653,6 +760,20 @@ void vitriol_cuda_cleanup_vram(void) {
         }
         g_output_cache_pool = 0;
     }
+    /* Free all pinned tensor buffers */
+    {
+        std::lock_guard<std::mutex> lock(g_pin_mtx);
+        for (auto & kv : g_pin_map) {
+            CUresult r = cuMemFree(kv.second);
+            if (r != CUDA_SUCCESS) {
+                fprintf(stderr, "VITRIOL: cuMemFree(pinned tensor %llx) failed: %d\n",
+                        (unsigned long long)kv.first, (int)r);
+            }
+        }
+        g_pin_map.clear();
+        g_pinned_bytes = 0;
+        g_vitriol_config.pin_active = false;
+    }
 }
 
 void vitriol_cuda_print_stats(void) {
@@ -669,6 +790,14 @@ void vitriol_cuda_print_stats(void) {
     printf("LRU Evictions: %llu\n", g_lru_stats.evictions);
     printf("Predictor: %s\n", g_vitriol_config.async_prefetch ? "cross-layer + temporal" : "none");
     printf("Output Cache: %s\n", g_vitriol_config.output_cache ? "enabled (approximate)" : "none");
+    printf("Expert Pinning: %s\n", g_vitriol_config.pin_active ? "active" :
+           g_vitriol_config.pin_first_n_layers > 0 ? "configured but no layers pinned yet" : "none");
+    if (g_vitriol_config.pin_active) {
+        printf("Pinned Tensors: %zu\n", g_pin_map.size());
+        printf("Pinned Memory: %zu MB (%.1f GiB)\n",
+               g_pinned_bytes / 1024 / 1024,
+               (double)g_pinned_bytes / (1024.0 * 1024.0 * 1024.0));
+    }
     if (g_vitriol_config.output_cache) {
         uint64_t oc_total = g_output_cache_stats.hits + g_output_cache_stats.misses;
         float oc_hr = (oc_total > 0) ? 100.0f * (float)g_output_cache_stats.hits / (float)oc_total : 0.0f;

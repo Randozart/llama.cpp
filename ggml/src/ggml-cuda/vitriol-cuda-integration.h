@@ -42,6 +42,9 @@ typedef struct {
     bool benchmark;
     bool disk_offload;
     bool output_cache;
+    int  pin_first_n_layers;  // 0=off, N=pin first N model layers' expert tensors in VRAM
+    int  pin_tensors_per_layer;  // auto-detected: number of tensor ops per model layer (default 2 for fused gate+up + down)
+    bool pin_active;          // true after first pin allocation
 } vitriol_config_t;
 
 extern vitriol_config_t g_vitriol_config;
@@ -107,6 +110,37 @@ void vitriol_predictor_update(
 /* Returns true if predictive prefetching is enabled. */
 static inline bool vitriol_predictive_enabled(void) {
     return g_vitriol_config.async_prefetch;
+}
+
+/* ── Expert Pinning ──────────────────────────────────────────────────
+ * Pre-load full expert weight tensors of the first N layers into VRAM
+ * at first use, so MMVQ/MMQ/MMF fast-path kernels read from VRAM
+ * instead of PCIe-hosted page-locked RAM.
+ *
+ * Controlled by env VITRIOL_PIN_FIRST_N_LAYERS (default 0 = off)
+ * or config vitriol.pin_first_n_layers.
+ *
+ * When active, output cache is auto-disabled (they target different
+ * decode paths: pinning helps the fast path, output cache helps the
+ * per-expert loop).
+ * ──────────────────────────────────────────────────────────────────*/
+
+/* Ensure the tensor for a given layer is pinned in VRAM.
+ * Called lazily on first encounter during prefill/decode.
+ * Returns VRAM pointer, or 0 on failure/skip. */
+CUdeviceptr vitriol_pin_ensure(
+    const void    *tensor_base,
+    size_t         tensor_nb02,
+    int64_t        n_experts,
+    CUstream       stream);
+
+/* Look up an already-pinned tensor by its base address.
+ * Returns VRAM pointer or 0. */
+CUdeviceptr vitriol_pin_lookup(const void *tensor_base);
+
+/* Returns true if at least one tensor has been pinned. */
+static inline bool vitriol_pin_active(void) {
+    return g_vitriol_config.pin_active;
 }
 
 void vitriol_cuda_print_stats(void);

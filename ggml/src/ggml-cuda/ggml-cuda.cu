@@ -2527,6 +2527,22 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // ── Expert Pinning: redirect src0 to VRAM for fast-path kernels ──
+    ggml_tensor pinned_src0_override;
+    const ggml_tensor *orig_src0 = src0;
+    bool use_pinned = false;
+
+    if (g_vitriol_config.pin_first_n_layers > 0) {
+        vitriol_pin_ensure(src0->data, (size_t)nb02, ne02, ctx.stream());
+        CUdeviceptr pin_ptr = vitriol_pin_lookup(src0->data);
+        if (pin_ptr) {
+            pinned_src0_override = *src0;
+            pinned_src0_override.data = (void*)pin_ptr;
+            src0 = &pinned_src0_override;
+            use_pinned = true;
+        }
+    }
+
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -2565,6 +2581,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 return;
             }
         }
+    }
+
+    // ── Restore original src0 for per-expert loop ──
+    if (use_pinned) {
+        src0 = orig_src0;
     }
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
