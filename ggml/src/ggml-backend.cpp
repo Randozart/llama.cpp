@@ -1371,6 +1371,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_end = graph->n_nodes;
         sched->n_splits = i_split + 1;
+#ifdef GGML_USE_CUDA
+        /* Expose split count to VITRIOL for stats display */
+        extern int g_vitriol_last_graph_splits;
+        g_vitriol_last_graph_splits = sched->n_splits;
+#endif
     }
 
     if (sched->debug) {

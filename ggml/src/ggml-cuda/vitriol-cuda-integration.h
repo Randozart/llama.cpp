@@ -148,6 +148,9 @@ static inline bool vitriol_pin_active(void) {
     return g_vitriol_config.pin_active;
 }
 
+/* Graph split counter — updated by the scheduler when VITRIOL is active */
+extern int g_vitriol_last_graph_splits;
+
 void vitriol_cuda_print_stats(void);
 
 __attribute__((visibility("default")))

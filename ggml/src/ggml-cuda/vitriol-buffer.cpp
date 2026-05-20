@@ -37,9 +37,15 @@ static const char * vitriol_buffer_type_get_name(ggml_backend_buffer_type_t buft
     return ctx->name.c_str();
 }
 
-/* Check if a buffer type is VITRIOL by comparing the get_name function pointer */
+/* Check if a buffer type is VITRIOL by checking the context pointer range */
 bool vitriol_is_vitriol_buffer_type(ggml_backend_buffer_type_t buft) {
-    return buft && buft->iface.get_name == vitriol_buffer_type_get_name;
+    if (!buft || !buft->context) return false;
+    /* VITRIOL context objects are allocated in the static 'types' array
+     * in vitriol_get_buffer_type(). We check if the context pointer is
+     * within our known range by matching the name string. Since get_name
+     * now points to CUDA host's function, we check the context name. */
+    auto * ctx = (vitriol_buffer_type_context *)buft->context;
+    return ctx->name == "VITRIOL";
 }
 
 /* VITRIOL buffer context */
@@ -270,9 +276,24 @@ ggml_backend_buffer_type_t vitriol_get_buffer_type(int device) {
     static bool initialized = false;
 
     if (!initialized) {
+        /* Steal the get_name function pointer from CUDA host buffer type.
+         * This makes ggml_backend_buft_is_cuda_host() return true for
+         * VITRIOL buft, telling the scheduler these weights are
+         * CUDA-host-compatible (page-locked RAM, GPU-accessible via DMA).
+         * Without this, the scheduler creates ~17 graph splits instead of
+         * ~2, adding ~0.5 ms overhead per split per layer. */
+        auto cuda_host_buft = ggml_backend_cuda_host_buffer_type();
+        auto cuda_host_get_name = cuda_host_buft->iface.get_name;
+
         for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            /* Start with the VITRIOL interface, but override get_name
+             * to match CUDA host's — this is the only function pointer
+             * the scheduler uses for buft identity checks. */
+            ggml_backend_buffer_type_i iface = vitriol_buffer_type_interface;
+            iface.get_name = cuda_host_get_name;
+
             types[i] = {
-                /* .iface   = */ vitriol_buffer_type_interface,
+                /* .iface   = */ iface,
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
                 /* .context = */ new vitriol_buffer_type_context{i, "VITRIOL"},
             };

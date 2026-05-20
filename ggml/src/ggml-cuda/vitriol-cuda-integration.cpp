@@ -73,6 +73,9 @@ static std::mutex          g_pin_mtx;
 static size_t              g_pinned_bytes = 0;
 static bool                g_pin_init_done = false;
 
+/* Graph split counter — set by scheduler, displayed in stats */
+int g_vitriol_last_graph_splits = -1;
+
 /* Monolithic VRAM pool for all pinned tensors.
  * Allocated once on first pin; subdivided per tensor. */
 static CUdeviceptr g_pin_pool = 0;
@@ -838,6 +841,11 @@ void vitriol_cuda_print_stats(void) {
                g_pinned_bytes / 1024 / 1024,
                (double)g_pinned_bytes / (1024.0 * 1024.0 * 1024.0));
     }
+    printf("Graph Splits: ");
+    if (g_vitriol_last_graph_splits >= 0)
+        printf("%d\n", g_vitriol_last_graph_splits);
+    else
+        printf("N/A (first call)\n");
     if (g_vitriol_config.output_cache) {
         uint64_t oc_total = g_output_cache_stats.hits + g_output_cache_stats.misses;
         float oc_hr = (oc_total > 0) ? 100.0f * (float)g_output_cache_stats.hits / (float)oc_total : 0.0f;
