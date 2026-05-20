@@ -2552,8 +2552,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    // Output cache requires the sorted path (per-expert loop with cache hooks)
-                    if (!vitriol_output_cache_active() || ne12 != 1) {
+                    // Output cache + Expert pruning require the sorted path
+                    if ((!vitriol_output_cache_active() || ne12 != 1) && vitriol_prune_experts() <= 0) {
                         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                         return;
                     }
@@ -2561,8 +2561,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
                     if (!vitriol_output_cache_active() || ne12 != 1) {
-                        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
-                        return;
+                        if (vitriol_prune_experts() <= 0) {
+                            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                            return;
+                        }
                     }
                 }
             }
@@ -2570,15 +2572,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             if (!vitriol_output_cache_active() || ne12 != 1) {
-                ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
-                return;
+                if (vitriol_prune_experts() <= 0) {
+                    ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+                    return;
+                }
             }
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             if (!vitriol_output_cache_active() || ne12 != 1) {
-                ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
-                return;
+                if (vitriol_prune_experts() <= 0) {
+                    ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+                    return;
+                }
             }
         }
     }
@@ -2655,6 +2661,24 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
     const bool is_single_token = (ne12 == 1);
+
+    // ── Top-K Expert Pruning: drop bottom N of 8 active experts ──
+    {
+        int prune = vitriol_prune_experts();
+        if (prune > 0 && prune < n_expert_used) {
+            int keep = (int)(n_expert_used - prune);
+            int kept = 0;
+            for (int64_t i = 0; i < ne02; i++) {
+                if (tokens_per_expert[i] > 0) {
+                    kept++;
+                    if (kept > keep) {
+                        tokens_per_expert[i] = 0;
+                    }
+                }
+            }
+        }
+    }
+
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
         if (tokens_per_expert[i02] == 0) {
             continue;

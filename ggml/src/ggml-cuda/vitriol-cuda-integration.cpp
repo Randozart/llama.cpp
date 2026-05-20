@@ -73,6 +73,12 @@ static std::mutex          g_pin_mtx;
 static size_t              g_pinned_bytes = 0;
 static bool                g_pin_init_done = false;
 
+/* Monolithic VRAM pool for all pinned tensors.
+ * Allocated once on first pin; subdivided per tensor. */
+static CUdeviceptr g_pin_pool = 0;
+static size_t      g_pin_pool_offset = 0;
+static size_t      g_pin_pool_total = 0;
+
 /* ── Expert Output Cache (approximate) ───────────────────────────── */
 
 #define VITRIOL_MAX_CACHE_EXPERTS_PER_LAYER 256
@@ -261,6 +267,12 @@ void vitriol_cuda_init(void) {
     if (pin_env) {
         int val = atoi(pin_env);
         if (val > 0) g_vitriol_config.pin_first_n_layers = val;
+    }
+
+    const char* prune_env = getenv("VITRIOL_PRUNE_EXPERTS");
+    if (prune_env) {
+        int val = atoi(prune_env);
+        if (val > 0 && val <= 7) g_vitriol_config.prune_experts = val;
     }
 
     if (g_vitriol_config.mode == VITRIOL_MODE_STREAM) {
@@ -505,22 +517,48 @@ CUdeviceptr vitriol_pin_ensure(
         }
     }
 
-    /* Allocate VRAM buffer for the full tensor (all experts) */
+    /* Get total size for this tensor */
     size_t total_size = tensor_nb02 * (size_t)n_experts;
-    CUdeviceptr vram_buf = 0;
-    CUresult err = cuMemAlloc(&vram_buf, total_size);
-    if (err != CUDA_SUCCESS) {
-        fprintf(stderr, "VITRIOL: pin alloc %zu MB failed (%d) — pinning disabled for remaining layers\n",
-                total_size / 1024 / 1024, (int)err);
-        /* Disable further pinning attempts */
-        g_vitriol_config.pin_first_n_layers = 0;
+
+    /* Monolithic pool: allocate once on first call */
+    if (g_pin_pool == 0) {
+        int expected_tensors = g_vitriol_config.pin_first_n_layers *
+                               g_vitriol_config.pin_tensors_per_layer;
+        /* Use 1.5× the first tensor's size as per-slot estimate.
+         * Different tensor types vary (e.g., gate_up ~66 MB, down ~98 MB),
+         * so we leave margin. If a tensor exceeds remaining pool space,
+         * it falls through to host RAM gracefully. */
+        size_t pool_size = total_size * expected_tensors * 3 / 2;
+        CUresult err = cuMemAlloc(&g_pin_pool, pool_size);
+        if (err != CUDA_SUCCESS) {
+            fprintf(stderr, "VITRIOL: pin pool alloc %zu MB failed (%d) — pinning disabled\n",
+                    pool_size / 1024 / 1024, (int)err);
+            g_vitriol_config.pin_first_n_layers = 0;
+            return 0;
+        }
+        g_pin_pool_total = pool_size;
+        g_pin_pool_offset = 0;
+        if (g_vitriol_config.verbose)
+            printf("VITRIOL: pin pool allocated: %zu MB (%d slots × ~%zu MB each)\n",
+                   pool_size / 1024 / 1024, expected_tensors,
+                   total_size / 1024 / 1024);
+    }
+
+    /* Check if this tensor fits in remaining pool */
+    if (g_pin_pool_offset + total_size > g_pin_pool_total) {
+        if (g_vitriol_config.verbose)
+            printf("VITRIOL: pin pool exhausted for layer %d (%zu MB needed, %zu MB left) — skipping\n",
+                   layer_idx, total_size / 1024 / 1024,
+                   (g_pin_pool_total - g_pin_pool_offset) / 1024 / 1024);
         return 0;
     }
 
+    CUdeviceptr vram_buf = g_pin_pool + g_pin_pool_offset;
+    g_pin_pool_offset += total_size;
+
     /* Async H2D copy of the full tensor to VRAM */
-    err = cuMemcpyHtoDAsync(vram_buf, tensor_base, total_size, stream);
+    CUresult err = cuMemcpyHtoDAsync(vram_buf, tensor_base, total_size, stream);
     if (err != CUDA_SUCCESS) {
-        cuMemFree(vram_buf);
         fprintf(stderr, "VITRIOL: pin H2D copy failed (%d)\n", (int)err);
         return 0;
     }
@@ -760,16 +798,18 @@ void vitriol_cuda_cleanup_vram(void) {
         }
         g_output_cache_pool = 0;
     }
-    /* Free all pinned tensor buffers */
+    /* Free monolithic pin pool (single allocation — all tensors) */
+    if (g_pin_pool != 0) {
+        CUresult r = cuMemFree(g_pin_pool);
+        if (r != CUDA_SUCCESS) {
+            fprintf(stderr, "VITRIOL: cuMemFree(pin pool) failed: %d\n", (int)r);
+        }
+        g_pin_pool = 0;
+        g_pin_pool_offset = 0;
+        g_pin_pool_total = 0;
+    }
     {
         std::lock_guard<std::mutex> lock(g_pin_mtx);
-        for (auto & kv : g_pin_map) {
-            CUresult r = cuMemFree(kv.second);
-            if (r != CUDA_SUCCESS) {
-                fprintf(stderr, "VITRIOL: cuMemFree(pinned tensor %llx) failed: %d\n",
-                        (unsigned long long)kv.first, (int)r);
-            }
-        }
         g_pin_map.clear();
         g_pinned_bytes = 0;
         g_vitriol_config.pin_active = false;

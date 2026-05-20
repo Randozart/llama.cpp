@@ -45,6 +45,7 @@ typedef struct {
     int  pin_first_n_layers;  // 0=off, N=pin first N model layers' expert tensors in VRAM
     int  pin_tensors_per_layer;  // auto-detected: number of tensor ops per model layer (default 2 for fused gate+up + down)
     bool pin_active;          // true after first pin allocation
+    int  prune_experts;       // 0=off, N=drop bottom N of 8 active experts before compute
 } vitriol_config_t;
 
 extern vitriol_config_t g_vitriol_config;
@@ -137,6 +138,10 @@ CUdeviceptr vitriol_pin_ensure(
 /* Look up an already-pinned tensor by its base address.
  * Returns VRAM pointer or 0. */
 CUdeviceptr vitriol_pin_lookup(const void *tensor_base);
+
+static inline int vitriol_prune_experts(void) {
+    return g_vitriol_config.prune_experts;
+}
 
 /* Returns true if at least one tensor has been pinned. */
 static inline bool vitriol_pin_active(void) {
