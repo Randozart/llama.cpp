@@ -1222,22 +1222,51 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (vk_sym) {
                     vitriol_vk_getter = (buft_getter_t)vk_sym;
                 }
-                // Check if Chimera mode is enabled via env var
-                const char * chimera_env = getenv("VITRIOL_CHIMERA");
-                if (chimera_env && strcmp(chimera_env, "1") == 0 && vk_sym) {
-                    chimera_active = true;
-                    LLAMA_LOG_INFO("VITRIOL: Chimera mode enabled (CUDA+Vulkan hybrid)\n");
+                // Determine Chimera mode from VITRIOL_CHIMERA_MODE env var
+                //   auto   → Chimera if both backends available
+                //   cuda   → CUDA-only (VITRIOL experts, default dense)
+                //   vulkan → Vulkan-only (all tensors→VK type)
+                //   off    → CUDA-only (same as cuda)
+                const char * chimera_env = getenv("VITRIOL_CHIMERA_MODE");
+                if (!chimera_env || !chimera_env[0]) {
+                    chimera_env = "auto";
+                }
+                if (strcmp(chimera_env, "auto") == 0) {
+                    chimera_active = (vk_sym != nullptr);
+                    if (chimera_active) {
+                        LLAMA_LOG_INFO("VITRIOL: Chimera auto-detect — Vulkan backend found, hybrid mode active\n");
+                    } else {
+                        LLAMA_LOG_INFO("VITRIOL: Chimera auto-detect — Vulkan backend not found, CUDA-only\n");
+                    }
+                } else if (strcmp(chimera_env, "vulkan") == 0) {
+                    chimera_active = false;
+                    if (vk_sym) {
+                        LLAMA_LOG_INFO("VITRIOL: Chimera mode 'vulkan' — all tensors → VK buffer type\n");
+                    }
+                } else {
+                    // "cuda" or "off" — explicit CUDA-only
+                    LLAMA_LOG_INFO("VITRIOL: Chimera mode '%s' — CUDA-only\n", chimera_env);
                 }
             }
+            const char * chimera_env_check = getenv("VITRIOL_CHIMERA_MODE");
+            if (!chimera_env_check || !chimera_env_check[0]) chimera_env_check = "auto";
+            bool vulkan_only = (strcmp(chimera_env_check, "vulkan") == 0);
+
             if (tensor_name.find("exps") != std::string::npos) {
                 LLAMA_LOG_INFO("VITRIOL: tensor '%s' matched 'exps' pattern\n", tensor_name.c_str());
-                if (vitriol_getter) {
+                if (vulkan_only && vitriol_vk_getter) {
+                    /* Vulkan-only mode: experts also go to VK buffer type */
+                    buft = vitriol_vk_getter();
+                } else if (vitriol_getter) {
                     buft = vitriol_getter();
-                    LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to VITRIOL\n",
-                            tensor_name.c_str(),
-                            ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type));
                 }
-            } else if (chimera_active && vitriol_vk_getter) {
+                if (buft) {
+                    LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
+                            tensor_name.c_str(),
+                            ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                            vulkan_only ? "VITRIOL_VK" : "VITRIOL");
+                }
+            } else if ((chimera_active && vitriol_vk_getter) || (vulkan_only && vitriol_vk_getter)) {
                 /* Chimera: route dense tensors to VITRIOL VK buffer type */
                 static int chimera_tensor_count = 0;
                 chimera_tensor_count++;
