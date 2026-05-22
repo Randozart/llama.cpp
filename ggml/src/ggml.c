@@ -1493,6 +1493,7 @@ bool ggml_is_contiguous_channels(const struct ggml_tensor * tensor) {
 }
 
 bool ggml_is_contiguous_rows(const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor != NULL);
     return
         tensor->ne[0] == ggml_blck_size(tensor->type) ||
         tensor->nb[0] == ggml_type_size(tensor->type);
@@ -1518,6 +1519,7 @@ bool ggml_is_empty(const struct ggml_tensor * tensor) {
 }
 
 bool ggml_are_same_shape(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
+    GGML_ASSERT(t0 != NULL && t1 != NULL);
     static_assert(GGML_MAX_DIMS == 4, "GGML_MAX_DIMS is not 4 - update this function");
 
     return

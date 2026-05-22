@@ -237,7 +237,7 @@ ggml_backend_dev_t ggml_backend_meta_device(
         /*ctx    =*/ ctxs.back().get(),
     };
 
-    auto result = meta_devs.emplace(*ctxs.back(), meta_dev);
+    auto result = meta_devs.try_emplace(*ctxs.back(), meta_dev);
     return &result.first->second;
 }
 
@@ -363,7 +363,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
         /*device =*/ dev,
         /*ctx    =*/ buft_ctx,
     };
-    auto result = meta_bufts.emplace(dev, meta_buft);
+    auto result = meta_bufts.try_emplace(dev, meta_buft);
     return &result.first->second;
 }
 
@@ -450,6 +450,7 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+    GGML_ASSERT(tensor != NULL && tensor->buffer != NULL);
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
 

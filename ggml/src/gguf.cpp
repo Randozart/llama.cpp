@@ -1069,7 +1069,7 @@ int64_t gguf_remove_key(struct gguf_context * ctx, const char * key) {
 }
 
 template<typename T>
-static void gguf_check_reserved_keys(const std::string & key, const T val) {
+static void gguf_check_reserved_keys(const std::string_view key, const T val) {
     if (key == GGUF_KEY_GENERAL_ALIGNMENT) {
         if constexpr (std::is_same<T, uint32_t>::value) {
             GGML_ASSERT(val > 0 && (val & (val - 1)) == 0 && GGUF_KEY_GENERAL_ALIGNMENT " must be power of 2");
@@ -1302,7 +1302,7 @@ struct gguf_writer_base {
         write(val8);
     }
 
-    void write(const std::string & val) {
+    void write(const std::string_view val) {
         {
             const uint64_t n = val.length();
             write(n);

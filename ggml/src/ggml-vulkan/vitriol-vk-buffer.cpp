@@ -118,14 +118,17 @@ static const struct ggml_backend_buffer_i vitriol_vk_buffer_interface = {
 };
 
 static bool vitriol_vk_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
-    return true;  /* page-locked host RAM, GPU via VK_EXT_external_memory_host */
+    (void)buft;
+    return true;
 }
 
 static size_t vitriol_vk_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 4096;  /* page-aligned — fine for mmap + VK_EXT_external_memory_host */
+    (void)buft;
+    return 4096;
 }
 
 static size_t vitriol_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+    (void)buft;
     return ggml_nbytes(tensor);
 }
 
