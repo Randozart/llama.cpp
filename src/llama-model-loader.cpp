@@ -1188,35 +1188,65 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // The buffer type allocates system RAM but reports as device memory, causing the
         // scheduler to route MUL_MAT_ID to the CUDA backend. Expert data is CE DMA'd into
         // a VRAM pool on demand during inference.
+        //
+        // VITRIOL Chimera: also intercept non-expert tensors and route them to the
+        // VITRIOL VK buffer type (page-locked host RAM imported into Vulkan via
+        // VK_EXT_external_memory_host). This enables dense ops (SSM, attention, norms)
+        // to run on Vulkan with pre-baked command buffers while MoE experts run on CUDA.
         if (!buft) {
             std::string tensor_name = tn.str();
+            typedef ggml_backend_buffer_type_t (*buft_getter_t)(void);
+            static buft_getter_t vitriol_getter = nullptr;
+            static buft_getter_t vitriol_vk_getter = nullptr;
+            static bool chimera_active = false;
+            static bool looked_up = false;
+            if (!looked_up) {
+                looked_up = true;
+                LLAMA_LOG_INFO("VITRIOL: attempting dlopen libggml-cuda.so\n");
+                void * dl = dlopen("libggml-cuda.so", RTLD_NOW | RTLD_GLOBAL);
+                LLAMA_LOG_INFO("VITRIOL: dlopen = %p, dlerror = %s\n", dl, dlerror());
+                // Initialize VITRIOL config (reads VITRIOL_MODE env var)
+                void (*init_fn)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "vitriol_cuda_init");
+                if (init_fn) {
+                    init_fn();
+                    LLAMA_LOG_INFO("VITRIOL: vitriol_cuda_init called\n");
+                }
+                void * sym = dlsym(RTLD_DEFAULT, "vitriol_get_expert_buffer_type");
+                LLAMA_LOG_INFO("VITRIOL: dlsym vitriol_get_expert_buffer_type = %p\n", sym);
+                if (sym) {
+                    vitriol_getter = (buft_getter_t)sym;
+                }
+                // Look up Chimera (VITRIOL VK buffer type) symbols
+                void * vk_sym = dlsym(RTLD_DEFAULT, "vitriol_get_vk_buffer_type");
+                LLAMA_LOG_INFO("VITRIOL: dlsym vitriol_get_vk_buffer_type = %p\n", vk_sym);
+                if (vk_sym) {
+                    vitriol_vk_getter = (buft_getter_t)vk_sym;
+                }
+                // Check if Chimera mode is enabled via env var
+                const char * chimera_env = getenv("VITRIOL_CHIMERA");
+                if (chimera_env && strcmp(chimera_env, "1") == 0 && vk_sym) {
+                    chimera_active = true;
+                    LLAMA_LOG_INFO("VITRIOL: Chimera mode enabled (CUDA+Vulkan hybrid)\n");
+                }
+            }
             if (tensor_name.find("exps") != std::string::npos) {
                 LLAMA_LOG_INFO("VITRIOL: tensor '%s' matched 'exps' pattern\n", tensor_name.c_str());
-                typedef ggml_backend_buffer_type_t (*buft_getter_t)(void);
-                static buft_getter_t vitriol_getter = nullptr;
-                static bool looked_up = false;
-                if (!looked_up) {
-                    looked_up = true;
-                    LLAMA_LOG_INFO("VITRIOL: attempting dlopen libggml-cuda.so\n");
-                    void * dl = dlopen("libggml-cuda.so", RTLD_NOW | RTLD_GLOBAL);
-                    LLAMA_LOG_INFO("VITRIOL: dlopen = %p, dlerror = %s\n", dl, dlerror());
-                    // Initialize VITRIOL config (reads VITRIOL_MODE env var)
-                    void (*init_fn)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "vitriol_cuda_init");
-                    if (init_fn) {
-                        init_fn();
-                        LLAMA_LOG_INFO("VITRIOL: vitriol_cuda_init called\n");
-                    }
-                    void * sym = dlsym(RTLD_DEFAULT, "vitriol_get_expert_buffer_type");
-                    LLAMA_LOG_INFO("VITRIOL: dlsym vitriol_get_expert_buffer_type = %p\n", sym);
-                    if (sym) {
-                        vitriol_getter = (buft_getter_t)sym;
-                    }
-                }
                 if (vitriol_getter) {
                     buft = vitriol_getter();
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to VITRIOL\n",
                             tensor_name.c_str(),
                             ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type));
+                }
+            } else if (chimera_active && vitriol_vk_getter) {
+                /* Chimera: route dense tensors to VITRIOL VK buffer type */
+                static int chimera_tensor_count = 0;
+                chimera_tensor_count++;
+                buft = vitriol_vk_getter();
+                if (chimera_tensor_count <= 5 || chimera_tensor_count % 100 == 0) {
+                    LLAMA_LOG_INFO("VITRIOL: tensor '%s' (%zu MiB) routed to VITRIOL VK buffer (Chimera, count=%d)\n",
+                            tensor_name.c_str(),
+                            ggml_nbytes(t_meta) / 1024 / 1024,
+                            chimera_tensor_count);
                 }
             }
         }

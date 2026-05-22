@@ -1,4 +1,5 @@
 #include "ggml-vulkan.h"
+#include "vitriol-vk-buffer.h"
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -6525,6 +6526,8 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
     }
 }
 
+static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
+
 static vk_subbuffer ggml_vk_tensor_subbuffer(
     const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
 
@@ -6534,9 +6537,44 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
         ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
     }
     if (!buffer) {
-        auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
-        buffer = buf_ctx->dev_buffer;
-        offset = vk_tensor_offset(tensor) + tensor->view_offs;
+        if (vitriol_is_vitriol_vk_buffer_type(tensor->buffer->buft)) {
+            /* VITRIOL VK buffer type: lazily create VkBuffer from host memory */
+            void ** vk_buf_slot = vitriol_vk_buffer_get_vk_buf_slot(tensor->buffer);
+            void ** dev_slot = vitriol_vk_buffer_get_device_slot(tensor->buffer);
+            if (!vk_buf_slot || !dev_slot) {
+                GGML_ASSERT(false && "VITRIOL VK buffer missing context");
+            }
+
+            if (!*vk_buf_slot) {
+                /* Lazy init: create VkBuffer importing the host pointer */
+                *dev_slot = (void *)ctx->device.get();
+                void * host_ptr = vitriol_vk_buffer_get_host_ptr(tensor->buffer, tensor);
+                if (!host_ptr) {
+                    GGML_ASSERT(false && "VITRIOL VK buffer missing host pointer");
+                }
+                size_t size = ggml_nbytes(tensor);
+                auto vk_buf = ggml_vk_buffer_from_host_ptr(const_cast<vk_device &>(ctx->device), host_ptr, size);
+                if (!vk_buf) {
+                    GGML_LOG_ERROR("ggml_vulkan: VITRIOL VK ggml_vk_buffer_from_host_ptr failed\n");
+                    GGML_ASSERT(false && "VITRIOL VK buffer creation failed");
+                }
+                /* Store vk_buffer (shared_ptr<vk_buffer_struct>) in a type-erased
+                 * shared_ptr<void> with custom deleter. The deleter captures the
+                 * real shared_ptr, so the VkBuffer stays alive until we delete it. */
+                auto erased = std::make_shared<std::shared_ptr<vk_buffer_struct>>(vk_buf);
+                *vk_buf_slot = (void *)new std::shared_ptr<std::shared_ptr<vk_buffer_struct>>(erased);
+                offset = 0;
+                buffer = vk_buf;
+            } else {
+                auto stash_ptr = (std::shared_ptr<std::shared_ptr<vk_buffer_struct>> *)*vk_buf_slot;
+                buffer = **stash_ptr;
+                offset = 0;
+            }
+        } else {
+            auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+            buffer = buf_ctx->dev_buffer;
+            offset = vk_tensor_offset(tensor) + tensor->view_offs;
+        }
     }
     GGML_ASSERT(buffer != nullptr);
 
@@ -15862,14 +15900,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 }
 
 static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
-        return false;
+    if (buft->iface.get_name == ggml_backend_vk_buffer_type_name) {
+        ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+        ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
+        return buft_ctx->device->idx == ctx->device;
     }
-
-    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
-    ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
-
-    return buft_ctx->device->idx == ctx->device;
+    if (vitriol_is_vitriol_vk_buffer_type(buft)) {
+        return true;
+    }
+    return false;
 }
 
 static int64_t ggml_vk_get_op_batch_size(const ggml_tensor * op) {
