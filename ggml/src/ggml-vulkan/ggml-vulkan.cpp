@@ -837,6 +837,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_delta_net[3][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
+    vk_pipeline pipeline_ssm_scan_f32_d16;
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
@@ -4756,6 +4757,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 3, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d16, "ssm_scan_mamba1_f32", ssm_scan_mamba1_f32_len, ssm_scan_mamba1_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {}, 1, true, true);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -9738,6 +9741,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 return ctx->device->pipeline_ssm_scan_f32_d128;
             } else if (d_state == 256) {
                 return ctx->device->pipeline_ssm_scan_f32_d256;
+            } else if (d_state == 16) {
+                return ctx->device->pipeline_ssm_scan_f32_d16;
             }
         }
         return nullptr;
@@ -10631,7 +10636,6 @@ static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const uint32_t n_seq = src1->ne[3];
 
     bool is_mamba2 = (src3->nb[1] == sizeof(float));
-    GGML_ASSERT(is_mamba2);
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src0, src1, src2, dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
@@ -10660,9 +10664,15 @@ static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, 
     std::array<uint32_t, 3> elements;
 
     const uint32_t d_state = src0->ne[0];
-    uint32_t num_subgroups = d_state / ctx->device->subgroup_size;
-    const uint32_t num_workgroups_x = CEIL_DIV(n_head * head_dim, num_subgroups);
-    const uint32_t num_workgroups_y = n_seq;
+    uint32_t num_workgroups_x;
+    uint32_t num_workgroups_y = n_seq;
+    if (is_mamba2) {
+        uint32_t num_subgroups = d_state / ctx->device->subgroup_size;
+        num_workgroups_x = CEIL_DIV(n_head * head_dim, num_subgroups);
+    } else {
+        /* Mamba-1: 128 threads per workgroup, each handling 1 head */
+        num_workgroups_x = CEIL_DIV(n_head, 128u);
+    }
     elements = { num_workgroups_x, num_workgroups_y, 1 };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -15805,15 +15815,19 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const uint32_t head_dim = op->src[0]->ne[1];
 
                 bool is_mamba2 = (op->src[3] && op->src[3]->nb[1] == sizeof(float));
-                if (!is_mamba2) {
-                    return false;
+
+                if (is_mamba2) {
+                    if ((d_state != 128 && d_state != 256) || head_dim % 16 != 0) {
+                        return false;
+                    }
+                } else {
+                    /* Mamba-1: d_state=16, head_dim=1, n_group=1 */
+                    if (d_state != 16 || head_dim != 1) {
+                        return false;
+                    }
                 }
 
-                if ((d_state != 128 && d_state != 256) || head_dim % 16 != 0) {
-                    return false;
-                }
-
-                size_t shmem_size = d_state * sizeof(float);
+                size_t shmem_size = is_mamba2 ? d_state * sizeof(float) : 2 * d_state * sizeof(float);
 
                 if (shmem_size > device->properties.limits.maxComputeSharedMemorySize) {
                     return false;
