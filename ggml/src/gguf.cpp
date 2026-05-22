@@ -228,7 +228,7 @@ struct gguf_context {
 };
 
 struct gguf_reader {
-    gguf_reader(FILE * file) : file(file) {
+    explicit gguf_reader(FILE * file) : file(file) {
         // read the remaining bytes once and update on each read
         nbytes_remain = file_remain(file);
     }
@@ -712,8 +712,7 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
     // compute the total size of the data section, taking into account the alignment
     {
         ctx->size = 0;
-        for (size_t i = 0; i < ctx->info.size(); ++i) {
-            const gguf_tensor_info & ti = ctx->info[i];
+        for (const gguf_tensor_info & ti : ctx->info) {
             if (ti.offset != ctx->size) {
                 GGML_LOG_ERROR("%s: tensor '%s' has offset %" PRIu64 ", expected %zu\n",
                     __func__, ti.t.name, ti.offset, ctx->size);
@@ -811,8 +810,7 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
         ggml_set_no_alloc(ctx_data, true);
 
         // create the tensors
-        for (size_t i = 0; i < ctx->info.size(); ++i) {
-            const struct gguf_tensor_info & info = ctx->info[i];
+        for (const struct gguf_tensor_info & info : ctx->info) {
 
             struct ggml_tensor * cur = ggml_new_tensor(ctx_data, info.t.type, GGML_MAX_DIMS, info.t.ne);
 
@@ -1283,7 +1281,7 @@ void gguf_set_tensor_data(struct gguf_context * ctx, const char * name, const vo
 struct gguf_writer_base {
     size_t written_bytes {0u};
 
-    ~gguf_writer_base(void) = default;
+    virtual ~gguf_writer_base(void) = default;
 
     // we bet on devirtualization
     virtual void write(int8_t val) = 0;
@@ -1390,7 +1388,7 @@ struct gguf_writer_base {
 struct gguf_writer_buf final : public gguf_writer_base {
     std::vector<int8_t> & buf;
 
-    gguf_writer_buf(std::vector<int8_t> & buf) : buf(buf) {}
+    explicit gguf_writer_buf(std::vector<int8_t> & buf) : buf(buf) {}
 
     using gguf_writer_base::write;
 
@@ -1428,7 +1426,7 @@ struct gguf_writer_buf final : public gguf_writer_base {
 struct gguf_writer_file final : public gguf_writer_base {
     FILE * file;
 
-    gguf_writer_file(FILE* file) : file(file) {}
+    explicit gguf_writer_file(FILE* file) : file(file) {}
 
     using gguf_writer_base::write;
 

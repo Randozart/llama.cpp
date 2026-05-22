@@ -618,7 +618,18 @@ static float make_qx_quants(int n, int nmax, const float * GGML_RESTRICT x, int8
         for (int i = 0; i < n; ++i) {
             int l = nearest_int(iscale * x[i]);
             l = MAX(-nmax, MIN(nmax-1, l));
-            float w = qw ? qw[i] : rmse_type == 1 ? x[i] * x[i] : rmse_type == 2 ? 1 : rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
+        float w;
+        if (qw) {
+            w = qw[i];
+        } else if (rmse_type == 1) {
+            w = x[i] * x[i];
+        } else if (rmse_type == 2) {
+            w = 1;
+        } else if (rmse_type == 3) {
+            w = fabsf(x[i]);
+        } else {
+            w = sqrtf(fabsf(x[i]));
+        }
             sumlx += w*x[i]*l;
             suml2 += w*l*l;
         }
@@ -3780,7 +3791,7 @@ void iq2xs_init_impl(enum ggml_type type) {
 
     const int kmap_size = 43692;
     //const int nwant = type == GGML_TYPE_IQ1_S ? 3 : 2;
-    const int nwant = type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ? 3 : type == GGML_TYPE_IQ2_S ? 1 : 2;
+    const int nwant = type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ? 3 : (type == GGML_TYPE_IQ2_S ? 1 : 2);
     const uint16_t * kgrid = type == GGML_TYPE_IQ2_XXS ? kgrid_2bit_256 :
                              type == GGML_TYPE_IQ2_XS  ? kgrid_2bit_512 :
                              type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ? kgrid_1bit_2048 : kgrid_2bit_1024;
@@ -5438,7 +5449,7 @@ static void quantize_row_iq1_m_impl(const float * GGML_RESTRICT x, void * GGML_R
             if (scale < 0) {
                 for (int j = 0; j < block_size; ++j) L[j] = 2 - L[j];
                 scale = -scale;
-                best_k = best_k == 0 ? 3 : best_k == 1 ? 2 : best_k == 2 ? 1 : 0;
+                best_k = 3 - best_k;
             }
             bool all_on_grid = true;
             for (int k = 0; k < block_size/8; ++k) {
