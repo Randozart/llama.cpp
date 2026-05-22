@@ -490,10 +490,13 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
         GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
 #endif // NDEBUG
         size_t nbytes = ggml_nbytes(src);
-        void * data = malloc(nbytes);
+        thread_local std::vector<uint8_t> staging_buf;
+        if (staging_buf.size() < nbytes) {
+            staging_buf.resize(nbytes);
+        }
+        void * data = staging_buf.data();
         ggml_backend_tensor_get(src, data, 0, nbytes);
         ggml_backend_tensor_set(dst, data, 0, nbytes);
-        free(data);
     }
 }
 
