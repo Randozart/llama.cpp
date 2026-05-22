@@ -3161,6 +3161,15 @@ private:
                     slot.print_timings();
                     send_final_response(slot);
                     metrics.on_prediction(slot);
+
+                    // Approach E: save exact-boundary checkpoint at generation end
+                    // so the next continuation turn restores to within 0 tokens of LCP boundary
+                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                        create_checkpoint(slot, 0, pos_min, pos_max);
+                    }
+
                     slot.release();
 
                     continue;
@@ -3271,6 +3280,13 @@ private:
                         slot.print_timings();
                         send_final_response(slot);
                         metrics.on_prediction(slot);
+
+                        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                            const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                            const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                            create_checkpoint(slot, 0, pos_min, pos_max);
+                        }
+
                         slot.release();
 
                         break;
