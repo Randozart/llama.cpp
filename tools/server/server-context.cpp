@@ -8,6 +8,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "treesitter/compact.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -2676,9 +2677,11 @@ private:
                         slot.prompt.tokens.keep_first(n_past);
 
                         // create a checkpoint at the LCP boundary for future reuse
+                        // n_past >= 1 ensures even a short LCP (e.g. 3 tokens) gets a checkpoint,
+                        // preventing full reprocess when the next request also has a short prefix
                         if (params_base.n_ctx_checkpoints > 0 &&
                             slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
-                            n_past >= 64 &&
+                            n_past >= 1 &&
                             (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || n_swa > 0) &&
                             (slot.prompt.checkpoints.empty() || n_past > slot.prompt.checkpoints.back().n_tokens + 64)) {
                             const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -3434,15 +3437,31 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
         //SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
 
+        // AST-aware prompt compaction
+        std::string compacted_str;
+        if (params.compact_prompt && prompt.is_string()) {
+            compacted_str = compact::compact_prompt(prompt.get<std::string>());
+            const size_t orig = prompt.get<std::string>().size();
+            const size_t comp = compacted_str.size();
+            if (comp < orig) {
+                SRV_INF("compacted prompt: %zu chars -> %zu chars (%.0f%% reduction)\n",
+                    orig, comp, 100.0f * (1.0f - (float)comp / (float)orig));
+            } else {
+                compacted_str.clear(); // no reduction, use original
+            }
+        }
+
         // process prompt
         std::vector<server_tokens> inputs;
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
+            std::string ps = compacted_str.empty() ? prompt.get<std::string>() : compacted_str;
+            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, ps, files));
         } else {
             // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+            json p = compacted_str.empty() ? prompt : json(compacted_str);
+            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, p, true, true);
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks

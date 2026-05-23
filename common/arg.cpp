@@ -1335,6 +1335,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--compact-prompt"},
+        {"--no-compact-prompt"},
+        "AST-aware compaction of code blocks in prompts to reduce token count (strips function bodies, retains signatures)",
+        [](common_params & params, bool value) {
+            params.compact_prompt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

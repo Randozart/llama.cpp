@@ -1,5 +1,56 @@
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
+# tree-sitter AST library for prompt compaction
+
+set(TARGET treesitter)
+
+# Tree-sitter core
+set(TS_SRC
+    treesitter/treesitter.c
+    treesitter/wasm_store.c
+)
+
+# AST compaction wrapper
+set(COMPACT_SRC
+    treesitter/compact.cpp
+)
+
+# Language grammar files (parser + scanner pairs)
+set(TS_GRAMMARS
+    treesitter/grammars/python.c
+    treesitter/grammars/python-scanner.c
+    treesitter/grammars/javascript.c
+    treesitter/grammars/javascript-scanner.c
+    treesitter/grammars/typescript.c
+    treesitter/grammars/typescript-scanner.c
+    treesitter/grammars/rust.c
+    treesitter/grammars/rust-scanner.c
+    treesitter/grammars/go.c
+    treesitter/grammars/c.c
+    treesitter/grammars/cpp.c
+    treesitter/grammars/cpp-scanner.c
+    treesitter/grammars/java.c
+    treesitter/grammars/bash.c
+    treesitter/grammars/bash-scanner.c
+)
+
+add_library(${TARGET} STATIC ${TS_SRC} ${COMPACT_SRC} ${TS_GRAMMARS})
+
+target_include_directories(${TARGET} PUBLIC
+    treesitter/include          # for tree_sitter/api.h / parser.h
+    treesitter                  # for local headers (alloc.h, etc.)
+    ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+# Grammar C files often have large tables and warnings - suppress them
+target_compile_options(${TARGET} PRIVATE -w)
+
+if (BUILD_SHARED_LIBS)
+    set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+target_link_libraries(${TARGET} PUBLIC ${CMAKE_THREAD_LIBS_INIT})
+
 # server-context containing the core server logic, used by llama-server and CLI
 
 set(TARGET server-context)
@@ -25,7 +76,7 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PUBLIC llama-common mtmd treesitter ${CMAKE_THREAD_LIBS_INIT})
 
 
 # llama-server executable
