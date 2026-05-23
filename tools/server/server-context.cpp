@@ -2659,18 +2659,8 @@ private:
                                 }
                             }
 
-                            {
-                                // erase any checkpoints with pos_max > pos_next
-                                for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
-                                    const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
-                                        SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
-                                        it = slot.prompt.checkpoints.erase(it);
-                                    } else {
-                                        ++it;
-                                    }
-                                }
-                            }
+                            
+
                         }
 
                         // [TAG_PROMPT_LOGITS]
@@ -2684,6 +2674,19 @@ private:
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        // create a checkpoint at the LCP boundary for future reuse
+                        if (params_base.n_ctx_checkpoints > 0 &&
+                            slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+                            n_past >= 64 &&
+                            (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || n_swa > 0) &&
+                            (slot.prompt.checkpoints.empty() || n_past > slot.prompt.checkpoints.back().n_tokens + 64)) {
+                            const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                            const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                            if (pos_min >= 0) {
+                                create_checkpoint(slot, 0, pos_min, pos_max);
+                            }
+                        }
 
                         // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
