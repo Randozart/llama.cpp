@@ -545,8 +545,19 @@ struct server_metrics {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    // speculative decoding / MTP aggregate counters
+    uint64_t n_draft_total_total     = 0;  // total draft tokens generated
+    uint64_t n_draft_accepted_total  = 0;  // total draft tokens accepted
+
     void init() {
         t_start = ggml_time_us();
+    }
+
+    void on_draft(const server_slot & slot) {
+        if (slot.n_draft_total > 0) {
+            n_draft_total_total    += slot.n_draft_total;
+            n_draft_accepted_total += slot.n_draft_accepted;
+        }
     }
 
     void on_prompt_eval(const server_slot & slot) {
@@ -605,6 +616,10 @@ public:
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
+
+    // draft metrics accessor (read-only, for server_routes)
+    uint64_t draft_n_total()    const { return metrics.n_draft_total_total; }
+    uint64_t draft_n_accepted() const { return metrics.n_draft_accepted_total; }
 
     ~server_context_impl() {
         if (!sleeping) {
@@ -3166,6 +3181,7 @@ private:
                     // release slot because of stop condition
                     slot.print_timings();
                     send_final_response(slot);
+                    metrics.on_draft(slot);
                     metrics.on_prediction(slot);
 
                     // Approach E: save exact-boundary checkpoint at generation end
@@ -3285,6 +3301,7 @@ private:
                     if (!process_token(result, slot)) {
                         slot.print_timings();
                         send_final_response(slot);
+                        metrics.on_draft(slot);
                         metrics.on_prediction(slot);
 
                         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
@@ -3905,6 +3922,19 @@ void server_routes::init_routes() {
             { "build_info",                  meta->build_info },
             { "is_sleeping",                 queue_tasks.is_sleeping() },
         };
+
+        // speculative decoding metrics (server-wide aggregates)
+        json draft_metrics = {
+            {"n_total",    this->ctx_server.draft_n_total()},
+            {"n_accepted", this->ctx_server.draft_n_accepted()},
+        };
+        int total = this->ctx_server.draft_n_total();
+        if (total > 0) {
+            draft_metrics["acceptance_rate"] =
+                (double) this->ctx_server.draft_n_accepted() / (double) total;
+        }
+        props["draft"] = draft_metrics;
+
         if (params.use_jinja) {
             if (!tmpl_tools.empty()) {
                 props["chat_template_tool_use"] = tmpl_tools;
