@@ -9,6 +9,8 @@
 #include <list>
 #include <mutex>
 #include <cuda.h>
+#include <cuda_runtime.h>
+#include <sys/mman.h>
 
 vitriol_config_t g_vitriol_config;
 
@@ -275,9 +277,20 @@ void vitriol_cuda_init(void) {
         if (val > 0 && val <= 7) g_vitriol_config.prune_experts = val;
     }
 
+    const char* locked_env = getenv("VITRIOL_MAX_LOCKED_MB");
+    if (locked_env) {
+        int val = atoi(locked_env);
+        if (val > 0) g_vitriol_config.max_locked_mb = val;
+    }
+
     if (g_vitriol_config.mode == VITRIOL_MODE_STREAM) {
         if (g_vitriol_config.verbose)
             printf("VITRIOL: stream mode — page-locked host RAM + LRU VRAM cache\n");
+        if (g_vitriol_config.max_locked_mb > 0) {
+            if (g_vitriol_config.verbose)
+                printf("VITRIOL: lazy page locking — max %d MB, per-expert on demand\n",
+                       g_vitriol_config.max_locked_mb);
+        }
     }
 
     if (g_vitriol_config.async_prefetch) {
@@ -310,6 +323,112 @@ void vitriol_cuda_init(void) {
         /* Register atexit handlers */
         atexit(vitriol_cuda_cleanup_vram);
         atexit(vitriol_cuda_print_stats);
+    }
+}
+
+/* ── Locked-Slice LRU (Lazy/Chunked Page Locking) ──────────────
+ * Tracks which (tensor_base, expert_idx) pairs are currently
+ * page-locked via mlock + cudaHostRegister. Keeps total locked
+ * bytes below g_vitriol_config.max_locked_mb. Evicts by LRU.
+ * ───────────────────────────────────────────────────────────────*/
+
+#define VITRIOL_MAX_LOCKED_SLICES 1024
+
+struct locked_slice {
+    const void * tensor_base;
+    int          expert_idx;
+    size_t       size;
+    uint64_t     last_used;  // timestamp for LRU eviction
+};
+
+static std::mutex               g_locked_mtx;
+static locked_slice             g_locked_slices[VITRIOL_MAX_LOCKED_SLICES];
+static int                      g_n_locked_slices = 0;
+static uint64_t                 g_locked_bytes    = 0;
+static uint64_t                 g_locked_epoch    = 1;
+
+void vitriol_ensure_expert_locked(const void * tensor_base, int expert_idx, size_t expert_size) {
+    if (!vitriol_lazy_lock_active()) return;
+    if (expert_size == 0) return;
+
+    std::lock_guard<std::mutex> lock(g_locked_mtx);
+
+    /* Check if already locked */
+    for (int i = 0; i < g_n_locked_slices; i++) {
+        if (g_locked_slices[i].tensor_base == tensor_base &&
+            g_locked_slices[i].expert_idx == expert_idx) {
+            g_locked_slices[i].last_used = g_locked_epoch++;
+            return;
+        }
+    }
+
+    /* Evict if at budget limit */
+    const uint64_t max_bytes = (uint64_t)g_vitriol_config.max_locked_mb * 1024 * 1024;
+    while (g_locked_bytes + expert_size > max_bytes && g_n_locked_slices > 0) {
+        /* Find LRU victim */
+        int victim = 0;
+        uint64_t oldest = g_locked_slices[0].last_used;
+        for (int i = 1; i < g_n_locked_slices; i++) {
+            if (g_locked_slices[i].last_used < oldest) {
+                oldest = g_locked_slices[i].last_used;
+                victim = i;
+            }
+        }
+
+        const locked_slice & s = g_locked_slices[victim];
+        const void * addr = (const char *)s.tensor_base + (ptrdiff_t)s.expert_idx * (ptrdiff_t)s.size;
+
+        cudaError_t err = cudaHostUnregister((void *)addr);
+        if (err != cudaSuccess && g_vitriol_config.verbose) {
+            fprintf(stderr, "VITRIOL: cudaHostUnregister evict failed: %s\n", cudaGetErrorString(err));
+        }
+        munlock(addr, s.size);
+
+        g_locked_bytes -= s.size;
+        g_n_locked_slices--;
+
+        /* Swap last slot into victim position */
+        if (victim < g_n_locked_slices) {
+            g_locked_slices[victim] = g_locked_slices[g_n_locked_slices];
+        }
+    }
+
+    /* Lock this slice */
+    const void * addr = (const char *)tensor_base + (ptrdiff_t)expert_idx * (ptrdiff_t)expert_size;
+
+    if (mlock(addr, expert_size) != 0) {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "VITRIOL: mlock slice(%zu) failed: %m — subsequent failures suppressed\n", expert_size);
+            warned = true;
+        }
+        return;
+    }
+
+    cudaError_t err = cudaHostRegister((void *)addr, expert_size, 0);
+    if (err != cudaSuccess) {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "VITRIOL: cudaHostRegister slice(%zu) failed: %s — subsequent failures suppressed\n",
+                    expert_size, cudaGetErrorString(err));
+            warned = true;
+        }
+        munlock(addr, expert_size);
+        return;
+    }
+
+    /* Record */
+    int slot = g_n_locked_slices++;
+    g_locked_slices[slot].tensor_base = tensor_base;
+    g_locked_slices[slot].expert_idx  = expert_idx;
+    g_locked_slices[slot].size        = expert_size;
+    g_locked_slices[slot].last_used   = g_locked_epoch++;
+    g_locked_bytes += expert_size;
+
+    if (g_vitriol_config.verbose) {
+        printf("VITRIOL: locked slice (tensor=%p, expert=%d, size=%zu, total_locked=%lu MiB)\n",
+               (const void *)tensor_base, expert_idx, expert_size,
+               (unsigned long)(g_locked_bytes / 1024 / 1024));
     }
 }
 
@@ -556,7 +675,13 @@ CUdeviceptr vitriol_pin_ensure(
     CUdeviceptr vram_buf = g_pin_pool + g_pin_pool_offset;
     g_pin_pool_offset += total_size;
 
-    /* Async H2D copy of the full tensor to VRAM */
+    /* Async H2D copy of the full tensor to VRAM.
+     * In lazy mode, ensure all expert pages are locked first. */
+    if (vitriol_lazy_lock_active()) {
+        for (int64_t i = 0; i < n_experts; i++) {
+            vitriol_ensure_expert_locked(tensor_base, (int)i, tensor_nb02);
+        }
+    }
     CUresult err = cuMemcpyHtoDAsync(vram_buf, tensor_base, total_size, stream);
     if (err != CUDA_SUCCESS) {
         fprintf(stderr, "VITRIOL: pin H2D copy failed (%d)\n", (int)err);
@@ -774,12 +899,18 @@ void vitriol_lru_prefetch(
     CUstream       compute_stream)
 {
     (void)compute_stream;
+    if (vitriol_lazy_lock_active()) {
+        vitriol_ensure_expert_locked(tensor_base, expert_idx, expert_size);
+    }
     vitriol_lru_prefetch_async(tensor_base, expert_idx, expert_data, expert_size);
 }
 
 ggml_backend_buffer_type_t vitriol_get_expert_buffer_type(void) {
     if (g_vitriol_config.mode != VITRIOL_MODE_STREAM)
         return NULL;
+    if (g_vitriol_config.max_locked_mb > 0) {
+        return vitriol_get_buffer_type_lazy(0);
+    }
     return vitriol_get_buffer_type(0);
 }
 

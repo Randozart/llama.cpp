@@ -46,11 +46,33 @@ typedef struct {
     int  pin_tensors_per_layer;  // auto-detected: number of tensor ops per model layer (default 2 for fused gate+up + down)
     bool pin_active;          // true after first pin allocation
     int  prune_experts;       // 0=off, N=drop bottom N of 8 active experts before compute
+    int  max_locked_mb;       // 0=all (eager), N=max MiB of page-locked host RAM (lazy/chunked)
 } vitriol_config_t;
 
 extern vitriol_config_t g_vitriol_config;
 
 void vitriol_cuda_init(void);
+
+/* ── Lazy (Chunked) Page Locking ──────────────────────────────────
+ * When max_locked_mb > 0, expert weight buffers are allocated as
+ * pageable mmap (no mlock, no cudaHostRegister). Individual expert
+ * slices are page-locked on demand via vitriol_ensure_expert_locked(),
+ * limited to max_locked_mb total. Stale slices are evicted via LRU.
+ * ──────────────────────────────────────────────────────────────────*/
+
+/* Returns true if lazy/chunked page locking is active. */
+static inline bool vitriol_lazy_lock_active(void) {
+    return g_vitriol_config.max_locked_mb > 0;
+}
+
+/* Ensure a single expert slice (nb02 bytes at tensor_base + i02*nb02)
+ * is page-locked and DMA-registered. May evict a stale locked slice
+ * to stay within max_locked_mb budget. Idempotent — safe to call
+ * multiple times for the same slice. */
+void vitriol_ensure_expert_locked(
+    const void    *tensor_base,
+    int            expert_idx,
+    size_t         expert_size);
 
 static inline bool vitriol_is_stream_enabled(void) {
     return g_vitriol_config.mode == VITRIOL_MODE_STREAM;

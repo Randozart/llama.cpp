@@ -266,6 +266,34 @@ static const struct ggml_backend_buffer_type_i vitriol_buffer_type_interface = {
     /* .is_host          = */ vitriol_buffer_type_is_host,
 };
 
+/* ── Lazy buffer type (pageable, no mlock, no cudaHostRegister) ── */
+
+static ggml_backend_buffer_t vitriol_buffer_type_alloc_buffer_lazy(ggml_backend_buffer_type_t buft, size_t size) {
+    void * ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        fprintf(stderr, "VITRIOL: lazy mmap(%zu) failed: %m\n", size);
+        return nullptr;
+    }
+    /* No mlock, no cudaHostRegister, no MAP_POPULATE — done lazily
+     * per-expert via vitriol_ensure_expert_locked(). Pages are faulted
+     * in on first memcpy during tensor loading, so no memset needed. */
+    if (g_vitriol_config.verbose)
+        printf("VITRIOL: lazy buffer — pageable mmap (%zu MiB, not locked)\n",
+               size / 1024 / 1024);
+    auto * ctx = new vitriol_buffer_context{ptr, size};
+    return ggml_backend_buffer_init(buft, vitriol_buffer_interface, ctx, size);
+}
+
+static const struct ggml_backend_buffer_type_i vitriol_buffer_type_lazy_interface = {
+    /* .get_name         = */ vitriol_buffer_type_get_name,
+    /* .alloc_buffer     = */ vitriol_buffer_type_alloc_buffer_lazy,
+    /* .get_alignment    = */ vitriol_buffer_type_get_alignment,
+    /* .get_max_size     = */ nullptr,
+    /* .get_alloc_size   = */ vitriol_buffer_type_get_alloc_size,
+    /* .is_host          = */ vitriol_buffer_type_is_host,
+};
+
 /* ── Singleton access ─────────────────────────────────────────── */
 
 ggml_backend_buffer_type_t vitriol_get_buffer_type(int device) {
@@ -296,6 +324,35 @@ ggml_backend_buffer_type_t vitriol_get_buffer_type(int device) {
                 /* .iface   = */ iface,
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
                 /* .context = */ new vitriol_buffer_type_context{i, "VITRIOL"},
+            };
+        }
+        initialized = true;
+    }
+
+    if (device >= ggml_backend_cuda_get_device_count())
+        return nullptr;
+    return &types[device];
+}
+
+ggml_backend_buffer_type_t vitriol_get_buffer_type_lazy(int device) {
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+
+    static ggml_backend_buffer_type types[GGML_CUDA_MAX_DEVICES];
+    static bool initialized = false;
+
+    if (!initialized) {
+        auto cuda_host_buft = ggml_backend_cuda_host_buffer_type();
+        auto cuda_host_get_name = cuda_host_buft->iface.get_name;
+
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            ggml_backend_buffer_type_i iface = vitriol_buffer_type_lazy_interface;
+            iface.get_name = cuda_host_get_name;
+
+            types[i] = {
+                /* .iface   = */ iface,
+                /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context = */ new vitriol_buffer_type_context{i, "VITRIOL_LAZY"},
             };
         }
         initialized = true;

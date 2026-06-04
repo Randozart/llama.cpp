@@ -2546,7 +2546,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    const bool fast_path_allowed = !vitriol_lazy_lock_active() || use_pinned;
+    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && fast_path_allowed) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
@@ -2625,8 +2626,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     vitriol_predictor_prefetch(src0->data, (size_t)nb02, stream);
 
     std::vector<char> ids_host(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (ggml_backend_buffer_is_host(ids->buffer)) {
+        memcpy(ids_host.data(), ids->data, ggml_nbytes(ids));
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
@@ -2692,6 +2697,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src0_slice.data     = (char *) src0->data + i02*nb02;
 
         if (vitriol_is_stream_enabled()) {
+            if (vitriol_lazy_lock_active()) {
+                vitriol_ensure_expert_locked(
+                    src0->data,
+                    (int)i02,
+                    (size_t)nb02);
+            }
             CUdeviceptr vram_ptr = vitriol_lru_ensure(
                 src0->data,              // tensor_base
                 (int)i02,                // expert_idx
