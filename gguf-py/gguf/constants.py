@@ -846,6 +846,8 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HNORM          = auto()
     NEXTN_SHARED_HEAD_HEAD = auto()
     NEXTN_SHARED_HEAD_NORM = auto()
+    MTP_PRE_PROJ         = auto()
+    MTP_POST_PROJ        = auto()
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -1344,6 +1346,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
+    MODEL_TENSOR.MTP_PRE_PROJ:             "blk.{bid}.mtp.pre_proj",
+    MODEL_TENSOR.MTP_POST_PROJ:            "blk.{bid}.mtp.post_proj",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
