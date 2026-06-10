@@ -1252,8 +1252,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (!chimera_env_check || !chimera_env_check[0]) chimera_env_check = "auto";
             bool vulkan_only = (strcmp(chimera_env_check, "vulkan") == 0);
 
-            if (tensor_name.find("exps") != std::string::npos) {
-                LLAMA_LOG_INFO("VITRIOL: tensor '%s' matched 'exps' pattern\n", tensor_name.c_str());
+            if (tensor_name.find("exps.weight") != std::string::npos) {
+                LLAMA_LOG_INFO("VITRIOL: tensor '%s' matched 'exps.weight' pattern\n", tensor_name.c_str());
                 if (vulkan_only && vitriol_vk_getter) {
                     /* Vulkan-only mode: experts also go to VK buffer type */
                     buft = vitriol_vk_getter();
