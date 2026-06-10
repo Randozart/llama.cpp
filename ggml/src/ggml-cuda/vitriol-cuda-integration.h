@@ -100,6 +100,11 @@ void vitriol_lru_prefetch(
     size_t         expert_size,
     CUstream       compute_stream);
 
+/* Mark an LRU VRAM slot as no longer in use by compute.
+ * Called from ggml-cuda.cu after each matmul so the LRU stream knows
+ * it is safe to overwrite this slot on eviction. */
+void vitriol_lru_mark_compute_done(CUdeviceptr vram_ptr, CUstream stream);
+
 /* ── Predictive Prefetching ──────────────────────────────────────────
  * Combined cross-layer + temporal prediction (Fate-style heuristic).
  *

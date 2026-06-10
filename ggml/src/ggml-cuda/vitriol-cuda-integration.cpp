@@ -57,9 +57,9 @@ static std::unordered_map<LRUKey, int, LRUKeyHash> g_lru_map;
 static std::list<LRUKey> g_lru_order;
 static std::mutex        g_lru_mtx;
 
-/* Dedicated stream + event for async DMA */
+/* Dedicated stream for async DMA; per-slot events for sync */
 static CUstream  g_lru_stream = 0;
-static CUevent   g_lru_event  = 0;
+static CUevent  *g_lru_slot_events = nullptr;
 
 static struct LRUStats {
     unsigned long long hits;
@@ -720,8 +720,6 @@ static bool lru_ensure_stream(void) {
     CUresult r;
     r = cuStreamCreate(&g_lru_stream, CU_STREAM_NON_BLOCKING);
     if (r != CUDA_SUCCESS) return false;
-    r = cuEventCreate(&g_lru_event, CU_EVENT_DISABLE_TIMING);
-    if (r != CUDA_SUCCESS) return false;
     return true;
 }
 
@@ -760,6 +758,12 @@ static bool lru_init_pool(size_t min_expert_size) {
         printf("VITRIOL: LRU pool %zu MB, %d slots x %zu bytes\n",
                pool_size / 1024 / 1024, g_lru_num_slots, g_lru_slot_size);
 
+    if (!g_lru_slot_events) {
+        g_lru_slot_events = new CUevent[g_lru_num_slots];
+        for (int i = 0; i < g_lru_num_slots; i++)
+            cuEventCreate(&g_lru_slot_events[i], CU_EVENT_DISABLE_TIMING);
+    }
+
     return true;
 }
 
@@ -796,8 +800,8 @@ CUdeviceptr vitriol_lru_ensure(
             g_lru_order.remove(key);
             g_lru_order.push_front(key);
             g_lru_stats.hits++;
-            /* Wait for any in-flight prefetch DMA on the LRU stream */
-            cuStreamWaitEvent(cstream, g_lru_event, 0);
+            /* Wait for any in-flight prefetch DMA on this slot */
+            cuStreamWaitEvent(cstream, g_lru_slot_events[it->second], 0);
             return g_lru_pool + (size_t)it->second * g_lru_slot_size;
         }
     }
@@ -824,15 +828,18 @@ CUdeviceptr vitriol_lru_ensure(
 
     CUdeviceptr dst = g_lru_pool + (size_t)slot * g_lru_slot_size;
 
+    /* Wait for compute to finish reading this slot before overwriting it */
+    cuStreamWaitEvent(g_lru_stream, g_lru_slot_events[slot], 0);
+
     /* Async DMA on dedicated stream, then make compute stream wait */
     CUresult r;
     r = cuMemcpyHtoDAsync(dst, expert_data, expert_size, g_lru_stream);
     if (r != CUDA_SUCCESS) return 0;
 
-    r = cuEventRecord(g_lru_event, g_lru_stream);
+    r = cuEventRecord(g_lru_slot_events[slot], g_lru_stream);
     if (r != CUDA_SUCCESS) return 0;
 
-    r = cuStreamWaitEvent(cstream, g_lru_event, 0);
+    r = cuStreamWaitEvent(cstream, g_lru_slot_events[slot], 0);
     if (r != CUDA_SUCCESS) return 0;
 
     return dst;
@@ -885,10 +892,13 @@ static void vitriol_lru_prefetch_async(
 
     CUdeviceptr dst = g_lru_pool + (size_t)slot * g_lru_slot_size;
 
+    /* Wait for compute to finish with this slot before overwriting */
+    cuStreamWaitEvent(g_lru_stream, g_lru_slot_events[slot], 0);
+
     /* Async DMA — no cuStreamWaitEvent, compute stream NOT blocked */
     CUresult r = cuMemcpyHtoDAsync(dst, expert_data, expert_size, g_lru_stream);
     if (r != CUDA_SUCCESS) return;
-    cuEventRecord(g_lru_event, g_lru_stream);
+    cuEventRecord(g_lru_slot_events[slot], g_lru_stream);
 }
 
 void vitriol_lru_prefetch(
@@ -914,7 +924,23 @@ ggml_backend_buffer_type_t vitriol_get_expert_buffer_type(void) {
     return vitriol_get_buffer_type(0);
 }
 
+void vitriol_lru_mark_compute_done(CUdeviceptr vram_ptr, CUstream stream) {
+    if (!vram_ptr || !g_lru_slot_events || !g_lru_pool)
+        return;
+    long long offset = (long long)(vram_ptr - g_lru_pool);
+    int slot = (int)(offset / g_lru_slot_size);
+    if (slot >= 0 && slot < g_lru_num_slots && offset % g_lru_slot_size == 0) {
+        cuEventRecord(g_lru_slot_events[slot], stream);
+    }
+}
+
 void vitriol_cuda_cleanup_vram(void) {
+    if (g_lru_slot_events) {
+        for (int i = 0; i < g_lru_num_slots; i++)
+            cuEventDestroy(g_lru_slot_events[i]);
+        delete[] g_lru_slot_events;
+        g_lru_slot_events = nullptr;
+    }
     if (g_lru_pool != 0) {
         CUresult r = cuMemFree(g_lru_pool);
         if (r != CUDA_SUCCESS) {

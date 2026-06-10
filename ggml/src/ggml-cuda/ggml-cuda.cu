@@ -2696,6 +2696,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src0_slice.view_src = dst->src[0]; // non-const pointer to src0
         src0_slice.data     = (char *) src0->data + i02*nb02;
 
+        CUdeviceptr vram_ptr = 0;
         if (vitriol_is_stream_enabled()) {
             if (vitriol_lazy_lock_active()) {
                 vitriol_ensure_expert_locked(
@@ -2703,7 +2704,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     (int)i02,
                     (size_t)nb02);
             }
-            CUdeviceptr vram_ptr = vitriol_lru_ensure(
+            vram_ptr = vitriol_lru_ensure(
                 src0->data,              // tensor_base
                 (int)i02,                // expert_idx
                 (const void *)((char *) src0->data + i02*nb02),  // expert_data
@@ -2765,6 +2766,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         } else {
             ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
             CUDA_CHECK(cudaGetLastError());
+        }
+
+        if (vram_ptr != 0) {
+            vitriol_lru_mark_compute_done(vram_ptr, stream);
         }
 
         src1_data_cur += src1_slice.nb[2];

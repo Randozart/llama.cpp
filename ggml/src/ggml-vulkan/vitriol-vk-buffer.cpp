@@ -89,13 +89,15 @@ static void * vitriol_vk_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 static void vitriol_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    auto * ctx = (vitriol_vk_buffer_ctx *)buffer->context;
-    memcpy((char *)ctx->ptr + offset, data, size);
+    GGML_ASSERT(tensor);
+    memcpy((char *)tensor->data + offset, data, size);
+    GGML_UNUSED(buffer);
 }
 
 static void vitriol_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    auto * ctx = (vitriol_vk_buffer_ctx *)buffer->context;
-    memcpy(data, (const char *)ctx->ptr + offset, size);
+    GGML_ASSERT(tensor);
+    memcpy(data, (const char *)tensor->data + offset, size);
+    GGML_UNUSED(buffer);
 }
 
 static void vitriol_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {

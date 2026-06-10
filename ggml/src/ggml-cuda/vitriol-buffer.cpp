@@ -110,23 +110,26 @@ static void * vitriol_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 static void vitriol_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    auto * ctx = (vitriol_buffer_context *)buffer->context;
-    memcpy((char *)ctx->base + offset, data, size);
+    GGML_ASSERT(tensor);
+    memcpy((char *)tensor->data + offset, data, size);
+    GGML_UNUSED(buffer);
 }
 
 static void vitriol_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    auto * ctx = (vitriol_buffer_context *)buffer->context;
-    memcpy(data, (const char *)ctx->base + offset, size);
+    GGML_ASSERT(tensor);
+    memcpy(data, (const char *)tensor->data + offset, size);
+    GGML_UNUSED(buffer);
 }
 
 static void vitriol_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
-    auto * ctx = (vitriol_buffer_context *)buffer->context;
-    char * base = (char *)ctx->base + offset;
+    GGML_ASSERT(tensor);
+    char * base = (char *)tensor->data + offset;
     const char * src = (const char *)data;
     for (size_t i = 0; i < n_copies; i++) {
         memcpy(base + i * stride_tensor, src + i * stride_data, size);
     }
+    GGML_UNUSED(buffer);
 }
 
 static void vitriol_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
