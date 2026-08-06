@@ -213,7 +213,14 @@ llama_kv_cache::llama_kv_cache(
             // VITRIOL: check for KV cache offload mode (page-locked host RAM)
             const char * vitriol_kv_mode = std::getenv("VITRIOL_KV_MODE");
             if (vitriol_kv_mode && strcmp(vitriol_kv_mode, "offload") == 0) {
+                // 2026-08-06: GPU-only. CPU-placed layers (il >= n_gpu_layers) have a
+                // device whose get_host_buffer_type is NULL (ggml-cpu.cpp:489), so
+                // ggml_backend_dev_host_buffer_type() returns NULL and buft_is_host()
+                // aborts. Fall back to the normal device buffer type for those layers.
                 buft = ggml_backend_dev_host_buffer_type(dev);
+                if (buft == nullptr) {
+                    buft = ggml_backend_dev_buffer_type(dev);
+                }
                 dev_name = "VITRIOL-KV (host RAM)";
             } else {
                 buft = ggml_backend_dev_buffer_type(dev);
