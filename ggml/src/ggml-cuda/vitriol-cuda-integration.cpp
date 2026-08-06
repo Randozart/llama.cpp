@@ -815,8 +815,21 @@ CUdeviceptr vitriol_lru_ensure(
         if ((int)g_lru_map.size() < g_lru_num_slots) {
             slot = (int)g_lru_map.size();
         } else {
+            // PROVENANCE: inspiration — kimi-k3-in-c (Apache-2.0; re-derived, not copied).
+            // Three-state cache principle: skip INFLIGHT slots in victim selection. Pick
+            // the LRU candidate whose last DMA has COMPLETED (cuEventQuery == SUCCESS)
+            // instead of blindly evicting the LRU and stalling on its in-flight fill.
             LRUKey evict = g_lru_order.back();
-            g_lru_order.pop_back();
+            for (auto it = std::prev(g_lru_order.end()); it != g_lru_order.begin(); --it) {
+                auto mit = g_lru_map.find(*it);
+                int s = (mit != g_lru_map.end()) ? mit->second : -1;
+                if (s >= 0 && s < g_lru_num_slots &&
+                    cuEventQuery(g_lru_slot_events[s]) == CUDA_SUCCESS) {
+                    evict = *it;
+                    break;
+                }
+            }
+            g_lru_order.remove(evict);
             auto eit = g_lru_map.find(evict);
             slot = (eit != g_lru_map.end()) ? eit->second : 0;
             if (eit != g_lru_map.end()) g_lru_map.erase(eit);
