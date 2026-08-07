@@ -17,6 +17,10 @@
 #include <limits>
 #include <stdexcept>
 
+// VITRIOL expert-fired rectification: scheduler eval callback that tallies the
+// MoE absolute-expert-id tensors as each node finishes computing.
+static bool expert_fired_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
+
 //
 // llama_context
 //
@@ -1339,6 +1343,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    // ── VITRIOL expert-fired rectification hook ──
+    // When a request wants the firing tally, observe the MoE router output
+    // (`ffn_moe_topk`, the absolute expert-id tensor) through the scheduler's
+    // eval callback — it fires right after each node computes, so the data is
+    // current and correctly placed (no post-hoc buffer aliasing). Gated so the
+    // overhead is zero when unused. Must be set BEFORE graph_compute.
+    if (expert_fired_enabled) {
+        expert_fired_top_k = (int32_t) model.hparams.n_expert_used;
+        ggml_backend_sched_set_eval_callback(sched.get(), expert_fired_eval_cb, this);
+    } else {
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -4203,4 +4220,68 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+//
+// VITRIOL expert-fired rectification hook
+//
+
+// Scheduler eval callback: fires right after each node computes. On the MoE
+// absolute-expert-id tensor (`ffn_moe_topk`), read the ids into the context's
+// fired set. Sanity-guard the values so stray buffers cannot pollute the tally.
+static bool expert_fired_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    if (ask || strcmp(t->name, "ffn_moe_topk") != 0) {
+        return true;
+    }
+    auto * ctx = static_cast<llama_context *>(user_data);
+    const int64_t n_elems = ggml_nelements(t);
+    if (n_elems <= 0 || ggml_element_size(t) < 4) {
+        return true;
+    }
+    // The tensor is the (possibly full, descending) argsort of the router:
+    // [n_expert, n_tokens]. The selected experts per token are the top-k rows.
+    const int64_t n_expert = t->ne[0];
+    const int64_t n_tokens = t->ne[1];
+    const int64_t k = ctx->expert_fired_top_k > 0 ? ctx->expert_fired_top_k : n_expert;
+    std::lock_guard<std::mutex> lock(ctx->expert_fired_mtx);
+    std::vector<int32_t> buf((size_t) n_elems);
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * ggml_element_size(t));
+    for (int64_t col = 0; col < n_tokens; col++) {
+        for (int64_t row = 0; row < k && row < n_expert; row++) {
+            const int32_t id = buf[col * n_expert + row];
+            if (id >= 0 && id < 4096) {
+                ctx->expert_fired.insert(id);
+            }
+        }
+    }
+    return true;
+}
+
+void llama_ctx_expert_fired_reset(struct llama_context * ctx) {
+    std::lock_guard<std::mutex> lock(ctx->expert_fired_mtx);
+    ctx->expert_fired.clear();
+}
+
+void llama_ctx_expert_fired_enable(struct llama_context * ctx, bool enable) {
+    ctx->expert_fired_enabled = enable;
+    if (!enable) {
+        std::lock_guard<std::mutex> lock(ctx->expert_fired_mtx);
+        ctx->expert_fired.clear();
+    }
+}
+
+int32_t llama_ctx_expert_fired_get(struct llama_context * ctx, int32_t * out, size_t cap) {
+    std::lock_guard<std::mutex> lock(ctx->expert_fired_mtx);
+    const size_t n = ctx->expert_fired.size();
+    if (out == nullptr || cap == 0) {
+        return (int32_t) n;
+    }
+    size_t i = 0;
+    for (int32_t id : ctx->expert_fired) {
+        if (i >= cap) {
+            break;
+        }
+        out[i++] = id;
+    }
+    return (int32_t) i;
 }

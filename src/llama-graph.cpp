@@ -1430,6 +1430,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // select top n_group_used expert groups
     // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/modeling_deepseek.py#L440-L457
+    ggml_tensor * expert_groups = nullptr;
     if (hparams.n_expert_groups > 1 && n_tokens > 0) {
         const int64_t n_exp_per_group = n_expert / hparams.n_expert_groups;
 
@@ -1466,6 +1467,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     } else {
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
+
+    // VITRIOL rectification hook: expose the ABSOLUTE expert ids selected by
+    // the router. For group-MoE (deepseek-style) selected_experts holds
+    // within-group indices; add the group offset so the tallied set spans the
+    // real expert pool. The named tensor is read by the post-compute scan.
+    ggml_tensor * rectify_ids = selected_experts;
+    if (hparams.n_expert_groups > 1 && n_tokens > 0) {
+        ggml_tensor * g = ggml_reshape_3d(ctx0, expert_groups, 1, hparams.n_group_used, n_tokens);
+        g = ggml_cast(ctx0, g, GGML_TYPE_F32);
+        g = ggml_scale(ctx0, g, (float) (n_expert / hparams.n_expert_groups));
+        g = ggml_cast(ctx0, g, GGML_TYPE_I32);
+        rectify_ids = ggml_add(ctx0, selected_experts, g);
+    }
+    cb(rectify_ids, "ffn_moe_rectify_ids", il);
+    ggml_set_name(rectify_ids, "ffn_moe_topk");
 
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);

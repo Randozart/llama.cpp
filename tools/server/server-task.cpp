@@ -250,6 +250,7 @@ task_params server_task::params_from_json_cmpl(
     params.stream           = json_value(data,       "stream",             false);
     auto stream_opt         = json_value(data,       "stream_options",     json::object());
     params.include_usage    = json_value(stream_opt, "include_usage",      false);
+    params.rectify          = json_value(data,       "rectify",            false);
     params.cache_prompt     = json_value(data,       "cache_prompt",       defaults.cache_prompt);
     params.return_tokens    = json_value(data,       "return_tokens",      false);
     params.return_progress  = json_value(data,       "return_progress",    false);
@@ -800,6 +801,11 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     }
     if (timings.prompt_n >= 0) {
         res.push_back({"timings", timings.to_json()});
+    }
+
+    // VITRIOL rectification: which MoE experts fired during this request.
+    if (!expert_fired.empty()) {
+        res["rectify"] = json{{"experts", expert_fired}};
     }
 
     return res;

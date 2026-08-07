@@ -72,6 +72,10 @@ struct task_params {
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
 
+    // VITRIOL rectification: when set, the server enables the expert-fired scan
+    // for this request and reports `rectify.experts` in the response.
+    bool rectify = false;
+
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 
@@ -355,6 +359,10 @@ struct server_task_result_cmpl_final : server_task_result {
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;
     std::vector<std::string>  response_fields;
+
+    // VITRIOL rectification: MoE expert ids that fired during this request
+    // (union across decode steps), exposed as `rectify.experts`.
+    std::vector<int32_t> expert_fired;
 
     task_params generation_params;
 

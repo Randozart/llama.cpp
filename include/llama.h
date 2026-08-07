@@ -972,6 +972,21 @@ extern "C" {
     // Get the number of threads used for prompt and batch processing (multiple token).
     LLAMA_API int32_t llama_n_threads_batch(struct llama_context * ctx);
 
+    // VITRIOL expert-fired rectification hook.
+    // Records which MoE expert ids are selected across decode steps; the server
+    // resets per request and reads the union to build the `rectify.experts`
+    // completion response field (the RECTIFY firing tally).
+
+    // Clear the accumulated fired-expert set.
+    LLAMA_API void llama_ctx_expert_fired_reset(struct llama_context * ctx);
+
+    // Enable/disable the per-decode scan (off by default to save time).
+    LLAMA_API void llama_ctx_expert_fired_enable(struct llama_context * ctx, bool enable);
+
+    // Copy the union of fired expert ids into `out` (capacity `cap`); returns
+    // the count written (or the total count when `cap` is 0).
+    LLAMA_API int32_t llama_ctx_expert_fired_get(struct llama_context * ctx, int32_t * out, size_t cap);
+
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);

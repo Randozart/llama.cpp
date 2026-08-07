@@ -1383,6 +1383,11 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        // VITRIOL rectification: start a fresh firing tally for this request
+        // (scan enabled only when the client asked for it).
+        llama_ctx_expert_fired_enable(ctx_tgt, slot.task->params.rectify);
+        llama_ctx_expert_fired_reset(ctx_tgt);
+
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
@@ -1681,6 +1686,15 @@ private:
         res->timings         = slot.get_timings();
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
+
+        // VITRIOL rectification: snapshot the fired-expert tally for the reply.
+        {
+            int32_t cap = llama_ctx_expert_fired_get(ctx_tgt, nullptr, 0);
+            if (cap > 0) {
+                res->expert_fired.resize(cap);
+                llama_ctx_expert_fired_get(ctx_tgt, res->expert_fired.data(), cap);
+            }
+        }
 
         res->truncated             = slot.truncated;
         res->n_decoded             = slot.n_decoded;

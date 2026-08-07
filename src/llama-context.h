@@ -13,6 +13,9 @@
 
 #include <map>
 #include <vector>
+#include <set>
+#include <mutex>
+#include <string>
 
 struct llama_model;
 class llama_batch_allocr;
@@ -249,6 +252,14 @@ public:
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+
+    // ── VITRIOL expert-fired rectification hook ──
+    // Set of MoE expert ids selected across decode steps since the last reset
+    // (the RECTIFY signal: which experts actually fire for a request).
+    std::set<int32_t>   expert_fired;
+    bool                expert_fired_enabled = false;
+    int32_t             expert_fired_top_k   = 0; // top-k experts per token to tally
+    std::mutex          expert_fired_mtx;
 
 private:
     llm_graph_params graph_params(
