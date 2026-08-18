@@ -175,10 +175,20 @@ static inline bool vitriol_pin_active(void) {
     return g_vitriol_config.pin_active;
 }
 
+/* Returns true if expert pinning is enabled — either the global
+ * VITRIOL_PIN_FIRST_N_LAYERS or any per-device override
+ * VITRIOL_PIN_FIRST_N_LAYERS_GPU<d> is > 0. */
+bool vitriol_pin_enabled(void);
+
 void vitriol_cuda_print_stats(void);
 
 __attribute__((visibility("default")))
 struct ggml_backend_buffer_type * vitriol_get_expert_buffer_type(void);
+
+/* Device-aware variant: returns the VITRIOL expert buffer type bound to the
+ * given CUDA device (for multi-GPU layer splits). Called by the model loader. */
+__attribute__((visibility("default")))
+struct ggml_backend_buffer_type * vitriol_get_expert_buffer_type_dev(int device);
 
 /* ── Expert Output Cache (approximate) ──────────────────────────────
  * During single-token generation, caches each expert's FFN output

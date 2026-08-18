@@ -75,8 +75,6 @@ struct cli_context {
         // defaults.return_progress = true; // TODO: show progress
 
         verbose_prompt = params.verbose_prompt;
-        reasoning_budget = params.reasoning_budget;
-        reasoning_budget_message = params.reasoning_budget_message;
     }
 
     std::string generate_completion(result_timings & out_timings) {
@@ -646,7 +644,6 @@ int main(int argc, char ** argv) {
 
     // bump the log level to display timings
     common_log_set_verbosity_thold(LOG_LEVEL_INFO);
-    llama_memory_breakdown_print(ctx_cli.ctx_server.get_llama_context());
 
     return 0;
 }

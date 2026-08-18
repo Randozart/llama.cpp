@@ -2532,7 +2532,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor *orig_src0 = src0;
     bool use_pinned = false;
 
-    if (g_vitriol_config.pin_first_n_layers > 0) {
+    if (vitriol_pin_enabled()) {
         vitriol_pin_ensure(src0->data, (size_t)nb02, ne02, ctx.stream());
         CUdeviceptr pin_ptr = vitriol_pin_lookup(src0->data);
         if (pin_ptr) {

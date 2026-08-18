@@ -3182,6 +3182,20 @@ private:
 
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
 
+                // VITRIOL: live decode heartbeat, rate-limited to ~1 Hz so the
+                // dashboard can light its decode gauge only while a slot is
+                // actively generating. Generation-end `eval time` lines cannot
+                // distinguish a busy slot from an idle one, so this is the
+                // in-progress signal the UI polls for.
+                static int64_t g_last_decode_heartbeat_us = 0;
+                if (t_current - g_last_decode_heartbeat_us >= 1000000) {
+                    g_last_decode_heartbeat_us = t_current;
+                    SLT_INF(slot,
+                            "decode heartbeat: %d tokens, %6.2f tokens per second (live)\n",
+                            slot.n_decoded,
+                            1e3 / slot.t_token_generation * slot.n_decoded);
+                }
+
                 completion_token_output result;
                 result.tok          = id;
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));

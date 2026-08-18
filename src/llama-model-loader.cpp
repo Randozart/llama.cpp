@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "ggml-cuda.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1196,7 +1197,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (!buft) {
             std::string tensor_name = tn.str();
             typedef ggml_backend_buffer_type_t (*buft_getter_t)(void);
+            typedef ggml_backend_buffer_type_t (*buft_getter_dev_t)(int);
             static buft_getter_t vitriol_getter = nullptr;
+            static buft_getter_dev_t vitriol_getter_dev = nullptr;
             static buft_getter_t vitriol_vk_getter = nullptr;
             static bool chimera_active = false;
             static bool looked_up = false;
@@ -1215,6 +1218,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 LLAMA_LOG_INFO("VITRIOL: dlsym vitriol_get_expert_buffer_type = %p\n", sym);
                 if (sym) {
                     vitriol_getter = (buft_getter_t)sym;
+                }
+                // Device-aware variant for multi-GPU layer splits
+                void * sym_dev = dlsym(RTLD_DEFAULT, "vitriol_get_expert_buffer_type_dev");
+                LLAMA_LOG_INFO("VITRIOL: dlsym vitriol_get_expert_buffer_type_dev = %p\n", sym_dev);
+                if (sym_dev) {
+                    vitriol_getter_dev = (buft_getter_dev_t)sym_dev;
                 }
                 // Look up Chimera (VITRIOL VK buffer type) symbols
                 void * vk_sym = dlsym(RTLD_DEFAULT, "vitriol_get_vk_buffer_type");
@@ -1257,6 +1266,26 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (vulkan_only && vitriol_vk_getter) {
                     /* Vulkan-only mode: experts also go to VK buffer type */
                     buft = vitriol_vk_getter();
+                } else if (vitriol_getter_dev) {
+                    /* Resolve the owning CUDA device of this layer from the
+                     * per-layer buft list (first supported entry), then ask for
+                     * that device's VITRIOL buffer type. Multi-GPU layer splits
+                     * route each GPU's expert weights into ITS OWN host buffer. */
+                    int dev = 0;
+                    ggml_backend_reg_t cuda_reg = ggml_backend_cuda_reg();
+                    int n_cuda = ggml_backend_cuda_get_device_count();
+                    for (const auto & cur : *buft_list) {
+                        if (weight_buft_supported(hparams, t_meta, op, cur.second, cur.first)) {
+                            for (int i = 0; i < n_cuda; i++) {
+                                if (ggml_backend_reg_dev_get(cuda_reg, i) == cur.first) {
+                                    dev = i;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    buft = vitriol_getter_dev(dev);
                 } else if (vitriol_getter) {
                     buft = vitriol_getter();
                 }
