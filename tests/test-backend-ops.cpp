@@ -3674,7 +3674,7 @@ struct test_gated_delta_net : public test_case {
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
         ggml_tensor * state = ggml_new_tensor_2d(ctx, type, head_size * v_repeat * head_size * head_count, n_seqs);
-        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
+        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, /*keep_intermediates=*/false);
         return out;
     }
 };
@@ -8703,6 +8703,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
+
+    // Qwen3.8-27B MTP-verify shape: S_v=128, n_seq_tokens=6 (draft batch), non-KDA
+    // (qwen35 uses the non-KDA path, g->ne[0]==1). These exercise the serial-loop
+    // kernel at the exact geometry the MTP verify hits (see qwen38-c1b plan).
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 6, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 6, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 6, 1, 1, false, true));
+
+    // qwen35-27B real head count (48 V-heads) at decode (1) and verify (6) shapes
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 6, 1));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

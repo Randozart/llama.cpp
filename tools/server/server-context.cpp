@@ -2983,7 +2983,26 @@ private:
                 batch.logits   + i,
             };
 
+            // VITRIOL: env-gated decode-level timing (GGML_CUDA_GDN_PROFILE=1) to
+            // reconstruct the MTP cycle: prompt-pp, single-token TG, draft, and verify.
+            static const bool dec_profile = getenv("GGML_CUDA_GDN_PROFILE") != nullptr;
+            static bool dec_has_spec = false;
+            for (const auto & sl : slots) {
+                if (!sl.spec_draft.empty()) {
+                    dec_has_spec = true;
+                    break;
+                }
+            }
+            const int64_t t_dec0 = dec_profile ? ggml_time_us() : 0;
+
             const int ret = llama_decode(ctx_tgt, batch_view);
+
+            if (dec_profile) {
+                const double t_dec_ms = (ggml_time_us() - t_dec0) / 1000.0;
+                fprintf(stderr, "[DEC] n_tokens=%d spec=%d : %.2f ms\n",
+                        n_tokens, (int) dec_has_spec, t_dec_ms);
+                dec_has_spec = false;
+            }
 
             metrics.on_decoded(slots);
 

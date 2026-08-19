@@ -261,6 +261,24 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     cudaStream_t stream = ctx.stream();
 
+    // VITRIOL: env-gated per-call timing (GGML_CUDA_GDN_PROFILE=1) to measure the
+    // exact delta-net op cost at a given shape (e.g. MTP verify: S_v=128, n_tokens=6).
+    // Skipped while CUDA graph capture is active (event sync is illegal there).
+    static bool gdn_profile = getenv("GGML_CUDA_GDN_PROFILE") != nullptr;
+    static int gdn_profile_n = 0;
+    cudaStreamCaptureStatus cap_status;
+    bool capturing = false;
+    if (gdn_profile && cudaStreamIsCapturing(stream, &cap_status) == cudaSuccess) {
+        capturing = (cap_status != cudaStreamCaptureStatusNone);
+    }
+    const bool do_time = gdn_profile && !capturing && (gdn_profile_n++ < 4000);
+    cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
+    if (do_time) {
+        cudaEventCreate(&ev_start);
+        cudaEventCreate(&ev_stop);
+        cudaEventRecord(ev_start, stream);
+    }
+
     if (kda) {
         launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
@@ -269,5 +287,16 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
         launch_gated_delta_net<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
             sb1, sb2, sb3, neqk1, rq3, scale, stream);
+    }
+
+    if (do_time) {
+        cudaEventRecord(ev_stop, stream);
+        cudaEventSynchronize(ev_stop);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        fprintf(stderr, "[GDN] S_v=%lld H=%lld n_tokens=%lld n_seqs=%lld kda=%d : %.4f ms\n",
+                (long long) S_v, (long long) H, (long long) n_tokens, (long long) n_seqs, (int) kda, ms);
+        cudaEventDestroy(ev_start);
+        cudaEventDestroy(ev_stop);
     }
 }

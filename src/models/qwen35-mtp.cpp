@@ -189,6 +189,7 @@ llama_model_qwen35_mtp::graph::graph(const llama_model & model, const llm_graph_
     // (In the trunk graph this is `t_h_pre_norm`; the MTP head reuses the same slot.)
     cb(cur, "h_pre_norm", -1);
     res->t_h_pre_norm = cur;
+    res->t_mtp_out    = cur;
 
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
             ? layer.nextn.shared_head_norm
