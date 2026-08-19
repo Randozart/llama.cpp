@@ -661,6 +661,40 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+// ── VITRIOL perf diagnostics (env-gated by GGML_CUDA_GDN_PROFILE) ────────────
+// Rolling counters accumulated during graph compute, read by llama-context to
+// emit the [PERF] decode-breakdown line. Access is single-threaded (server task
+// thread drives both llama_decode and the synchronous CUDA compute), but keep
+// atomics so the optional /metrics read never races.
+namespace {
+struct vitriol_cuda_perf {
+    std::atomic<uint64_t> n_capture{0};
+    std::atomic<uint64_t> n_replay {0};
+    std::atomic<uint64_t> op_n  [GGML_OP_COUNT];
+};
+static vitriol_cuda_perf g_perf;
+// enabled once from GGML_CUDA_GDN_PROFILE (same env-gate as the [GDN]/[DEC] timers)
+static const bool g_perf_enabled = getenv("GGML_CUDA_GDN_PROFILE") != nullptr;
+}
+
+void ggml_cuda_perf_reset(void) {
+    g_perf.n_capture.store(0);
+    g_perf.n_replay.store(0);
+    for (int i = 0; i < GGML_OP_COUNT; ++i) {
+        g_perf.op_n[i].store(0);
+    }
+}
+
+ggml_cuda_perf_snapshot ggml_cuda_perf_get(void) {
+    ggml_cuda_perf_snapshot s;
+    s.n_capture = g_perf.n_capture.load();
+    s.n_replay  = g_perf.n_replay.load();
+    for (int i = 0; i < GGML_OP_COUNT; ++i) {
+        s.op_n[i] = g_perf.op_n[i].load();
+    }
+    return s;
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -3311,6 +3345,10 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
+        if (g_perf_enabled) {
+            fprintf(stderr, "[CUGR] n_nodes changed %d -> %d\n",
+                    (int) graph->node_props.size(), cgraph->n_nodes);
+        }
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
@@ -3327,7 +3365,45 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        const bool differs = memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0;
+        if (differs && g_perf_enabled) {
+            const ggml_tensor * prev = &graph->node_props[i].node;
+            const ggml_tensor * cur  = cgraph->nodes[i];
+            fprintf(stderr, "[CUGR] node[%d] %s (%s) changed:",
+                    i, cur->name, ggml_op_name((enum ggml_op) cur->op));
+            if (prev->data != cur->data)        fprintf(stderr, " data=%p->%p", prev->data, cur->data);
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                if (prev->ne[d] != cur->ne[d])  fprintf(stderr, " ne[%d]=%lld->%lld", d,
+                        (long long) prev->ne[d], (long long) cur->ne[d]);
+                if (prev->nb[d] != cur->nb[d])  fprintf(stderr, " nb[%d]=%zu->%zu", d,
+                        (size_t) prev->nb[d], (size_t) cur->nb[d]);
+            }
+            if (prev->op != cur->op)            fprintf(stderr, " op=%d->%d", prev->op, cur->op);
+            if (prev->type != cur->type)        fprintf(stderr, " type=%d->%d", prev->type, cur->type);
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (cgraph->nodes[i]->src[j]) {
+                    if (graph->node_props[i].node_src_data_ptrs[j] != prop.node_src_data_ptrs[j]) {
+                        fprintf(stderr, " src[%d].data=%p->%p", j,
+                                graph->node_props[i].node_src_data_ptrs[j], prop.node_src_data_ptrs[j]);
+                    }
+                    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                        if (graph->node_props[i].node_src_ne[j][d] != prop.node_src_ne[j][d]) {
+                            fprintf(stderr, " src[%d].ne[%d]=%lld->%lld", j, d,
+                                (long long) graph->node_props[i].node_src_ne[j][d],
+                                (long long) prop.node_src_ne[j][d]);
+                        }
+                        if (graph->node_props[i].node_src_nb[j][d] != prop.node_src_nb[j][d]) {
+                            fprintf(stderr, " src[%d].nb[%d]=%zu->%zu", j, d,
+                                (size_t) graph->node_props[i].node_src_nb[j][d],
+                                (size_t) prop.node_src_nb[j][d]);
+                        }
+                    }
+                }
+            }
+            fprintf(stderr, "\n");
+        }
+
+        if (res || differs) {
             graph->node_props[i] = prop;
             res = true;
         }
@@ -3812,6 +3888,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
+            if (g_perf_enabled && use_cuda_graph && cuda_graph_update_required) {
+                g_perf.n_capture.fetch_add(1, std::memory_order_relaxed);
+            }
             [[maybe_unused]] int prev_i = 0;
 
             if (stream_ctx.concurrent_events.size() > 0) {
@@ -4287,6 +4366,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+                if (g_perf_enabled) {
+                    g_perf.op_n[node->op].fetch_add(1, std::memory_order_relaxed);
+                }
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
@@ -4315,6 +4398,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        if (g_perf_enabled && !cuda_graph_update_required) {
+            g_perf.n_replay.fetch_add(1, std::memory_order_relaxed);
+        }
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }

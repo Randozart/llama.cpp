@@ -17,6 +17,22 @@
 #include <limits>
 #include <stdexcept>
 
+// ── VITRIOL perf diagnostics (env-gated by GGML_CUDA_GDN_PROFILE) ────────────
+// Thread-local decode breakdown, read + emitted at the end of llama_decode.
+// Gated so the overhead is zero when unused.
+#include "ggml-cuda.h"
+static bool g_vitriol_perf = getenv("GGML_CUDA_GDN_PROFILE") != nullptr;
+struct vitriol_decode_perf_t {
+    int64_t t_build_us   = 0;  // graph build + alloc + set_inputs
+    int64_t t_compute_us = 0;  // graph_compute (synchronous CUDA work)
+    int64_t t_post_us    = 0;  // logits/embd extraction + MTP hook (ctx_mtp decode + sync)
+    int64_t t_total_us   = 0;  // whole llama_decode
+    int     n_sync       = 0;  // synchronize() stalls in the MTP hook
+    int64_t t_sync_us    = 0;
+};
+static thread_local vitriol_decode_perf_t g_dec_perf;
+static thread_local int g_dec_perf_depth = 0;
+
 // VITRIOL expert-fired rectification: scheduler eval callback that tallies the
 // MoE absolute-expert-id tensors as each node finishes computing.
 static bool expert_fired_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
@@ -1286,6 +1302,7 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const int64_t t_build_start = g_vitriol_perf ? ggml_time_us() : 0;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1358,11 +1375,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
     }
 
+    const int64_t t_compute_start = g_vitriol_perf ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (g_vitriol_perf) {
+        const int64_t t_now = ggml_time_us();
+        g_dec_perf.t_build_us   += t_compute_start - t_build_start;
+        g_dec_perf.t_compute_us += t_now - t_compute_start;
     }
 
     // ── VITRIOL Early Exit Detection ──
@@ -1867,6 +1891,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
 
+    int64_t t_total_start = g_vitriol_perf ? ggml_time_us() : 0;
+    if (g_vitriol_perf) {
+        g_dec_perf_depth++;
+    }
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2096,6 +2124,46 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (g_vitriol_perf && --g_dec_perf_depth == 0) {
+        g_dec_perf.t_total_us = ggml_time_us() - t_total_start;
+        g_dec_perf.t_post_us  = g_dec_perf.t_total_us - g_dec_perf.t_build_us - g_dec_perf.t_compute_us;
+
+        const auto ps = ggml_cuda_perf_get();
+
+        fprintf(stderr,
+            "[PERF] total=%.1fms build=%.1fms compute=%.1fms post=%.1fms "
+            "graph=%uC/%uR sync=%d(%.1fms) top_ops=",
+            g_dec_perf.t_total_us/1000.0,
+            g_dec_perf.t_build_us/1000.0,
+            g_dec_perf.t_compute_us/1000.0,
+            g_dec_perf.t_post_us/1000.0,
+            (unsigned) ps.n_capture, (unsigned) ps.n_replay,
+            g_dec_perf.n_sync, g_dec_perf.t_sync_us/1000.0);
+
+        // top-4 op classes by node count
+        struct { int op; uint64_t n; } top[4] = {};
+        for (int i = 0; i < GGML_OP_COUNT; ++i) {
+            if (ps.op_n[i] == 0) continue;
+            for (int j = 0; j < 4; ++j) {
+                if (ps.op_n[i] > top[j].n) {
+                    for (int k = 3; k > j; --k) top[k] = top[k-1];
+                    top[j] = { i, ps.op_n[i] };
+                    break;
+                }
+            }
+        }
+        bool first = true;
+        for (int j = 0; j < 4 && top[j].n > 0; ++j) {
+            fprintf(stderr, "%s%s=%llu", first ? "" : " ", ggml_op_name((enum ggml_op) top[j].op), (unsigned long long) top[j].n);
+            first = false;
+        }
+        fprintf(stderr, "\n");
+
+        // reset for next decode
+        g_dec_perf = vitriol_decode_perf_t{};
+        ggml_cuda_perf_reset();
+    }
 
     return 0;
 }
@@ -3321,7 +3389,7 @@ void llama_context::opt_epoch_iter(
         };
 
         uint32_t pos_batch = 0;
-        do {
+    do {
             const auto & ubatch = mctx->get_ubatch();
 
             n_outputs = ubatch.n_tokens;
@@ -3772,7 +3840,14 @@ void llama_context::handle_mtp_for_ubatch(
         mtp.pending_pos = -1;
     }
 
-    synchronize();
+    if (g_vitriol_perf) {
+        const int64_t t_sync_start = ggml_time_us();
+        synchronize();
+        g_dec_perf.n_sync++;
+        g_dec_perf.t_sync_us += ggml_time_us() - t_sync_start;
+    } else {
+        synchronize();
+    }
 
     const size_t row_bytes = (size_t) n_embd * sizeof(float);
     const int    n_out     = (pending_continues ? 1 : 0) + (n_rows - 1);

@@ -40,6 +40,18 @@ GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
 
+// ── VITRIOL perf diagnostics (env-gated by GGML_CUDA_GDN_PROFILE) ────────────
+// Rolling counters accumulated across all CUDA devices/contexts during graph
+// compute. read by llama-context to emit the [PERF] decode-breakdown line.
+typedef struct ggml_cuda_perf_snapshot {
+    uint64_t n_capture;              // CUDA graph captures this decode
+    uint64_t n_replay;               // CUDA graph replays this decode
+    uint64_t op_n  [GGML_OP_COUNT];  // per-op-class node count (capture/eval path only)
+} ggml_cuda_perf_snapshot;
+
+GGML_BACKEND_API void ggml_cuda_perf_reset(void);
+GGML_BACKEND_API struct ggml_cuda_perf_snapshot ggml_cuda_perf_get(void);
+
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
