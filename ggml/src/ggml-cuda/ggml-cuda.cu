@@ -2426,8 +2426,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         && (src0->type != GGML_TYPE_TQ3_4S || ggml_is_contiguous(src0));
 
     // fusion is not universally faster on Pascal
+    // VITRIOL: allow override via env to A/B fused mmvq on Pascal (GTX 1070 Ti)
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (cc <= GGML_CUDA_CC_PASCAL) {
+    if (cc <= GGML_CUDA_CC_PASCAL && getenv("VITRIOL_FUSE_MMVQ_PASCAL") == nullptr) {
         return false;
     }
     //we only support fusion for ncols_dst = 1
