@@ -751,7 +751,70 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (params_base.speculative.has_dft()) {
+        if (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                      COMMON_SPECULATIVE_TYPE_MTP) != params_base.speculative.types.end()) {
+            // MTP head lives in a GGUF — normally embedded in the target model,
+            // but a separate MTP head file may be supplied via --spec-draft-model.
+            // Load it as a sibling model with override_arch and feed it through
+            // the existing ctx_dft slot. Prefer the explicit draft path so a
+            // base model without an embedded MTP head (nextn_predict_layers=0)
+            // can still use a separately-downloaded head.
+            char trunk_arch[64] = {0};
+            llama_model_meta_val_str(model_tgt, "general.architecture", trunk_arch, sizeof(trunk_arch));
+
+            const char * mtp_arch = nullptr;
+            if (std::string(trunk_arch) == "qwen35") {
+                mtp_arch = "qwen35_mtp";
+            } else if (std::string(trunk_arch) == "qwen35moe") {
+                mtp_arch = "qwen35moe_mtp";
+            } else {
+                SRV_ERR("MTP not supported for trunk architecture '%s'\n", trunk_arch);
+                return false;
+            }
+
+            std::string mtp_path = params_base.model.path;
+            if (!params_base.speculative.draft.mparams.path.empty()) {
+                mtp_path = params_base.speculative.draft.mparams.path;
+            }
+
+            SRV_INF("loading MTP head from '%s' (override_arch=%s)\n",
+                    mtp_path.c_str(), mtp_arch);
+
+            auto params_mtp = params_base;
+            // Honor an explicit draft device / ngl so the MTP head can be placed
+            // on a separate GPU (e.g. --spec-draft-device CUDA1) instead of always
+            // riding along with the main model.
+            const auto & spec_draft = params_base.speculative.draft;
+            if (!spec_draft.devices.empty()) {
+                params_mtp.devices      = spec_draft.devices;
+                params_mtp.n_gpu_layers = spec_draft.n_gpu_layers;
+                params_mtp.cache_type_k = spec_draft.cache_type_k;
+                params_mtp.cache_type_v = spec_draft.cache_type_v;
+            }
+
+            auto mparams_mtp = common_model_params_to_llama(params_mtp);
+            mparams_mtp.override_arch = mtp_arch;
+
+            model_dft.reset(llama_model_load_from_file(mtp_path.c_str(), mparams_mtp));
+            if (model_dft == nullptr) {
+                SRV_ERR("failed to load MTP head from '%s'\n", mtp_path.c_str());
+                return false;
+            }
+
+            auto cparams_mtp = common_context_params_to_llama(params_mtp);
+            cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+
+            ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams_mtp));
+            if (ctx_dft == nullptr) {
+                SRV_ERR("%s", "failed to create MTP context\n");
+                return false;
+            }
+
+            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = ctx_dft.get();
+        } else if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
             const auto & params_spec = params_base.speculative.draft;
 
@@ -782,48 +845,6 @@ private:
 
             auto cparams = common_context_params_to_llama(params_dft);
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
-
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
-
-            params_base.speculative.draft.ctx_tgt = ctx_tgt;
-            params_base.speculative.draft.ctx_dft = ctx_dft.get();
-        } else if (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
-                             COMMON_SPECULATIVE_TYPE_MTP) != params_base.speculative.types.end()) {
-            // MTP head lives in the *target* GGUF — load it as a sibling model
-            // with override_arch and feed it through the existing ctx_dft slot.
-            char trunk_arch[64] = {0};
-            llama_model_meta_val_str(model_tgt, "general.architecture", trunk_arch, sizeof(trunk_arch));
-
-            const char * mtp_arch = nullptr;
-            if (std::string(trunk_arch) == "qwen35") {
-                mtp_arch = "qwen35_mtp";
-            } else if (std::string(trunk_arch) == "qwen35moe") {
-                mtp_arch = "qwen35moe_mtp";
-            } else {
-                SRV_ERR("MTP not supported for trunk architecture '%s'\n", trunk_arch);
-                return false;
-            }
-
-            SRV_INF("loading MTP head from '%s' (override_arch=%s)\n",
-                    params_base.model.path.c_str(), mtp_arch);
-
-            auto mparams_mtp = common_model_params_to_llama(params_base);
-            mparams_mtp.override_arch = mtp_arch;
-
-            model_dft.reset(llama_model_load_from_file(params_base.model.path.c_str(), mparams_mtp));
-            if (model_dft == nullptr) {
-                SRV_ERR("failed to load MTP head from '%s'\n", params_base.model.path.c_str());
-                return false;
-            }
-
-            auto cparams_mtp = common_context_params_to_llama(params_base);
-            cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-
-            ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams_mtp));
-            if (ctx_dft == nullptr) {
-                SRV_ERR("%s", "failed to create MTP context\n");
-                return false;
-            }
 
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
 
