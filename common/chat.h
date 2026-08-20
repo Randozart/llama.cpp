@@ -263,16 +263,14 @@ nlohmann::ordered_json common_chat_msgs_to_json_oaicompat(const std::vector<comm
 
 nlohmann::ordered_json common_chat_tools_to_json_oaicompat(const std::vector<common_chat_tool> & tools);
 
-// VITRIOL: compact "Tools registered in this session..." reminder injected near
-// the generation point so SWA-windowed models (Mellum2: 21/28 layers attend
-// only the last 1024 tokens) keep tool awareness across long conversations.
-// Lists tool names + (env-gated) call-envelope hint, phrased as permission —
-// "use only when required; otherwise answer directly" — so the model stays
-// aware of tools without feeling compelled to call them. trigger_marker is the
-// template's per-call trigger (e.g. "<tool_call>" for the hermes/Mellum2
-// template, "[TOOL_CALLS]" for Ministral/Qwen) — the model must emit it to
-// engage the lazy grammar. Disable the envelope hint with
-// VITRIOL_TOOL_REMINDER_ENVELOPE=0.
+// VITRIOL: compact "Note: tools available in this environment..." reminder
+// injected before the last user message so SWA-windowed models (Mellum2: 21/28
+// layers attend only the last 1024 tokens) keep tool awareness across long
+// conversations without the reminder reading as a current-turn directive. Lists
+// tool names + (env-gated) call-envelope hint. trigger_marker is the template's
+// per-call trigger (e.g. "<tool_call>" for the hermes/Mellum2 template,
+// "[TOOL_CALLS]" for Ministral/Qwen) — the model must emit it to engage the
+// lazy grammar. Disable the envelope hint with VITRIOL_TOOL_REMINDER_ENVELOPE=0.
 std::string common_chat_tools_reminder(const std::vector<common_chat_tool> & tools, const std::string & trigger_marker);
 
 // get template caps, useful for reporting to server /props endpoint

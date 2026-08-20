@@ -463,7 +463,7 @@ std::string common_chat_tools_reminder(const std::vector<common_chat_tool> & too
         return v == nullptr || std::string(v) != "0";
     }();
 
-    std::string reminder = "<|im_start|>system\nTools registered in this session: ";
+    std::string reminder = "<|im_start|>system\nNote: tools available in this environment (call one only if the user's request needs it):\n";
     for (size_t i = 0; i < tools.size(); ++i) {
         if (i > 0) {
             reminder += ", ";
@@ -471,9 +471,7 @@ std::string common_chat_tools_reminder(const std::vector<common_chat_tool> & too
         reminder += tools[i].name;
     }
     if (envelope) {
-        reminder += "\nCall one only when the user's request needs it, or when the user explicitly asks you to use a tool. Otherwise answer directly.\nIf calling, format it as " + marker + "\n{\"name\": \"<tool>\", \"arguments\": {...}}.";
-    } else {
-        reminder += "\nCall one only when the user's request needs it, or when the user explicitly asks you to use a tool. Otherwise answer directly.";
+        reminder += "\nIf calling, format it as " + marker + "\n{\"name\": \"<tool>\", \"arguments\": {...}}. If you need a tool's exact arguments, call get_tool_capabilities(name) first.";
     }
     reminder += "\n<|im_end|>\n";
 

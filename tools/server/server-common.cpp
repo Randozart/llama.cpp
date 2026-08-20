@@ -1111,10 +1111,11 @@ json oaicompat_chat_params_parse(
     // layers attend only the last 1024 tokens). Tool schemas render into the
     // system message at prompt start and drift out of SWA reach as history
     // grows, so the model "forgets" it has tools. Inject a compact reminder
-    // (names + call-envelope hint) right before the generation marker so it
-    // always sits within the last ~1024 tokens. Full schemas stay at prompt
-    // start (7 full-attn layers + lazy grammar guide exact args). Gated on
-    // tools being present; disable with VITRIOL_TOOL_REMINDER=0.
+    // (names + call-envelope hint) before the LAST user message so it always
+    // sits within the last ~1024 tokens and reads as ambient context (not as a
+    // directive for the current turn). Full schemas stay at prompt start (7
+    // full-attn layers + lazy grammar guide exact args). Gated on tools being
+    // present; disable with VITRIOL_TOOL_REMINDER=0.
     const bool vitriol_tool_reminder_enabled = [] {
         const char * v = std::getenv("VITRIOL_TOOL_REMINDER");
         return v == nullptr || std::string(v) != "0";
@@ -1132,15 +1133,22 @@ json oaicompat_chat_params_parse(
         }
         const std::string reminder = common_chat_tools_reminder(inputs.tools, trigger_marker);
         if (!reminder.empty()) {
-            const std::string marker = "<|im_start|>assistant";
-            const size_t pos = chat_params.prompt.rfind(marker);
+            // Inject before the LAST user message so the reminder reads as
+            // ambient context, not as a directive for the current turn. A
+            // reminder placed immediately before the assistant generation
+            // marker was being interpreted by the model as "the user's prompt"
+            // (it quoted the tool list back as the task). The last user message
+            // is still within SWA reach, so tool awareness is preserved.
+            const std::string user_marker = "<|im_start|>user";
+            const size_t pos = chat_params.prompt.rfind(user_marker);
             if (pos != std::string::npos) {
                 chat_params.prompt.insert(pos, reminder);
             } else {
-                // Non-chatml template: fall back to appending before the prompt end
+                // No user message present (e.g. odd tool-loop continuation):
+                // fall back to appending before the prompt end.
                 chat_params.prompt += reminder;
             }
-            SRV_DBG("VITRIOL tool reminder injected (%zu bytes) before generation marker\n", reminder.size());
+            SRV_DBG("VITRIOL tool reminder injected (%zu bytes) before last user message\n", reminder.size());
         }
     }
 
