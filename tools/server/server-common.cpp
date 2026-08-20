@@ -1107,6 +1107,43 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    // VITRIOL: tool-awareness reminder for SWA-windowed models (Mellum2: 21/28
+    // layers attend only the last 1024 tokens). Tool schemas render into the
+    // system message at prompt start and drift out of SWA reach as history
+    // grows, so the model "forgets" it has tools. Inject a compact reminder
+    // (names + call-envelope hint) right before the generation marker so it
+    // always sits within the last ~1024 tokens. Full schemas stay at prompt
+    // start (7 full-attn layers + lazy grammar guide exact args). Gated on
+    // tools being present; disable with VITRIOL_TOOL_REMINDER=0.
+    const bool vitriol_tool_reminder_enabled = [] {
+        const char * v = std::getenv("VITRIOL_TOOL_REMINDER");
+        return v == nullptr || std::string(v) != "0";
+    }();
+    if (vitriol_tool_reminder_enabled && !inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+        // Detect the template's per-call trigger marker so the reminder teaches
+        // the exact envelope the lazy grammar requires ("<tool_call>" for the
+        // hermes/Mellum2 template, "[TOOL_CALLS]" for Ministral/Qwen).
+        std::string trigger_marker;
+        const std::string tmpl_src = common_chat_templates_source(opt.tmpls.get());
+        if (tmpl_src.find("<tool_call>") != std::string::npos) {
+            trigger_marker = "<tool_call>";
+        } else if (tmpl_src.find("[TOOL_CALLS]") != std::string::npos) {
+            trigger_marker = "[TOOL_CALLS]";
+        }
+        const std::string reminder = common_chat_tools_reminder(inputs.tools, trigger_marker);
+        if (!reminder.empty()) {
+            const std::string marker = "<|im_start|>assistant";
+            const size_t pos = chat_params.prompt.rfind(marker);
+            if (pos != std::string::npos) {
+                chat_params.prompt.insert(pos, reminder);
+            } else {
+                // Non-chatml template: fall back to appending before the prompt end
+                chat_params.prompt += reminder;
+            }
+            SRV_DBG("VITRIOL tool reminder injected (%zu bytes) before generation marker\n", reminder.size());
+        }
+    }
+
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
     if (!chat_params.grammar.empty()) {

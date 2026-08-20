@@ -263,6 +263,14 @@ nlohmann::ordered_json common_chat_msgs_to_json_oaicompat(const std::vector<comm
 
 nlohmann::ordered_json common_chat_tools_to_json_oaicompat(const std::vector<common_chat_tool> & tools);
 
+// VITRIOL: compact "Available tools: ..." reminder injected near the generation
+// point so SWA-windowed models (Mellum2: 21/28 layers attend only the last 1024
+// tokens) keep tool awareness across long conversations. Names + call-envelope
+// hint, ~100-150 tokens. trigger_marker is the template's per-call trigger
+// (e.g. "<tool_call>" for the hermes/Mellum2 template, "[TOOL_CALLS]" for
+// Ministral/Qwen) — the model must emit it to engage the lazy grammar.
+std::string common_chat_tools_reminder(const std::vector<common_chat_tool> & tools, const std::string & trigger_marker);
+
 // get template caps, useful for reporting to server /props endpoint
 std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_templates * chat_templates);
 
