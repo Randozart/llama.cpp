@@ -458,14 +458,24 @@ std::string common_chat_tools_reminder(const std::vector<common_chat_tool> & too
 
     const std::string marker = trigger_marker.empty() ? "<tool_call>" : trigger_marker;
 
-    std::string reminder = "<|im_start|>system\nAvailable tools: ";
+    const bool envelope = [] {
+        const char * v = std::getenv("VITRIOL_TOOL_REMINDER_ENVELOPE");
+        return v == nullptr || std::string(v) != "0";
+    }();
+
+    std::string reminder = "<|im_start|>system\nTools registered in this session: ";
     for (size_t i = 0; i < tools.size(); ++i) {
         if (i > 0) {
             reminder += ", ";
         }
         reminder += tools[i].name;
     }
-    reminder += "\nTo call a tool, emit " + marker + " followed by {\"name\": \"<tool>\", \"arguments\": {...}}.\n<|im_end|>\n";
+    if (envelope) {
+        reminder += "\nCall one only when the user's request needs it, or when the user explicitly asks you to use a tool. Otherwise answer directly.\nIf calling, format it as " + marker + "\n{\"name\": \"<tool>\", \"arguments\": {...}}.";
+    } else {
+        reminder += "\nCall one only when the user's request needs it, or when the user explicitly asks you to use a tool. Otherwise answer directly.";
+    }
+    reminder += "\n<|im_end|>\n";
 
     return reminder;
 }
