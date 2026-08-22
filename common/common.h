@@ -598,6 +598,7 @@ struct common_params {
     int32_t checkpoint_every_nt = 2048;  // make a checkpoint every n tokens during prefill
     bool    compact_prompt      = false; // enable AST-aware code block compaction in prompts
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    float   prompt_cache_min_lcp = 0.5f;
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

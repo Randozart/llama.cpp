@@ -2059,6 +2059,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const float f_keep_cur = float(lcp_cur) / it->tokens.size();
         const float sim_cur    = float(lcp_cur) / tokens_new.size();
 
+        if (it->tokens.size() > 64 && sim_cur < min_lcp) { continue; }
+
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
             continue;

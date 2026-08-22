@@ -615,9 +615,11 @@ struct server_prompt {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    float min_lcp = 0.5f;
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, float min_lcp) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->min_lcp      = min_lcp;
     }
 
     std::list<server_prompt> states;

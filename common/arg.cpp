@@ -1318,6 +1318,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"-pcml", "--prompt-cache-min-lcp"}, "F",
+        string_format("set the minimum similarity for prompt cache matching (default: %.1f)", params.prompt_cache_min_lcp),
+        [](common_params & params, const std::string & value) {
+            params.prompt_cache_min_lcp = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_PROMPT_CACHE_MIN_LCP").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
