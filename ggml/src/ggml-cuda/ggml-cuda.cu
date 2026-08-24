@@ -84,6 +84,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -4434,7 +4435,141 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+static enum ggml_status ggml_backend_cuda_graph_compute_inner(ggml_backend_t backend, ggml_cgraph * cgraph);
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    // VITRIOL LULL (Phase 0): env-gated per-device split timing + VRAM watermark.
+    // Measures how long each device spends computing a sched split (busy) and how
+    // long it idles until its next split (the pipeline lull this project targets).
+    // Rotating event pairs, queried lazily and never blocking: zero perturbation.
+    // All calls are fault-tolerant — any CUDA error self-disables profiling for
+    // that backend instance instead of taking inference down.
+    // State is keyed by backend-context pointer: CUDA events belong to the context
+    // that created them, and a device can be wrapped by more than one instance.
+    // PROVENANCE: original VITRIOL instrumentation for
+    // .opencode/plans/lull-plan-2026-08-24.md — no third-party code.
+    struct vitriol_lull_state {
+        bool        checked      = false;
+        bool        enabled      = false;
+        bool        poisoned     = false;
+        bool        records_only = false;
+        bool        no_elapsed   = false;
+        uint64_t    n            = 0;
+        int         dbg          = 0;
+        int         device       = -1;
+        cudaEvent_t ev[4]        = { nullptr, nullptr, nullptr, nullptr }; // s0,e0,s1,e1
+        bool        rec[4]       = { false, false, false, false };         // slot recorded?
+    };
+    static std::unordered_map<const void *, vitriol_lull_state> g_vitriol_lull;
+    static std::mutex g_vitriol_lull_mtx;
+
+    vitriol_lull_state & lull = [&] () -> vitriol_lull_state & {
+        std::lock_guard<std::mutex> lock(g_vitriol_lull_mtx);
+        return g_vitriol_lull[(const void *) cuda_ctx];
+    }();
+    if (!lull.checked) {
+        lull.checked = true;
+        lull.device  = cuda_ctx->device;
+        const char * env = getenv("VITRIOL_LULL_PROFILE");
+        lull.enabled = env != nullptr && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+        fprintf(stderr, "VITRIOL_LULL_DBG init dev=%d enabled=%d\n", lull.device, (int) lull.enabled);
+        // diagnostics knob: VITRIOL_LULL_RECORDS_ONLY=1 skips all query/elapsed
+        // calls (records only) to bisect which CUDA op upsets the stream.
+        const char * ro = getenv("VITRIOL_LULL_RECORDS_ONLY");
+        lull.records_only = ro != nullptr && ro[0] == '1';
+        // VITRIOL_LULL_NO_ELAPSED=1: run queries but skip EventElapsedTime.
+        const char * ne = getenv("VITRIOL_LULL_NO_ELAPSED");
+        lull.no_elapsed = ne != nullptr && ne[0] == '1';
+    }
+
+    if (lull.enabled && !lull.poisoned) {
+        if (!lull.ev[0]) {
+            for (int i = 0; i < 4 && !lull.poisoned; i++) {
+                cudaError_t rc = cudaEventCreate(&lull.ev[i]);
+                if (rc != cudaSuccess) {
+                    fprintf(stderr, "VITRIOL_LULL dev=%d event_create_rc=%d, disabling\n",
+                            lull.device, (int) rc);
+                    lull.poisoned = true;
+                }
+            }
+        }
+
+        const int cur = (int)(lull.n & 1);
+        const int prv = cur ^ 1;
+
+        // Record this call's start FIRST, then report the previous call.
+        // Never query or take elapsed() against an event that has not been
+        // recorded yet: doing so upset the stream and surfaced downstream as
+        // "invalid resource handle" kernel-launch failures.
+        if (!lull.poisoned) {
+            cudaError_t rrc = cudaEventRecord(lull.ev[2*cur+0], cuda_ctx->stream());
+            if (rrc == cudaSuccess) {
+                lull.rec[2*cur+0] = true;
+            } else {
+                fprintf(stderr, "VITRIOL_LULL dev=%d record_rc=%d, disabling\n", lull.device, (int) rrc);
+                lull.poisoned = true;
+            }
+        }
+
+        // Report the previous completed call: busy duration + idle gap into
+        // this call's start. Only ever touches events already recorded.
+        if (!lull.poisoned && !lull.records_only && lull.n > 0 &&
+            lull.rec[2*prv+0] && lull.rec[2*prv+1]) {
+            cudaError_t qrc = cudaEventQuery(lull.ev[2*prv+1]);
+            if (qrc == cudaSuccess) {
+                float busy_ms = -1.0f;
+                if (cudaEventElapsedTime(&busy_ms, lull.ev[2*prv+0], lull.ev[2*prv+1]) == cudaSuccess) {
+                    fprintf(stderr, "VITRIOL_LULL dev=%d busy_ms=%.3f\n", lull.device, busy_ms);
+                }
+                // idle only measurable when queue was empty and this call's
+                // start event already completed
+                if (cudaEventQuery(lull.ev[2*cur+0]) == cudaSuccess) {
+                    float idle_ms = -1.0f;
+                    if (cudaEventElapsedTime(&idle_ms, lull.ev[2*prv+1], lull.ev[2*cur+0]) == cudaSuccess) {
+                        fprintf(stderr, "VITRIOL_LULL dev=%d idle_ms=%.3f\n", lull.device, idle_ms);
+                    }
+                }
+            } else if (qrc != cudaErrorNotReady) {
+                fprintf(stderr, "VITRIOL_LULL dev=%d query_rc=%d, disabling\n", lull.device, (int) qrc);
+                lull.poisoned = true;
+            }
+        }
+
+        if (lull.poisoned) {
+            lull.enabled = false;
+        }
+    }
+
+    enum ggml_status status = ggml_backend_cuda_graph_compute_inner(backend, cgraph);
+
+    if (lull.enabled && !lull.poisoned) {
+        const int cur = (int)(lull.n & 1);
+        cudaError_t rrc = cudaEventRecord(lull.ev[2*cur+1], cuda_ctx->stream());
+        if (rrc != cudaSuccess) {
+            fprintf(stderr, "VITRIOL_LULL dev=%d record_end_rc=%d, disabling\n", lull.device, (int) rrc);
+            lull.poisoned = true;
+            lull.enabled  = false;
+        } else {
+            lull.rec[2*cur+1] = true;
+            ++lull.n;
+            if ((lull.n & 0x3F) == 0) {
+                size_t free_b = 0, total_b = 0;
+                if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                    fprintf(stderr, "VITRIOL_LULL dev=%d vram_free_mb=%zu vram_total_mb=%zu\n",
+                            lull.device, free_b / (1024 * 1024), total_b / (1024 * 1024));
+                }
+            }
+        }
+    }
+
+    return status;
+}
+
+static enum ggml_status ggml_backend_cuda_graph_compute_inner(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);

@@ -18,6 +18,7 @@ struct llama_context;
 //
 
 class llama_kv_cache : public llama_memory_i {
+    friend class llama_kv_cache_context;
 public:
     struct stream_copy_info {
         bool empty() const {
@@ -189,6 +190,14 @@ public:
     // Returns number of cells evicted.
     uint32_t evict_sparse(uint32_t n_needed, uint32_t n_sinks);
 
+    // VITRIOL LULL Phase 1: attention-probe scoring. The tail subgraph is
+    // built by vitriol_probe::append_scores(); these manage state and the
+    // score download into per-cell importance scores (exponential decay).
+    void vitriol_probe_reset();
+    void vitriol_probe_mark_output(ggml_tensor * out, uint32_t n_layers);
+    bool vitriol_probe_pending() const;
+    void vitriol_probe_finish();
+
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
@@ -272,6 +281,13 @@ private:
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
+
+    // VITRIOL LULL probe state (persistent; survives batch contexts)
+    ggml_tensor * v_probe_acc     = nullptr;
+    ggml_tensor * v_probe_out     = nullptr;
+    bool          v_probe_pending = false;
+    uint32_t      v_probe_layers  = 0;   // layers scored this pass
+    uint32_t      v_probe_strm    = 0;   // kv stream of the scored sequence
 
     std::vector<kv_layer> layers;
 
@@ -361,6 +377,11 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // VITRIOL LULL probe: state access for vitriol_probe::append_scores()
+    void vitriol_probe_reset() const;
+    void vitriol_probe_mark_output(ggml_tensor * out, uint32_t n_layers) const;
+    void vitriol_probe_finish() const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
