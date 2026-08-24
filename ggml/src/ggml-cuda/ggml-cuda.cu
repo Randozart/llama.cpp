@@ -4439,6 +4439,54 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // VITRIOL LULL (Phase 0): env-gated per-device split timing + VRAM watermark.
+    // Measures how long each device spends computing a sched split (busy) and how
+    // long it idles until its next split (the pipeline lull this project targets).
+    // Rotating event pairs, queried lazily and never blocking: zero perturbation.
+    // PROVENANCE: original VITRIOL instrumentation for
+    // .opencode/plans/lull-plan-2026-08-24.md — no third-party code.
+    struct vitriol_lull_state {
+        bool        checked = false;
+        bool        enabled = false;
+        uint64_t    n       = 0;
+        cudaEvent_t ev[4]   = { nullptr, nullptr, nullptr, nullptr }; // s0,e0,s1,e1
+    };
+    static vitriol_lull_state g_vitriol_lull[GGML_CUDA_MAX_DEVICES];
+
+    vitriol_lull_state & lull = g_vitriol_lull[cuda_ctx->device];
+    if (!lull.checked) {
+        lull.checked = true;
+        const char * env = getenv("VITRIOL_LULL_PROFILE");
+        lull.enabled = env != nullptr && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+    }
+
+    if (lull.enabled) {
+        if (!lull.ev[0]) {
+            CUDA_CHECK(cudaEventCreate(&lull.ev[0]));
+            CUDA_CHECK(cudaEventCreate(&lull.ev[1]));
+            CUDA_CHECK(cudaEventCreate(&lull.ev[2]));
+            CUDA_CHECK(cudaEventCreate(&lull.ev[3]));
+        }
+
+        const int cur = (int)(lull.n & 1);
+        const int prv = cur ^ 1;
+
+        // report the previous completed call: busy duration + idle gap into this call
+        if (lull.n > 0 && cudaEventQuery(lull.ev[2*prv+1]) == cudaSuccess) {
+            float busy_ms = -1.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&busy_ms, lull.ev[2*prv+0], lull.ev[2*prv+1]));
+            fprintf(stderr, "VITRIOL_LULL dev=%d busy_ms=%.3f\n", cuda_ctx->device, busy_ms);
+
+            if (cudaEventQuery(lull.ev[2*cur+0]) == cudaSuccess) {
+                float idle_ms = -1.0f;
+                CUDA_CHECK(cudaEventElapsedTime(&idle_ms, lull.ev[2*prv+1], lull.ev[2*cur+0]));
+                fprintf(stderr, "VITRIOL_LULL dev=%d idle_ms=%.3f\n", cuda_ctx->device, idle_ms);
+            }
+        }
+
+        CUDA_CHECK(cudaEventRecord(lull.ev[2*cur+0], cuda_ctx->stream()));
+    }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4489,6 +4537,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (lull.enabled) {
+        const int cur = (int)(lull.n & 1);
+        CUDA_CHECK(cudaEventRecord(lull.ev[2*cur+1], cuda_ctx->stream()));
+        ++lull.n;
+
+        if ((lull.n & 0x3F) == 0) {
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                fprintf(stderr, "VITRIOL_LULL dev=%d vram_free_mb=%zu vram_total_mb=%zu\n",
+                        cuda_ctx->device, free_b / (1024 * 1024), total_b / (1024 * 1024));
+            }
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }
