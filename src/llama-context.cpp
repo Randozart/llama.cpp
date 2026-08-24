@@ -10,6 +10,8 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "llama-kv-cache.h"
+#include "vitriol-kv-probe.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -692,6 +694,7 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -1316,7 +1319,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const bool vitriol_probe_armed = vitriol_probe::active();
+
+    if (!graph_reuse_disable && !vitriol_probe_armed && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1343,6 +1348,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        // VITRIOL LULL Phase 1: append the attention-probe scoring subgraph
+        // at the tail, after all model nodes exist (builders own the graph
+        // during build; tail insertion cannot break their ordering checks).
+        if (vitriol_probe_armed) {
+            static bool once_t = false;
+            if (!once_t) { once_t = true; fprintf(stderr, "VITRIOL_KV_SCORE_DBG: tail-append site reached\n"); }
+            vitriol_probe::append_scores(res->get_ctx(), gf);
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -1846,6 +1860,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             return -2;
         }
 
+        // VITRIOL LULL Phase 1: arm the attention probe for single-token
+        // decode batches (cadence handled inside the module).
+        vitriol_probe::begin_batch(balloc->get_n_tokens() == 1);
+
+
         switch (mctx->get_status()) {
             case LLAMA_MEMORY_STATUS_SUCCESS:
                 {
@@ -2074,6 +2093,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
+
+    // VITRIOL LULL Phase 1: download+apply probe scores for this decode step.
+    // tensor_get inside synchronizes the producing stream (ms-scale at 131k).
+    vitriol_probe::finish_pending();
 
     // set output mappings
     if (n_outputs > 0) {

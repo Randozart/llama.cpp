@@ -11,6 +11,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "vitriol-kv-probe.h"
 
 #include <cassert>
 #include <cmath>
@@ -2238,6 +2239,15 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    // VITRIOL LULL Phase 1: record this layer for the tail-appended scoring
+    // subgraph (see vitriol-kv-probe.h). Recording only — node insertion
+    // happens after model.build_graph() so builders keep their strict
+    // last-node-expansion invariant. No-op unless armed.
+    if (vitriol_probe::active()) {
+        vitriol_probe::push_capture(il, q, kq_scale);
+        vitriol_probe::set_source(const_cast<llama_kv_cache_context *>(mctx_cur));
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

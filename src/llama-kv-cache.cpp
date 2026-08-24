@@ -6,6 +6,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "vitriol-kv-probe.h"
 
 #include "ggml-backend.h"
 
@@ -2697,4 +2698,81 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+//
+// VITRIOL LULL Phase 1 — attention-probe scoring (see vitriol-kv-probe.h)
+//
+
+void llama_kv_cache_context::vitriol_probe_reset() const {
+    kv->vitriol_probe_reset();
+    if (sinfos[i_cur].n_stream() == 1) {
+        kv->v_probe_strm = sinfos[i_cur].strm[0];
+    }
+}
+
+
+
+void llama_kv_cache_context::vitriol_probe_mark_output(ggml_tensor * out, uint32_t n_layers) const {
+    kv->v_probe_out     = out;
+    kv->v_probe_layers  = n_layers;
+    kv->v_probe_pending = true;
+}
+
+void llama_kv_cache_context::vitriol_probe_finish() const {
+    kv->vitriol_probe_finish();
+}
+
+void llama_kv_cache::vitriol_probe_reset() {
+    v_probe_acc     = nullptr;
+    v_probe_out     = nullptr;
+    v_probe_layers  = 0;
+    v_probe_pending = false;
+}
+
+bool llama_kv_cache::vitriol_probe_pending() const {
+    return v_probe_pending;
+}
+
+void llama_kv_cache::vitriol_probe_mark_output(ggml_tensor * out, uint32_t n_layers) {
+    v_probe_out     = out;
+    v_probe_layers  = n_layers;
+    v_probe_pending = true;
+}
+
+void llama_kv_cache::vitriol_probe_finish() {
+    if (!v_probe_pending || !v_probe_out) {
+        return;
+    }
+
+    const uint32_t n_kv = (uint32_t)(v_probe_out->ne[0] * v_probe_out->ne[1]);
+
+    std::vector<float> scores(n_kv);
+    ggml_backend_tensor_get(v_probe_out, scores.data(), 0, n_kv * sizeof(float));
+
+    const float dec = vitriol_probe::decay();
+    auto & cells    = v_cells[v_probe_strm];
+
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        fprintf(stderr, "VITRIOL_KV_SCORE: probe active, n_kv=%u layers=%u decay=%.2f\n",
+                n_kv, v_probe_layers, dec);
+    }
+
+    uint32_t mapped = 0;
+    for (uint32_t j = 0; j < n_kv && j < cells.size(); ++j) {
+        if (cells.is_empty(j)) {
+            continue;
+        }
+        cells.score_set(j, dec * cells.score_get(j) + scores[j]);
+        mapped++;
+    }
+
+    LLAMA_LOG_DEBUG("%s: applied probe scores to %u/%u cells (layers=%u)\n",
+            __func__, mapped, n_kv, v_probe_layers);
+
+    v_probe_pending = false;
+    v_probe_acc     = nullptr;
+    v_probe_out     = nullptr;
 }
