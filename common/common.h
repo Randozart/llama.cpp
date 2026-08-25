@@ -645,6 +645,10 @@ struct common_params {
 
     float slot_prompt_similarity = 0.1f;
 
+    // VITRIOL: ported from upstream PR #23340 (MIT) -- per-slot context sizes:
+    // slot_id -> n_ctx. slots not listed get equal share of remaining context.
+    std::map<int, int32_t> slot_ctx_sizes;
+
     // batched-bench params
     bool is_pp_shared   = false;
     bool is_tg_separate = false;
