@@ -518,6 +518,13 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         return ptr;
     }
 
+    void reset() override {
+        for (int i = 0; i < MAX_BUFFERS; ++i) {
+            buffer_pool[i] = {};
+        }
+        pool_size = 0;
+    }
+
     void free(void * ptr, size_t size) override {
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer& b = buffer_pool[i];
@@ -630,6 +637,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #endif
 
         return ptr;
+    }
+
+    void reset() override {
+        pool_used = 0;
     }
 
     void free(void * ptr, size_t size) override {
@@ -4464,7 +4475,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         cudaEvent_t ev[4]        = { nullptr, nullptr, nullptr, nullptr }; // s0,e0,s1,e1
         bool        rec[4]       = { false, false, false, false };         // slot recorded?
     };
-    static std::unordered_map<const void *, vitriol_lull_state> g_vitriol_lull;
+    static bool g_vitriol_pool_reset_checked = false;
+static bool g_vitriol_pool_reset         = false;
+static std::unordered_map<const void *, vitriol_lull_state> g_vitriol_lull;
     static std::mutex g_vitriol_lull_mtx;
 
     vitriol_lull_state & lull = [&] () -> vitriol_lull_state & {
@@ -4545,6 +4558,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     enum ggml_status status = ggml_backend_cuda_graph_compute_inner(backend, cgraph);
+
+    // VITRIOL LULL: rewind compute pools after each graph evaluation so the
+    // VMM high-water tracks the true per-graph maximum instead of ratcheting
+    // when allocation/free order is not strictly LIFO across growing n_kv.
+    // Gated: safe only when nothing allocated outside gallocr holds pool
+    // memory across evaluations (checked: weights/KV use separate buffers).
+    if (!g_vitriol_pool_reset_checked) {
+        g_vitriol_pool_reset_checked = true;
+        const char * e = getenv("VITRIOL_POOL_RESET");
+        g_vitriol_pool_reset = e != nullptr && e[0] == '1';
+    }
+    if (g_vitriol_pool_reset) {
+        cuda_ctx->vitriol_reset_pools();
+    }
 
     if (lull.enabled && !lull.poisoned) {
         const int cur = (int)(lull.n & 1);
