@@ -1200,6 +1200,14 @@ private:
 
         bool update_cache = false;
 
+        // a slot whose context window cannot hold the prompt is never a
+        // candidate: with --slot-context splits, the small reserved slots
+        // (e.g. ontic's 8k) would otherwise win the LRU tie-break and
+        // reject large prompts that fit the big slot
+        const auto fits = [&task](const server_slot & slot) {
+            return task.tokens.empty() || (int) task.tokens.size() <= slot.n_ctx;
+        };
+
         // find the slot that has at least n% prompt similarity
         if (ret == nullptr && slot_prompt_similarity != 0.0f) {
             float sim_best = 0;
@@ -1207,6 +1215,11 @@ private:
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
+                    continue;
+                }
+
+                // skip the slot if it cannot hold the prompt
+                if (!fits(slot)) {
                     continue;
                 }
 
@@ -1251,8 +1264,15 @@ private:
                     continue;
                 }
 
-                // select the current slot if the criteria match
-                if (!ret || slot.t_last_used <= t_last) {
+                // skip the slot if it cannot hold the prompt
+                if (!fits(slot)) {
+                    continue;
+                }
+
+                // select the current slot if the criteria match;
+                // strict < so that ties (e.g. restored slots, all
+                // t_last_used == -1) resolve to the lowest slot id
+                if (!ret || slot.t_last_used < t_last) {
                     t_last = slot.t_last_used;
                     ret = &slot;
                 }
