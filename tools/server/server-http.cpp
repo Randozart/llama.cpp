@@ -39,6 +39,9 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
         || req.path == "/v1/models"
         || req.path == "/props"
         || req.path == "/metrics"
+        // VITRIOL: dashboard slot-status polling (~1 Hz) hits /slots; at INFO it
+        // was ~20% of gen-log volume. Covers /slots and /slots/{id}[?action=…].
+        || req.path.compare(0, 6, "/slots") == 0
     ) {
         return;
     }
