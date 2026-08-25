@@ -2280,7 +2280,10 @@ private:
             }
 
             if (all_idle) {
-                SRV_INF("%s", "all slots are idle\n");
+                // VITRIOL: fires on every scheduler tick while idle — debug, not
+                // info; at INFO it drowned the gen log (65% of lines) and buried
+                // decode heartbeats.
+                SRV_DBG("%s", "all slots are idle\n");
 
                 return;
             }
@@ -3438,7 +3441,17 @@ private:
     }
 
     int get_slot_n_ctx() {
-        return slots.back().n_ctx;
+        // VITRIOL: report the LARGEST slot's context in model metadata.
+        // With --slot-context asymmetry, slots.back() is not necessarily the
+        // biggest slot; clients sizing their prompts off /v1/models (hermes)
+        // must see the orchestrator slot's budget, not e.g. an 8k forge slot.
+        int max_ctx = 0;
+        for (const auto & slot : slots) {
+            if (slot.n_ctx > max_ctx) {
+                max_ctx = slot.n_ctx;
+            }
+        }
+        return max_ctx;
     }
 
     server_response_reader get_response_reader() {
