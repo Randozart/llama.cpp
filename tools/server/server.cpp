@@ -7,6 +7,7 @@
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
+#include <numeric>
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
@@ -81,6 +82,33 @@ int main(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
+    }
+
+    // VITRIOL-FINGERPRINT: canonical one-line launch identity, emitted for
+    // every launch path (including hand-launches) so logs are self-describing.
+    {
+        float ts_total = 0.0f;
+        for (float f : params.tensor_split) { ts_total += f; }
+        std::string ts_str;
+        if (ts_total > 0.0f) {
+            char tbuf[16];
+            for (int i = 0; i < 128 && params.tensor_split[i] > 0.0f; ++i) {
+                snprintf(tbuf, sizeof(tbuf), "%s%.0f", i ? "," : "", params.tensor_split[i] * 36.0f / ts_total);
+                ts_str += tbuf;
+            }
+        }
+        fprintf(stderr,
+                "VITRIOL-FINGERPRINT model=%s c=%d ub=%d ts=%s kv=%s/%s fa=%s mode_env=%s score_env=%s pool_reset_env=%s\n",
+                params.model.path.c_str(),
+                (int) params.n_ctx,
+                (int) params.n_ubatch,
+                ts_str.empty() ? "none" : ts_str.c_str(),
+                ggml_type_name(params.cache_type_k),
+                ggml_type_name(params.cache_type_v),
+                params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ? "on" : (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ? "off" : "auto"),
+                getenv("VITRIOL_MODE")     ? getenv("VITRIOL_MODE")     : "off",
+                getenv("VITRIOL_KV_SCORE") ? getenv("VITRIOL_KV_SCORE") : "off",
+                getenv("VITRIOL_POOL_RESET") ? getenv("VITRIOL_POOL_RESET") : "0");
     }
 
     // validate batch size for embeddings
