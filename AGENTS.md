@@ -33,8 +33,9 @@ agent are welcome.
 
 ## Licensing
 
-This fork is GPL-2.0. Before incorporating third-party code, check compatibility
-(Apache-2.0 is incompatible — study and re-derive only). Algorithm-bearing modules carry a
+This fork is Apache-2.0 (changed from GPL-2.0 on 2026-08-28; the fork is owned by the same
+author as VITRIOL). Before incorporating third-party code, check compatibility (copyleft
+licenses — GPL/LGPL/AGPL — stay out or get re-derived). Algorithm-bearing modules carry a
 `PROVENANCE` header. See root `AGENTS.md` and `docs/provenance/`.
 
 ## Useful resources (upstream)
