@@ -287,6 +287,47 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// TurboQuant 3-bit (3.5 bpw)
+// 32 values per block, WHT rotation + Lloyd-Max 8-level codebook
+#define QK_TQ3_0 32
+typedef struct {
+    ggml_half d;                    // scale factor (RMS of block)
+    uint8_t qs[QK_TQ3_0 * 3 / 8];  // 3-bit quant indices, packed (12 bytes)
+} block_tq3_0;
+static_assert(sizeof(block_tq3_0) == sizeof(ggml_half) + QK_TQ3_0 * 3 / 8, "wrong tq3_0 block size/padding");
+
+// TurboQuant 3-bit with two half-block scales (4.0 bpw)
+typedef struct {
+    ggml_half d0;
+    ggml_half d1;
+    uint8_t qs[QK_TQ3_0 * 3 / 8];
+} block_tq3_1s;
+static_assert(sizeof(block_tq3_1s) == 2 * sizeof(ggml_half) + QK_TQ3_0 * 3 / 8, "wrong tq3_1s block size/padding");
+
+// TurboQuant 3-bit with four u8 per-8 scales (4.0 bpw)
+// Each d[g] is an E3M5 mini-float: scale = 2^(d>>5 - 9) * (1 + (d&31)/32)
+typedef struct {
+    uint8_t   d[4];                // 4 × E3M5 scales for groups of 8 elements
+    uint8_t   qs[QK_TQ3_0 * 3 / 8]; // 12 bytes: 32 × 3-bit packed indices
+} block_tq3_4s;
+static_assert(sizeof(block_tq3_4s) == 4 + QK_TQ3_0 * 3 / 8, "wrong tq3_4s block size/padding");
+
+// TurboQuant 3-bit with one promoted shared-shift block per 16 logical TQ3_1S blocks.
+// Fixed layout per 512 weights:
+// - 2-byte bitmap with exactly one promoted logical slot bit set
+// - 15 contiguous base TQ3_1S blocks (all non-promoted logical blocks)
+// - 1 fixed promoted shared-shift trailer
+//
+// This keeps the superblock size unchanged while removing mixed-stream pointer
+// walking from the hot decode path.
+typedef struct {
+    ggml_half d0;
+    ggml_half d1;
+    ggml_half m;
+    uint8_t qs[QK_TQ3_0 * 3 / 8];
+} block_tq3_1s_shift;
+static_assert(sizeof(block_tq3_1s_shift) == 3 * sizeof(ggml_half) + QK_TQ3_0 * 3 / 8, "wrong tq3_1s_shift block size/padding");
+
 //
 // Super-block quantization structures
 //

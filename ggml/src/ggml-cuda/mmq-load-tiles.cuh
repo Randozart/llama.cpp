@@ -1766,3 +1766,256 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_u32_scale[i*sram_stride] = get_int_b4(bxi->d, 0);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// TQ3_0: optimized dequant to q8_0 format.
+// One 32-lane warp cooperatively handles one 32-value TQ3 block:
+// - one subgroup leader loads the packed 24-bit code for each 8-value subgroup
+// - all subgroup lanes extract their 3-bit code from that packed value
+// - the full 32-value inverse WHT remains exact
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_tq3_0(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    static_assert(warp_size == QK_TQ3_0, "TQ3_0 MMQ assumes one 32-lane warp per block");
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif
+
+    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0; // 8 q8-packed slots per row
+    constexpr int rows_per_warp_group = nwarps / blocks_per_tile_x_row;
+    static_assert(rows_per_warp_group > 0, "Not enough warps for TQ3_0 MMQ tile loader");
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+
+    constexpr float tq3_d_scale = 2.1519f / 127.0f;
+    constexpr int8_t tq3_q8_levels[8] = {-127, -79, -45, -14, 14, 45, 79, 127};
+
+    for (int i0 = 0; i0 < I; i0 += rows_per_warp_group) {
+        const int i = i0 + warp / blocks_per_tile_x_row;
+        if (fallback && i >= i_max) break;
+
+        const int blk = warp % blocks_per_tile_x_row;
+        const block_tq3_0 * bxi = (const block_tq3_0 *)x + kbx0 + i*stride + blk;
+        const int g = lane / 8;
+        const int r = lane % 8;
+        const int leader = g * 8;
+
+        float rms = 0.0f;
+        uint32_t packed = 0;
+        if (r == 0) {
+            rms = __half2float(bxi->d);
+            const uint8_t * qp = bxi->qs + g * 3;
+            packed = (uint32_t) qp[0] | ((uint32_t) qp[1] << 8) | ((uint32_t) qp[2] << 16);
+        }
+        rms = __shfl_sync(0xFFFFFFFF, rms, leader);
+        packed = __shfl_sync(0xFFFFFFFF, packed, leader);
+
+        // Rotated-domain TQ3 blocks always quantize against the same centroid set.
+        // That makes the q8_0 requant exact with a constant per-centroid lookup:
+        // q = round(centroid * 127 / max_abs_centroid), d = rms * max_abs_centroid / 127.
+        const uint8_t idx = (packed >> (3 * r)) & 7;
+        const int q = (int) tq3_q8_levels[idx];
+        const float d = __shfl_sync(0xFFFFFFFF, rms * tq3_d_scale, leader);
+
+        const int slot = lane % QI8_0;
+        const int q1 = __shfl_sync(0xFFFFFFFF, q, 4*slot + 0);
+        const int q2 = __shfl_sync(0xFFFFFFFF, q, 4*slot + 1);
+        const int q3 = __shfl_sync(0xFFFFFFFF, q, 4*slot + 2);
+        const int q4 = __shfl_sync(0xFFFFFFFF, q, 4*slot + 3);
+        if (lane < QI8_0) {
+            const uint32_t packed_q = (uint8_t) q1 | ((uint8_t) q2 << 8) | ((uint8_t) q3 << 16) | ((uint8_t) q4 << 24);
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*sram_stride + blk*QI8_0 + lane] = packed_q;
+            if (lane == 0) {
+                x_df[i*sram_stride + blk] = d;
+            }
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + blk*QI8_0 + lane] = packed_q;
+            if (lane == 0) {
+                x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + blk] = d;
+            }
+#endif
+        }
+    }
+}
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_tq3_1s(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    // Identical to load_tiles_tq3_0 except dual half-block scales (d0, d1)
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    static_assert(warp_size == QK_TQ3_0, "TQ3_1S MMQ assumes one 32-lane warp per block");
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif
+
+    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;
+    constexpr int rows_per_warp_group = nwarps / blocks_per_tile_x_row;
+    static_assert(rows_per_warp_group > 0, "Not enough warps for TQ3_1S MMQ tile loader");
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+
+    constexpr float tq3_d_scale = 2.1519f / 127.0f;
+    constexpr int8_t tq3_q8_levels[8] = {-127, -79, -45, -14, 14, 45, 79, 127};
+
+    for (int i0 = 0; i0 < I; i0 += rows_per_warp_group) {
+        const int i = i0 + warp / blocks_per_tile_x_row;
+        if (fallback && i >= i_max) break;
+
+        const int blk = warp % blocks_per_tile_x_row;
+        const block_tq3_1s * bxi = (const block_tq3_1s *)x + kbx0 + i*stride + blk;
+        const int g = lane / 8;
+        const int r = lane % 8;
+        const int leader = g * 8;
+
+        float rms = 0.0f;
+        uint32_t packed = 0;
+        if (r == 0) {
+            rms = (g < 2) ? __half2float(bxi->d0) : __half2float(bxi->d1);
+            const uint8_t * qp = bxi->qs + g * 3;
+            packed = (uint32_t) qp[0] | ((uint32_t) qp[1] << 8) | ((uint32_t) qp[2] << 16);
+        }
+        rms = __shfl_sync(0xFFFFFFFF, rms, leader);
+        packed = __shfl_sync(0xFFFFFFFF, packed, leader);
+
+        const uint8_t idx = (packed >> (3 * r)) & 7;
+        const int q = (int) tq3_q8_levels[idx];
+        const float d = __shfl_sync(0xFFFFFFFF, rms * tq3_d_scale, leader);
+
+        const int slot = lane % QI8_0;
+        const int q1 = __shfl_sync(0xFFFFFFFF, q, 4*slot + 0);
+        const int q2 = __shfl_sync(0xFFFFFFFF, q, 4*slot + 1);
+        const int q3 = __shfl_sync(0xFFFFFFFF, q, 4*slot + 2);
+        const int q4 = __shfl_sync(0xFFFFFFFF, q, 4*slot + 3);
+        if (lane < QI8_0) {
+            const uint32_t packed_q = (uint8_t) q1 | ((uint8_t) q2 << 8) | ((uint8_t) q3 << 16) | ((uint8_t) q4 << 24);
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*sram_stride + blk*QI8_0 + lane] = packed_q;
+            if (lane == 0) {
+                x_df[i*sram_stride + blk] = d;
+            }
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + blk*QI8_0 + lane] = packed_q;
+            if (lane == 0) {
+                x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + blk] = d;
+            }
+#endif
+        }
+    }
+}
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_tq3_4s(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    static_assert(warp_size == QK_TQ3_0, "TQ3_4S MMQ assumes one 32-lane warp per block");
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif
+
+    // 16 threads per row, each decoding 2 subgroups (16 elements) -> 4 int32 outputs.
+    // Scale baking: per-subgroup RMS folded into int8 values with a single block scale.
+    constexpr int threads_per_row = 16;
+    constexpr int nrows = warp_size / threads_per_row;  // 2
+    const int kqsx = threadIdx.x % threads_per_row;     // 0..15
+
+    static constexpr float tq3_centroids[8] = {
+        -1.996684f, -1.291398f, -0.740341f, -0.247508f,
+         0.230106f,  0.725222f,  1.277503f,  1.988943f
+    };
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const int blk_in_row = kqsx / 2;
+        const int half = kqsx % 2;
+        const int g_base = half * 2;
+
+        const block_tq3_4s * bxi = (const block_tq3_4s *)x + kbx0 + i*stride + blk_in_row;
+
+        // Decode all 4 subgroup scales, find max for the block-level scale
+        float rms[4];
+        for (int g = 0; g < 4; g++) {
+            const uint8_t sb = bxi->d[g];
+            if (sb == 0) {
+                rms[g] = 0.0f;
+            } else {
+                rms[g] = ldexpf(1.0f + (float)(sb & 31) / 32.0f, (sb >> 5) - 9);
+            }
+        }
+        const float amax = fmaxf(fmaxf(rms[0], rms[1]), fmaxf(rms[2], rms[3])) * 1.996684f;
+        const float d_block = amax / 127.0f;
+        const float d_inv = (d_block > 0.0f) ? 127.0f / amax : 0.0f;
+
+#pragma unroll
+        for (int sg = 0; sg < 2; sg++) {
+            const int g = g_base + sg;
+            const float rms_g = rms[g];
+
+            const uint8_t * qp = bxi->qs + g * 3;
+            const uint32_t packed = (uint32_t)qp[0] | ((uint32_t)qp[1] << 8) | ((uint32_t)qp[2] << 16);
+
+            // Bake per-subgroup scale into int8: qs = round(centroid * rms_g / d_block * 127)
+            int8_t q[8];
+#pragma unroll
+            for (int r = 0; r < 8; r++) {
+                const float val = tq3_centroids[(packed >> (3*r)) & 7] * rms_g;
+                q[r] = (int8_t)__float2int_rn(val * d_inv);
+            }
+
+            const uint32_t pq0 = (uint8_t)q[0] | ((uint8_t)q[1] << 8) | ((uint8_t)q[2] << 16) | ((uint8_t)q[3] << 24);
+            const uint32_t pq1 = (uint8_t)q[4] | ((uint8_t)q[5] << 8) | ((uint8_t)q[6] << 16) | ((uint8_t)q[7] << 24);
+
+            const int out_base = blk_in_row * QI8_0 + g * 2;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*sram_stride + out_base + 0] = pq0;
+            x_qs[i*sram_stride + out_base + 1] = pq1;
+            if (sg == 0 && half == 0) {
+                x_df[i*sram_stride + blk_in_row] = d_block;
+            }
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + out_base + 0] = pq0;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + out_base + 1] = pq1;
+            if (sg == 0 && half == 0) {
+                x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + blk_in_row] = d_block;
+            }
+#endif
+        }
+    }
+}
