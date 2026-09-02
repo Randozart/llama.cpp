@@ -435,7 +435,7 @@ extern "C" {
 
         GGML_TYPE_TQ3_0      = 200, // KV-cache only
 
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_COUNT   = 201,
     };
 
     // precision

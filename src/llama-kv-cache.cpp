@@ -303,6 +303,20 @@ llama_kv_cache::llama_kv_cache(
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+
+        // VITRIOL (2026-09-02): TQ3_* V-cache on CUDA is corrupted on the
+        // post-merge build. Upstream rewrote flash-attn (tile/mma/vec split)
+        // and added graph-level Hadamard rotation for quantized V
+        // (attn_rot_v); the TQ3 V-kernel paths from the frozen vitriol
+        // branch did not survive that rewrite. fattn rejects TQ3_* → the FA
+        // op falls back to CPU, where the dequant layout clashes with the
+        // GPU-quantized data → degraded output. CPU-only inference with
+        // tq3_0 K+V is verified correct (see EXPERIMENT_LOG 2026-09-02).
+        // K-side tq3_0 with CUDA vec_dot is verified correct.
+        if (type_v == GGML_TYPE_TQ3_0 || type_v == GGML_TYPE_TQ3_1S || type_v == GGML_TYPE_TQ3_4S) {
+            LLAMA_LOG_WARN("%s: TQ3 V-cache (%s) on CUDA is KNOWN-BROKEN after the upstream fattn/attn_rot rewrite — output will be degraded. Use q4_0 (or f16) for V until the fattn TQ3 port lands. K-side TQ3 is fine.\n",
+                    __func__, ggml_type_name(type_v));
+        }
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
