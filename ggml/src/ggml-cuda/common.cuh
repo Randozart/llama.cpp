@@ -1133,6 +1133,27 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qi = QI3_S;
 };
 
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ3_0> {
+    static constexpr int qk = QK_TQ3_0;
+    static constexpr int qr = 2;  // 2 values per dequant call (like q4_0)
+    static constexpr int qi = 16;  // qi/vdr=4: 4 threads per block
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ3_1S> {
+    static constexpr int qk = QK_TQ3_0;
+    static constexpr int qr = 2;
+    static constexpr int qi = 16;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ3_4S> {
+    static constexpr int qk = QK_TQ3_0;
+    static constexpr int qr = 2;
+    static constexpr int qi = 16;
+};
+
 //////////////////////
 
 struct ggml_cuda_device_info {
@@ -1170,6 +1191,13 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // VITRIOL LULL: rewind the bump allocator to offset 0. Safe only when
+    // every outstanding allocation has been freed (gallocr does this between
+    // graph evaluations); physical mappings are retained, so the pool
+    // high-water converges to the true maximum instead of ratcheting when
+    // frees arrive out of LIFO order.
+    virtual void reset() {}
 };
 
 template<typename T>
@@ -1526,6 +1554,17 @@ struct ggml_backend_cuda_context {
             pools[device][curr_stream_no] = new_pool_for_device(device, curr_stream_no);
         }
         return *pools[device][curr_stream_no];
+    }
+
+    // VITRIOL LULL: reset every device/stream pool (see ggml_cuda_pool::reset)
+    void vitriol_reset_pools() {
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+            for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+                if (pools[d][s]) {
+                    pools[d][s]->reset();
+                }
+            }
+        }
     }
 
     ggml_cuda_pool & pool() {

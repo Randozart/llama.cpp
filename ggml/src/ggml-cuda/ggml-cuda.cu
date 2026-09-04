@@ -2,8 +2,12 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include "vitriol-cuda-integration.h"
+#include "vitriol-buffer.h"
+
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-quants.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -69,6 +73,9 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/turbo-wht.cuh"
+#include "ggml-cuda/tq3-native.cuh"
+#include "ggml-cuda/tq3-prefill.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -92,6 +99,110 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+// ── VITRIOL perf diagnostics ────────────────────────────────────────────────
+// Rolling counters over all CUDA contexts; atomics so the optional /metrics
+// read never races. Enabled once from GGML_CUDA_GDN_PROFILE (same env-gate as
+// the [GDN]/[DEC] timers).
+namespace {
+struct vitriol_cuda_perf {
+    std::atomic<uint64_t> n_capture{0};
+    std::atomic<uint64_t> n_replay {0};
+    std::atomic<uint64_t> op_n  [GGML_OP_COUNT];
+};
+static vitriol_cuda_perf g_perf;
+static const bool g_perf_enabled = getenv("GGML_CUDA_GDN_PROFILE") != nullptr;
+}
+
+static bool ggml_cuda_tq3_native_prefill_debug_enabled() {
+    static bool enabled = getenv("GGML_CUDA_TQ3_NATIVE_PREFILL") != nullptr;
+    return enabled;
+}
+
+static void ggml_cuda_native_prefill_debug(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1) {
+
+    if (!ggml_cuda_tq3_native_prefill_debug_enabled()) {
+        return;
+    }
+    if (src0->type != GGML_TYPE_TQ3_0 || src1->type != GGML_TYPE_F32) {
+        return;
+    }
+
+    block_tq3_0 host_blk;
+    block_q8_0 host_q8;
+    float host_act[QK_TQ3_0];
+    float host_deq[QK_TQ3_0];
+    const block_tq3_0 * device_blk = (const block_tq3_0 *) src0->data;
+    const float * device_act = (const float *) src1->data;
+
+    CUDA_CHECK(cudaMemcpyAsync(&host_blk, device_blk, sizeof(host_blk), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(host_act, device_act, sizeof(host_act), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+    quantize_row_q8_0_ref(host_act, &host_q8, QK_TQ3_0);
+    dequantize_row_tq3_0(&host_blk, host_deq, QK_TQ3_0);
+
+    float host_ref = 0.0f;
+    for (int i = 0; i < QK_TQ3_0; ++i) {
+        host_ref += host_deq[i] * host_act[i];
+    }
+
+    block_q8_0 * d_q8 = nullptr;
+    float * d_out = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_q8, sizeof(block_q8_0)));
+    CUDA_CHECK(cudaMalloc(&d_out, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(d_q8, &host_q8, sizeof(host_q8), cudaMemcpyHostToDevice, ctx.stream()));
+
+    constexpr int warmup = 4;
+    constexpr int niters = 16;
+    for (int i = 0; i < warmup; ++i) {
+        ggml_cuda_native_tq3_dot_kernel<<<1, 32, 0, ctx.stream()>>>(device_blk, d_q8, d_out, 1);
+    }
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, ctx.stream()));
+    for (int i = 0; i < niters; ++i) {
+        ggml_cuda_native_tq3_dot_kernel<<<1, 32, 0, ctx.stream()>>>(device_blk, d_q8, d_out, 1);
+    }
+    CUDA_CHECK(cudaEventRecord(stop, ctx.stream()));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float native_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&native_ms, start, stop));
+
+    float native_sum = 0.0f;
+    CUDA_CHECK(cudaMemcpyAsync(&native_sum, d_out, sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+    GGML_LOG_INFO("TQ3 native prefill debug sample: native=%f ref=%f diff=%e avg %.3f us/launch",
+        native_sum, host_ref, fabsf(native_sum - host_ref), 1000.0f * native_ms / niters);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_q8));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+void ggml_cuda_perf_reset(void) {
+    g_perf.n_capture.store(0);
+    g_perf.n_replay.store(0);
+    for (int i = 0; i < GGML_OP_COUNT; ++i) {
+        g_perf.op_n[i].store(0);
+    }
+}
+
+ggml_cuda_perf_snapshot ggml_cuda_perf_get(void) {
+    ggml_cuda_perf_snapshot s;
+    s.n_capture = g_perf.n_capture.load();
+    s.n_replay  = g_perf.n_replay.load();
+    for (int i = 0; i < GGML_OP_COUNT; ++i) {
+        s.op_n[i] = g_perf.op_n[i].load();
+    }
+    return s;
+}
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
@@ -1860,13 +1971,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    // TQ3 vec_prefill_ok: TQ3_0/TQ3_1S need contiguous + single-col for MMVQ
+    const bool tq3_vec_prefill_ok = (src0->type != GGML_TYPE_TQ3_0 && src0->type != GGML_TYPE_TQ3_1S) || src1->ne[1] == 1;
+    if (tq3_vec_prefill_ok && ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+    // TQ3 MMQ requires contiguous for all three variants
+    const bool tq3_mmq_ok = (src0->type != GGML_TYPE_TQ3_0 || ggml_is_contiguous(src0))
+        && (src0->type != GGML_TYPE_TQ3_1S || ggml_is_contiguous(src0))
+        && (src0->type != GGML_TYPE_TQ3_4S || ggml_is_contiguous(src0));
+    if (tq3_mmq_ok && ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
+    }
+    if (src0->type == GGML_TYPE_TQ3_0 && src1->type == GGML_TYPE_F32) {
+        ggml_cuda_native_prefill_debug(ctx, src0, src1);
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
@@ -2391,6 +2511,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             ggml_cuda_cross_entropy_loss_back(ctx, dst);
+            break;
+        case GGML_OP_TURBO_WHT:
+            ggml_cuda_op_turbo_wht(ctx, dst);
             break;
         case GGML_OP_OPT_STEP_ADAMW:
             ggml_cuda_opt_step_adamw(ctx, dst);
@@ -4211,6 +4334,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
+            if (g_perf_enabled && use_cuda_graph && cuda_graph_update_required) {
+                g_perf.n_capture.fetch_add(1, std::memory_order_relaxed);
+            }
             [[maybe_unused]] int prev_i = 0;
 
             if (stream_ctx.concurrent_events.size() > 0) {
@@ -4352,6 +4478,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+                if (g_perf_enabled) {
+                    g_perf.op_n[node->op].fetch_add(1, std::memory_order_relaxed);
+                }
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
@@ -4380,6 +4510,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        if (g_perf_enabled && !cuda_graph_update_required) {
+            g_perf.n_replay.fetch_add(1, std::memory_order_relaxed);
+        }
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }
@@ -4412,7 +4545,156 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+static enum ggml_status ggml_backend_cuda_graph_compute_inner(ggml_backend_t backend, ggml_cgraph * cgraph);
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    // VITRIOL LULL (Phase 0): env-gated per-device split timing + VRAM watermark.
+    // Measures how long each device spends computing a sched split (busy) and how
+    // long it idles until its next split (the pipeline lull this project targets).
+    // Rotating event pairs, queried lazily and never blocking: zero perturbation.
+    // All calls are fault-tolerant — any CUDA error self-disables profiling for
+    // that backend instance instead of taking inference down.
+    // State is keyed by backend-context pointer: CUDA events belong to the context
+    // that created them, and a device can be wrapped by more than one instance.
+    // PROVENANCE: original VITRIOL instrumentation for
+    // .opencode/plans/lull-plan-2026-08-24.md — no third-party code.
+    struct vitriol_lull_state {
+        bool        checked      = false;
+        bool        enabled      = false;
+        bool        poisoned     = false;
+        bool        records_only = false;
+        bool        no_elapsed   = false;
+        uint64_t    n            = 0;
+        int         dbg          = 0;
+        int         device       = -1;
+        cudaEvent_t ev[4]        = { nullptr, nullptr, nullptr, nullptr }; // s0,e0,s1,e1
+        bool        rec[4]       = { false, false, false, false };         // slot recorded?
+    };
+    static bool g_vitriol_pool_reset_checked = false;
+static bool g_vitriol_pool_reset         = false;
+static std::unordered_map<const void *, vitriol_lull_state> g_vitriol_lull;
+    static std::mutex g_vitriol_lull_mtx;
+
+    vitriol_lull_state & lull = [&] () -> vitriol_lull_state & {
+        std::lock_guard<std::mutex> lock(g_vitriol_lull_mtx);
+        return g_vitriol_lull[(const void *) cuda_ctx];
+    }();
+    if (!lull.checked) {
+        lull.checked = true;
+        lull.device  = cuda_ctx->device;
+        const char * env = getenv("VITRIOL_LULL_PROFILE");
+        lull.enabled = env != nullptr && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+        fprintf(stderr, "VITRIOL_LULL_DBG init dev=%d enabled=%d\n", lull.device, (int) lull.enabled);
+        // diagnostics knob: VITRIOL_LULL_RECORDS_ONLY=1 skips all query/elapsed
+        // calls (records only) to bisect which CUDA op upsets the stream.
+        const char * ro = getenv("VITRIOL_LULL_RECORDS_ONLY");
+        lull.records_only = ro != nullptr && ro[0] == '1';
+        // VITRIOL_LULL_NO_ELAPSED=1: run queries but skip EventElapsedTime.
+        const char * ne = getenv("VITRIOL_LULL_NO_ELAPSED");
+        lull.no_elapsed = ne != nullptr && ne[0] == '1';
+    }
+
+    if (lull.enabled && !lull.poisoned) {
+        if (!lull.ev[0]) {
+            for (int i = 0; i < 4 && !lull.poisoned; i++) {
+                cudaError_t rc = cudaEventCreate(&lull.ev[i]);
+                if (rc != cudaSuccess) {
+                    fprintf(stderr, "VITRIOL_LULL dev=%d event_create_rc=%d, disabling\n",
+                            lull.device, (int) rc);
+                    lull.poisoned = true;
+                }
+            }
+        }
+
+        const int cur = (int)(lull.n & 1);
+        const int prv = cur ^ 1;
+
+        // Record this call's start FIRST, then report the previous call.
+        // Never query or take elapsed() against an event that has not been
+        // recorded yet: doing so upset the stream and surfaced downstream as
+        // "invalid resource handle" kernel-launch failures.
+        if (!lull.poisoned) {
+            cudaError_t rrc = cudaEventRecord(lull.ev[2*cur+0], cuda_ctx->stream());
+            if (rrc == cudaSuccess) {
+                lull.rec[2*cur+0] = true;
+            } else {
+                fprintf(stderr, "VITRIOL_LULL dev=%d record_rc=%d, disabling\n", lull.device, (int) rrc);
+                lull.poisoned = true;
+            }
+        }
+
+        // Report the previous completed call: busy duration + idle gap into
+        // this call's start. Only ever touches events already recorded.
+        if (!lull.poisoned && !lull.records_only && lull.n > 0 &&
+            lull.rec[2*prv+0] && lull.rec[2*prv+1]) {
+            cudaError_t qrc = cudaEventQuery(lull.ev[2*prv+1]);
+            if (qrc == cudaSuccess) {
+                float busy_ms = -1.0f;
+                if (cudaEventElapsedTime(&busy_ms, lull.ev[2*prv+0], lull.ev[2*prv+1]) == cudaSuccess) {
+                    fprintf(stderr, "VITRIOL_LULL dev=%d busy_ms=%.3f\n", lull.device, busy_ms);
+                }
+                // idle only measurable when queue was empty and this call's
+                // start event already completed
+                if (cudaEventQuery(lull.ev[2*cur+0]) == cudaSuccess) {
+                    float idle_ms = -1.0f;
+                    if (cudaEventElapsedTime(&idle_ms, lull.ev[2*prv+1], lull.ev[2*cur+0]) == cudaSuccess) {
+                        fprintf(stderr, "VITRIOL_LULL dev=%d idle_ms=%.3f\n", lull.device, idle_ms);
+                    }
+                }
+            } else if (qrc != cudaErrorNotReady) {
+                fprintf(stderr, "VITRIOL_LULL dev=%d query_rc=%d, disabling\n", lull.device, (int) qrc);
+                lull.poisoned = true;
+            }
+        }
+
+        if (lull.poisoned) {
+            lull.enabled = false;
+        }
+    }
+
+    enum ggml_status status = ggml_backend_cuda_graph_compute_inner(backend, cgraph);
+
+    // VITRIOL LULL: rewind compute pools after each graph evaluation so the
+    // VMM high-water tracks the true per-graph maximum instead of ratcheting
+    // when allocation/free order is not strictly LIFO across growing n_kv.
+    // Gated: safe only when nothing allocated outside gallocr holds pool
+    // memory across evaluations (checked: weights/KV use separate buffers).
+    if (!g_vitriol_pool_reset_checked) {
+        g_vitriol_pool_reset_checked = true;
+        const char * e = getenv("VITRIOL_POOL_RESET");
+        g_vitriol_pool_reset = e != nullptr && e[0] == '1';
+    }
+    if (g_vitriol_pool_reset) {
+        cuda_ctx->vitriol_reset_pools();
+    }
+
+    if (lull.enabled && !lull.poisoned) {
+        const int cur = (int)(lull.n & 1);
+        cudaError_t rrc = cudaEventRecord(lull.ev[2*cur+1], cuda_ctx->stream());
+        if (rrc != cudaSuccess) {
+            fprintf(stderr, "VITRIOL_LULL dev=%d record_end_rc=%d, disabling\n", lull.device, (int) rrc);
+            lull.poisoned = true;
+            lull.enabled  = false;
+        } else {
+            lull.rec[2*cur+1] = true;
+            ++lull.n;
+            if ((lull.n & 0x3F) == 0) {
+                size_t free_b = 0, total_b = 0;
+                if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                    fprintf(stderr, "VITRIOL_LULL dev=%d vram_free_mb=%zu vram_total_mb=%zu\n",
+                            lull.device, free_b / (1024 * 1024), total_b / (1024 * 1024));
+                }
+            }
+        }
+    }
+
+    return status;
+}
+static enum ggml_status ggml_backend_cuda_graph_compute_inner(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -5167,6 +5449,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_TQ3_0:
+                    case GGML_TYPE_TQ3_1S:
+                    case GGML_TYPE_TQ3_4S:
                         return true;
                     default:
                         return false;
@@ -5201,6 +5486,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_TQ3_0:
+                    case GGML_TYPE_TQ3_1S:
+                    case GGML_TYPE_TQ3_4S:
                         return true;
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
@@ -5221,7 +5509,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            (
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
+                               op->type == GGML_TYPE_TQ3_0) &&
                                op->src[0]->type == GGML_TYPE_F32
                            ) || (
                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
@@ -5497,6 +5786,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_TURBO_WHT:
+            return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
@@ -5518,7 +5809,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) || vitriol_is_vitriol_buffer_type(buft);
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -5767,6 +6058,8 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;
     }
+
+    vitriol_cuda_init();
 
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),

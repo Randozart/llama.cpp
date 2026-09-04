@@ -430,6 +430,11 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
+        GGML_TYPE_TQ3_1S  = 44, // TurboQuant 3-bit with two half-block scales
+        GGML_TYPE_TQ3_4S  = 46, // TurboQuant 3-bit with four u8 per-8 scales (4.0 bpw)
+
+        GGML_TYPE_TQ3_0      = 200, // KV-cache only
+
         GGML_TYPE_COUNT   = 43,
     };
 
@@ -589,6 +594,8 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_TURBO_WHT,
 
         GGML_OP_COUNT,
     };
@@ -2760,6 +2767,12 @@ extern "C" {
             struct ggml_tensor  * a,  // logits
             struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // gradients of cross_entropy_loss result
+
+    // TurboQuant WHT rotation: out[i] = WHT(sign*in)[i] / sqrt(block_size)
+    // Applied to activations before TQ3_0 weight matmul to eliminate WHT from kernels
+    GGML_API struct ggml_tensor * ggml_turbo_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf

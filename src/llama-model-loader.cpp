@@ -58,6 +58,9 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q6_K:      name = LLAMA_FTYPE_PREFIX "Q6_K"; break;
         case LLAMA_FTYPE_MOSTLY_TQ1_0:     name = LLAMA_FTYPE_PREFIX "TQ1_0 - 1.69 bpw ternary"; break;
         case LLAMA_FTYPE_MOSTLY_TQ2_0:     name = LLAMA_FTYPE_PREFIX "TQ2_0 - 2.06 bpw ternary"; break;
+        case LLAMA_FTYPE_MOSTLY_TQ3_0:     name = LLAMA_FTYPE_PREFIX "TQ3_0 - 3.50 bpw turbo"; break;
+        case LLAMA_FTYPE_MOSTLY_TQ3_1S:    name = LLAMA_FTYPE_PREFIX "TQ3_1S - 4.00 bpw turbo two-scale"; break;
+        case LLAMA_FTYPE_MOSTLY_TQ3_4S:    name = LLAMA_FTYPE_PREFIX "TQ3_4S - 4.00 bpw turbo four-scale"; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS:   name = LLAMA_FTYPE_PREFIX "IQ2_XXS - 2.0625 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:    name = LLAMA_FTYPE_PREFIX "IQ2_XS - 2.3125 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:     name = LLAMA_FTYPE_PREFIX "IQ2_S - 2.5 bpw"; break;
@@ -760,6 +763,9 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q6_K:    ftype = LLAMA_FTYPE_MOSTLY_Q6_K;    break;
             case GGML_TYPE_TQ1_0:   ftype = LLAMA_FTYPE_MOSTLY_TQ1_0;   break;
             case GGML_TYPE_TQ2_0:   ftype = LLAMA_FTYPE_MOSTLY_TQ2_0;   break;
+            case GGML_TYPE_TQ3_0:   ftype = LLAMA_FTYPE_MOSTLY_TQ3_0;   break;
+            case GGML_TYPE_TQ3_1S:  ftype = LLAMA_FTYPE_MOSTLY_TQ3_1S;  break;
+            case GGML_TYPE_TQ3_4S:  ftype = LLAMA_FTYPE_MOSTLY_TQ3_4S;  break;
             case GGML_TYPE_IQ2_XXS: ftype = LLAMA_FTYPE_MOSTLY_IQ2_XXS; break;
             case GGML_TYPE_IQ2_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ2_XS;  break;
             case GGML_TYPE_IQ2_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ2_S;   break;
@@ -1383,15 +1389,27 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
-    if (n_created > n_tensors) {
-        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
+    int n_expected_created = 0;
+    for (const auto & it : weights_map) {
+        const std::string & name = it.first;
+        if (name.size() >= 14 && name.rfind(".tq3_ap_bitmap") == name.size() - 14) {
+            continue;
+        }
+        if (name.size() >= 16 && name.rfind(".tq3_ap_promoted") == name.size() - 16) {
+            continue;
+        }
+        ++n_expected_created;
     }
-    if (n_created < n_tensors) {
+
+    if (n_created > n_expected_created) {
+        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_expected_created, n_created));
+    }
+    if (n_created < n_expected_created) {
         if (!partial) {
-            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_expected_created, n_created));
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
-                __func__, n_created, n_tensors);
+                __func__, n_created, n_expected_created);
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
