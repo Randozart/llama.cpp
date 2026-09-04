@@ -318,8 +318,15 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
         }
 
+        // TQ3 types apply their own randomized Hadamard transform inside the
+        // quantizer (both CPU and CUDA kernels assume raw-domain inputs), so
+        // the extra upstream attention rotation must not stack on top.
+        const bool tq3_k = type_k == GGML_TYPE_TQ3_0 || type_k == GGML_TYPE_TQ3_1S || type_k == GGML_TYPE_TQ3_4S;
+        const bool tq3_v = type_v == GGML_TYPE_TQ3_0 || type_v == GGML_TYPE_TQ3_1S || type_v == GGML_TYPE_TQ3_4S;
+
         attn_rot_k =
             !attn_rot_disable &&
+            !tq3_k &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
             hparams.n_embd_head_k() % 64 == 0;
@@ -333,6 +340,7 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_v =
             !attn_rot_disable &&
+            !tq3_v &&
             n_embd_head_v_all > 0 &&
             ggml_is_quantized(type_v) &&
             hparams.n_embd_head_v() % 64 == 0;

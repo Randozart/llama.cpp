@@ -562,6 +562,99 @@ void ggml_vec_dot_tq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
+// TurboQuant 3-bit K-cache vec_dots.
+// Exact-by-construction CPU reference paths: dequantize (including the
+// inverse WHT) then dot, mirroring dequantize_row_tq3_* in ggml-quants.c.
+// TQ3 blocks are 32 elements, so activations pair with q8_0 (32-block),
+// NOT q8_K (256-block) - rows shorter than 256 (head_dim < 256) would
+// break q8_K superblock quantization.
+void ggml_vec_dot_tq3_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_TQ3_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq3_0 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_TQ3_0;
+
+    float tmp[QK_TQ3_0];
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        dequantize_row_tq3_0(x + i, tmp, QK_TQ3_0);
+        const float d = ggml_fp16_to_fp32(y[i].d);
+        float sumi = 0.0f;
+        for (int j = 0; j < QK_TQ3_0; ++j) {
+            sumi += tmp[j] * y[i].qs[j];
+        }
+        sumf += sumi * d;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_tq3_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_TQ3_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq3_1s * GGML_RESTRICT x = vx;
+    const block_q8_0   * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_TQ3_0;
+
+    float tmp[QK_TQ3_0];
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        dequantize_row_tq3_1s(x + i, tmp, QK_TQ3_0);
+        const float d = ggml_fp16_to_fp32(y[i].d);
+        float sumi = 0.0f;
+        for (int j = 0; j < QK_TQ3_0; ++j) {
+            sumi += tmp[j] * y[i].qs[j];
+        }
+        sumf += sumi * d;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_tq3_4s_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_TQ3_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq3_4s * GGML_RESTRICT x = vx;
+    const block_q8_0   * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_TQ3_0;
+
+    float tmp[QK_TQ3_0];
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        dequantize_row_tq3_4s(x + i, tmp, QK_TQ3_0);
+        const float d = ggml_fp16_to_fp32(y[i].d);
+        float sumi = 0.0f;
+        for (int j = 0; j < QK_TQ3_0; ++j) {
+            sumi += tmp[j] * y[i].qs[j];
+        }
+        sumf += sumi * d;
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_q2_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

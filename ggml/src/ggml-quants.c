@@ -2548,14 +2548,17 @@ static void tq3_0_rht_forward(const float * GGML_RESTRICT in, float * GGML_RESTR
     }
 }
 
-// Inverse randomized Hadamard transform: WHT + normalize + undo sign flips
+// Inverse of tq3_0_rht_forward (F = D*W*S): F^-1 = S*W*D.
+// Ops order: pre-scale by 1/sqrt(32), WHT butterfly, undo sign flips last.
 static void tq3_0_rht_inverse(const float * GGML_RESTRICT in, float * GGML_RESTRICT out) {
-    // Copy input
+    const float norm = 1.0f / sqrtf(32.0f);
+
+    // Undo the forward normalization first
     for (int i = 0; i < 32; i++) {
-        out[i] = in[i];
+        out[i] = in[i] * norm;
     }
 
-    // In-place WHT butterfly (same as forward - WHT is self-inverse up to scale)
+    // WHT butterfly (self-inverse up to scale)
     for (int step = 1; step < 32; step <<= 1) {
         for (int i = 0; i < 32; i += step << 1) {
             for (int j = i; j < i + step; j++) {
@@ -2567,10 +2570,9 @@ static void tq3_0_rht_inverse(const float * GGML_RESTRICT in, float * GGML_RESTR
         }
     }
 
-    // Normalize and undo sign flips
-    const float norm = 1.0f / sqrtf(32.0f);
+    // Undo sign flips last
     for (int i = 0; i < 32; i++) {
-        out[i] *= norm * TQ3_0_SIGNS[i];
+        out[i] *= TQ3_0_SIGNS[i];
     }
 }
 
