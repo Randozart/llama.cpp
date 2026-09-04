@@ -4658,43 +4658,19 @@ void server_routes::init_routes() {
             should_reset_buckets = true;
         };
 
-        if (queue_tasks.is_sleeping()) {
-            use_cached_metrics();
-
-        } else {
-            // request slots data using task queue
-            {
-                server_task task(SERVER_TASK_TYPE_METRICS);
-                task.id = res->rd.get_new_id();
-                // the gauges are averaged over the window between two scrapes
-                task.metrics_reset_bucket = true;
-                res->rd.post_task(std::move(task), true); // high-priority task
-            }
-
-            // a task posted right before sleeping is never processed, do not wait for it
-            auto result = res->rd.next([&]{
-                return req.should_stop() || queue_tasks.is_sleeping();
-            });
-            if (!result) {
-                if (!req.should_stop()) {
-                    use_cached_metrics();
-                }
-                return res;
-            }
-
-            if (result->is_error()) {
-                res->error(result->to_json());
-                return res;
-            }
-
-            auto res_task = dynamic_cast<server_task_result_metrics*>(result.get());
-            GGML_ASSERT(res_task != nullptr);
-
-            res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->metrics.t_start);
-            res->content_type = "text/plain; version=0.0.4";
-            res->status = 200;
-            res->data = res_task->to_metrics();
-        }
+        // 2026-09-04 (VITRIOL): always serve cached. The old queue-wait
+        // branch blocked the scrape behind whatever task was running —
+        // during a generation every /metrics call stalled for seconds to
+        // minutes, and the officina telemetry poll read those timeouts as
+        // "engine down" (phantom-down while generation proceeded; see
+        // .opencode/plans/engine-metrics-nonblocking-2026-09-04.md).
+        // use_cached_metrics() resets the gauge buckets and flags
+        // should_reset_buckets, so update_cached_responses() refreshes
+        // cached_metrics at the next task boundary on the queue. Gauges
+        // now span task boundaries instead of scrape windows; counters
+        // (absolute) are unaffected. Liveness reporting no longer
+        // depends on queue idleness.
+        use_cached_metrics();
 
         return res;
     };
