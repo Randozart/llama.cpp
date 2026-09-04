@@ -1430,3 +1430,109 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+// ===== ported from vitriol branch (TQ3 CPU traits support) =====
+void quantize_row_tq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TQ3_0 == 0);
+    block_tq3_0 * GGML_RESTRICT y = vy;
+    quantize_row_tq3_0_ref(x, y, k);
+}
+
+void quantize_row_tq3_1s(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TQ3_0 == 0);
+    block_tq3_1s * GGML_RESTRICT y = vy;
+    quantize_row_tq3_1s_ref(x, y, k);
+}
+
+void ggml_vec_dot_tq3_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_TQ3_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq3_0 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_TQ3_0;
+
+    float sumf = 0.0f;
+    float tmp[QK_TQ3_0];
+
+    for (int i = 0; i < nb; ++i) {
+        // Dequantize TQ3_0 block to float (includes inverse WHT)
+        dequantize_row_tq3_0(&x[i], tmp, QK_TQ3_0);
+
+        // Dot product with Q8_0 block
+        const float d_q8 = GGML_CPU_FP16_TO_FP32(y[i].d);
+        float dot = 0.0f;
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            dot += tmp[j] * (float)y[i].qs[j];
+        }
+        sumf += dot * d_q8;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_tq3_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_TQ3_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq3_1s * GGML_RESTRICT x = vx;
+    const block_q8_0   * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_TQ3_0;
+
+    float sumf = 0.0f;
+    float tmp[QK_TQ3_0];
+
+    for (int i = 0; i < nb; ++i) {
+        dequantize_row_tq3_1s(&x[i], tmp, QK_TQ3_0);
+
+        const float d_q8 = GGML_CPU_FP16_TO_FP32(y[i].d);
+        float dot = 0.0f;
+        for (int j = 0; j < QK_TQ3_0; ++j) {
+            dot += tmp[j] * (float) y[i].qs[j];
+        }
+        sumf += dot * d_q8;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_tq3_4s_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_TQ3_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq3_4s * GGML_RESTRICT x = vx;
+    const block_q8_0   * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_TQ3_0;
+
+    float sumf = 0.0f;
+    float tmp[QK_TQ3_0];
+
+    for (int i = 0; i < nb; ++i) {
+        dequantize_row_tq3_4s(&x[i], tmp, QK_TQ3_0);
+
+        const float d_q8 = GGML_CPU_FP16_TO_FP32(y[i].d);
+        float dot = 0.0f;
+        for (int j = 0; j < QK_TQ3_0; ++j) {
+            dot += tmp[j] * (float) y[i].qs[j];
+        }
+        sumf += dot * d_q8;
+    }
+
+    *s = sumf;
+}
+

@@ -405,7 +405,9 @@ static void common_params_fit_impl(
                         //   - for MoE models only whole tensors can be assigned to devices, which we estimate to be <= 1/3 of a layer
                         //   - on average we expect a waste of 0.5 layers/tensors per device
                         //   - use slightly more than the expected average for nd devices to be safe
-                        const int64_t model_per_layer = sum_projected_model / std::min(uint32_t(mparams->n_gpu_layers), hp_ngl);
+                        // guard: n_gpu_layers == 0 (all-CPU pinned) makes the min() 0
+                        const uint32_t ngl_eff = std::min(uint32_t(mparams->n_gpu_layers), hp_ngl);
+                        const int64_t model_per_layer = ngl_eff > 0 ? sum_projected_model / ngl_eff : 0;
                         sum_used_target -= (nd + 1) * model_per_layer / (hp_nex == 0 ? 2 : 6);
                     }
 
@@ -420,7 +422,8 @@ static void common_params_fit_impl(
                             sum_projected_used_min_ctx += dmds_min_ctx[id].mb.total();
                         }
                     }
-                    if (sum_used_target > sum_projected_used_min_ctx) {
+                    if (sum_used_target > sum_projected_used_min_ctx && n_ctx_max > n_ctx_min_total
+                        && sum_projected_used > sum_projected_used_min_ctx) {
                         // linear interpolation between minimum and maximum context size:
                         cparams->n_ctx += (n_ctx_max - n_ctx_min_total) * (sum_used_target - sum_projected_used_min_ctx)
                             / (sum_projected_used - sum_projected_used_min_ctx);
@@ -690,7 +693,9 @@ static void common_params_fit_impl(
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                 LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
                 while (delta > 1) {
-                    uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                    // guard degenerate interp: mem_high == mem on an already-full device
+                    const int64_t headroom = mem_high[id] - mem[id];
+                    uint32_t step_size = headroom > 0 ? uint32_t(int64_t(delta) * (targets[id] - mem[id]) / headroom) : delta - 1;
                     step_size = std::max(step_size, uint32_t(1));
                     step_size = std::min(step_size, delta - 1);
 
@@ -762,7 +767,9 @@ static void common_params_fit_impl(
             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
             uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
             while (delta > 1) {
-                uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                // guard degenerate interp: mem_high == mem on an already-full device
+                const int64_t headroom = mem_high[id] - mem[id];
+                uint32_t step_size = headroom > 0 ? uint32_t(int64_t(delta) * (targets[id] - mem[id]) / headroom) : delta - 1;
                 step_size = std::max(step_size, uint32_t(1));
                 step_size = std::min(step_size, delta - 1);
 
