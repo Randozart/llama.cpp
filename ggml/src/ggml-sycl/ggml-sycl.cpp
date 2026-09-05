@@ -24,6 +24,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <vector>
+
+/* VITRIOL streaming for SYCL */
+#include "vitriol-sycl-buffer.hpp"
 #include <cmath>
 #include <iostream>
 #include <fstream>
@@ -5050,7 +5053,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 const int64_t i1 = id;
                 const int64_t i2 = i12;
 
-            src0_row.data = src0_original + i02*nb02;
+                /* VITRIOL: try LRU cache for this expert's weights */
+                void *expert_vram = nullptr;
+                if (vitriol_sycl_is_enabled()) {
+                    extern void * vitriol_sycl_lru_ensure(
+                        const void *tensor_base, int expert_idx,
+                        const void *expert_data, size_t expert_size);
+                    expert_vram = vitriol_sycl_lru_ensure(
+                        src0_original, (int)i02,
+                        src0_original + i02 * nb02, nb02);
+                }
+                src0_row.data = expert_vram ? expert_vram : src0_original + i02*nb02;
             src1_row.data = src1_original + i11*nb11 + i12*nb12;
             dst_row.data = dst_original + i1*nb1 + i2*nb2;
 
@@ -5112,7 +5125,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
             const int64_t expert_row_offset = expert_row_offsets[i02];
 
-            src0_row.data = src0_original + i02*nb02;
+            /* VITRIOL: try LRU cache for this expert's weights */
+            void *expert_vram = nullptr;
+            if (vitriol_sycl_is_enabled()) {
+                extern void * vitriol_sycl_lru_ensure(
+                    const void *tensor_base, int expert_idx,
+                    const void *expert_data, size_t expert_size);
+                expert_vram = vitriol_sycl_lru_ensure(
+                    src0_original, (int)i02,
+                    src0_original + i02 * nb02, nb02);
+            }
+            src0_row.data = expert_vram ? expert_vram : src0_original + i02*nb02;
 
             GGML_ASSERT(nb11 == sizeof(float)*ne10);
             GGML_ASSERT(nb1 == sizeof(float)*ne0);
@@ -6564,6 +6587,9 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
 
 static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     if (buft->iface.get_name != ggml_backend_sycl_buffer_type_get_name) {
+        /* Accept VITRIOL buffer types */
+        extern bool vitriol_sycl_is_vitriol_buffer_type(ggml_backend_buffer_type_t);
+        if (vitriol_sycl_is_vitriol_buffer_type(buft)) return true;
         return false;
     }
     ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *)buft->context;
@@ -6939,6 +6965,12 @@ static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, cons
         return (void *)ggml_backend_sycl_comm_allreduce_tensor;
     }
 
+    // VITRIOL: expose extra buffer types so model loader discovers VITRIOL SYCL bufts
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        extern ggml_backend_buffer_type_t * vitriol_sycl_get_extra_bufts(ggml_backend_dev_t);
+        return (void *)vitriol_sycl_get_extra_bufts;
+    }
+
     // SYCL doesn't support registering host memory, left here for reference
     // "ggml_backend_register_host_buffer"
     // "ggml_backend_unregister_host_buffer"
@@ -6965,6 +6997,11 @@ ggml_backend_reg_t ggml_backend_sycl_reg() {
         std::lock_guard<std::mutex> lock(mutex);
         if (!initialized) {
             initialize_sycl_begining();
+
+            /* VITRIOL: initialize streaming config from env vars */
+            extern void vitriol_sycl_init(void);
+            vitriol_sycl_init();
+
             ggml_backend_sycl_reg_context * ctx = new ggml_backend_sycl_reg_context;
             const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
