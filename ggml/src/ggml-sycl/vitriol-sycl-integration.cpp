@@ -55,6 +55,10 @@ static struct {
     unsigned long long evictions;
 } g_lru_stats = {};
 
+/* Per-slot event tracking for async DMA sync */
+static int g_lru_last_slot = -1;
+static bool g_lru_has_pending_dma = false;
+
 /* ── Predictive Prefetcher ─────────────────────────────────────── */
 
 #define VITRIOL_MAX_LAYERS 128
@@ -163,6 +167,11 @@ void * vitriol_sycl_lru_ensure(
             g_lru_order.push_front(key);
             g_lru_stats.hits++;
             int slot = it->second;
+            if (vitriol_sycl_verbose() && (g_lru_stats.hits % 100 == 0)) {
+                fprintf(stderr, "VITRIOL-SYCL LRU: hits=%llu misses=%llu evictions=%llu (hit rate %.1f%%)\n",
+                        g_lru_stats.hits, g_lru_stats.misses, g_lru_stats.evictions,
+                        100.0 * g_lru_stats.hits / (g_lru_stats.hits + g_lru_stats.misses + 1));
+            }
             if (slot < g_lru_num_slots) {
                 g_lru_slot_events[slot].wait();
             }
@@ -172,6 +181,11 @@ void * vitriol_sycl_lru_ensure(
 
     /* Cache miss */
     g_lru_stats.misses++;
+    if (vitriol_sycl_verbose() && (g_lru_stats.misses % 50 == 0)) {
+        fprintf(stderr, "VITRIOL-SYCL LRU: miss #%llu (hits=%llu evictions=%llu, hit rate %.1f%%)\n",
+                g_lru_stats.misses, g_lru_stats.hits, g_lru_stats.evictions,
+                100.0 * g_lru_stats.hits / (g_lru_stats.hits + g_lru_stats.misses + 1));
+    }
 
     int slot;
     {
@@ -179,8 +193,22 @@ void * vitriol_sycl_lru_ensure(
         if ((int)g_lru_map.size() < g_lru_num_slots) {
             slot = (int)g_lru_map.size();
         } else {
+            /* Three-state eviction: skip slots with in-flight DMA.
+             * PROVENANCE: inspired by CUDA VITRIOL's cuEventQuery approach
+             * (kimi-k3-in-c, Apache-2.0; re-derived for SYCL). */
             LRUKey evict = g_lru_order.back();
-            g_lru_order.pop_back();
+            for (auto it = std::prev(g_lru_order.end()); it != g_lru_order.begin(); --it) {
+                auto mit = g_lru_map.find(*it);
+                int s = (mit != g_lru_map.end()) ? mit->second : -1;
+                if (s >= 0 && s < g_lru_num_slots) {
+                    auto status = g_lru_slot_events[s].get_info<sycl::info::event::command_execution_status>();
+                    if (status == sycl::info::event_command_status::complete) {
+                        evict = *it;
+                        break;
+                    }
+                }
+            }
+            g_lru_order.remove(evict);
             auto eit = g_lru_map.find(evict);
             slot = (eit != g_lru_map.end()) ? eit->second : 0;
             if (eit != g_lru_map.end()) g_lru_map.erase(eit);
@@ -199,10 +227,25 @@ void * vitriol_sycl_lru_ensure(
     void *dst = (char *)g_lru_pool + slot * g_lru_slot_size;
     g_lru_slot_events[slot] = g_lru_queue->memcpy(dst, expert_data, expert_size);
 
-    /* Block until DMA completes (simple synchronous path for now) */
-    g_lru_slot_events[slot].wait();
+    /* In sync mode, block until DMA completes */
+    if (!vitriol_sycl_async_dma()) {
+        g_lru_slot_events[slot].wait();
+    } else {
+        g_lru_last_slot = slot;
+    }
 
     return dst;
+}
+
+void vitriol_sycl_lru_sync(void) {
+    /* In async mode, wait for the last-fired DMA event.
+     * This is called before compute to ensure the expert copy is done.
+     * The predictor prefetch fires DMA for NEXT layer's experts,
+     * which overlap with THIS layer's compute. */
+    if (g_lru_last_slot >= 0 && g_lru_last_slot < g_lru_num_slots) {
+        g_lru_slot_events[g_lru_last_slot].wait();
+        g_lru_last_slot = -1;
+    }
 }
 
 void vitriol_sycl_lru_prefetch(
@@ -234,8 +277,20 @@ void vitriol_sycl_lru_prefetch(
         if ((int)g_lru_map.size() < g_lru_num_slots) {
             slot = (int)g_lru_map.size();
         } else {
+            /* Three-state eviction: skip slots with in-flight DMA */
             LRUKey evict = g_lru_order.back();
-            g_lru_order.pop_back();
+            for (auto it = std::prev(g_lru_order.end()); it != g_lru_order.begin(); --it) {
+                auto mit = g_lru_map.find(*it);
+                int s = (mit != g_lru_map.end()) ? mit->second : -1;
+                if (s >= 0 && s < g_lru_num_slots) {
+                    auto status = g_lru_slot_events[s].get_info<sycl::info::event::command_execution_status>();
+                    if (status == sycl::info::event_command_status::complete) {
+                        evict = *it;
+                        break;
+                    }
+                }
+            }
+            g_lru_order.remove(evict);
             auto eit = g_lru_map.find(evict);
             slot = (eit != g_lru_map.end()) ? eit->second : 0;
             if (eit != g_lru_map.end()) g_lru_map.erase(eit);

@@ -25,6 +25,7 @@ struct vitriol_sycl_config_t {
     bool verbose;
     size_t lru_mb;
     bool prefetch;
+    bool async_dma;
 };
 
 static vitriol_sycl_config_t g_vsycl_config = {};
@@ -42,17 +43,22 @@ void vitriol_sycl_init(void) {
     if (g_vsycl_config.lru_mb < 64) g_vsycl_config.lru_mb = 64;
 
     const char *pf = getenv("VITRIOL_PREDICTIVE_PREFETCH");
-    g_vsycl_config.prefetch = pf && strcmp(pf, "1") == 0;
+    g_vsycl_config.prefetch = !pf || strcmp(pf, "0") != 0; /* enabled by default, VITRIOL_PREDICTIVE_PREFETCH=0 to disable */
+
+    const char *ad = getenv("VITRIOL_ASYNC_DMA");
+    g_vsycl_config.async_dma = ad && strcmp(ad, "1") == 0;
 
     if (g_vsycl_config.verbose)
-        fprintf(stderr, "VITRIOL-SYCL: stream mode, LRU %zu MB, prefetch %s\n",
-                g_vsycl_config.lru_mb, g_vsycl_config.prefetch ? "on" : "off");
+        fprintf(stderr, "VITRIOL-SYCL: stream mode, LRU %zu MB, prefetch %s, async_dma %s\n",
+                g_vsycl_config.lru_mb, g_vsycl_config.prefetch ? "on" : "off",
+                g_vsycl_config.async_dma ? "on" : "off");
 }
 
 bool vitriol_sycl_is_enabled(void) { return g_vsycl_config.enabled; }
 bool vitriol_sycl_verbose(void) { return g_vsycl_config.verbose; }
 size_t vitriol_sycl_lru_mb(void) { return g_vsycl_config.lru_mb; }
 bool vitriol_sycl_prefetch_enabled(void) { return g_vsycl_config.prefetch; }
+bool vitriol_sycl_async_dma(void) { return g_vsycl_config.async_dma; }
 
 /* ── Buffer type context ───────────────────────────────────────── */
 

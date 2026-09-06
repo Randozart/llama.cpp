@@ -21,6 +21,7 @@ bool vitriol_sycl_is_enabled(void);
 bool vitriol_sycl_verbose(void);
 size_t vitriol_sycl_lru_mb(void);
 bool vitriol_sycl_prefetch_enabled(void);
+bool vitriol_sycl_async_dma(void);
 
 /* Buffer type */
 bool vitriol_sycl_is_vitriol_buffer_type(ggml_backend_buffer_type_t buft);
@@ -33,6 +34,8 @@ void * vitriol_sycl_lru_ensure(
     int            expert_idx,
     const void    *expert_data,
     size_t         expert_size);
+
+void vitriol_sycl_lru_sync(void);
 
 void vitriol_sycl_lru_prefetch(
     const void    *tensor_base,

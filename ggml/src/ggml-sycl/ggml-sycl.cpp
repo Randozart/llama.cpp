@@ -5059,9 +5059,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                     extern void * vitriol_sycl_lru_ensure(
                         const void *tensor_base, int expert_idx,
                         const void *expert_data, size_t expert_size);
+                    extern void vitriol_sycl_lru_sync(void);
+                    extern void vitriol_sycl_predictor_prefetch(
+                        const void *tensor_base, size_t expert_size);
                     expert_vram = vitriol_sycl_lru_ensure(
                         src0_original, (int)i02,
                         src0_original + i02 * nb02, nb02);
+                    if (vitriol_sycl_async_dma()) {
+                        vitriol_sycl_lru_sync();
+                    }
+                    /* Predict and prefetch experts for next layer */
+                    vitriol_sycl_predictor_prefetch(src0_original, nb02);
                 }
                 src0_row.data = expert_vram ? expert_vram : src0_original + i02*nb02;
             src1_row.data = src1_original + i11*nb11 + i12*nb12;
@@ -5131,9 +5139,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 extern void * vitriol_sycl_lru_ensure(
                     const void *tensor_base, int expert_idx,
                     const void *expert_data, size_t expert_size);
+                extern void vitriol_sycl_lru_sync(void);
+                extern void vitriol_sycl_predictor_prefetch(
+                    const void *tensor_base, size_t expert_size);
                 expert_vram = vitriol_sycl_lru_ensure(
                     src0_original, (int)i02,
                     src0_original + i02 * nb02, nb02);
+                if (vitriol_sycl_async_dma()) {
+                    vitriol_sycl_lru_sync();
+                }
+                /* Predict and prefetch experts for next layer */
+                vitriol_sycl_predictor_prefetch(src0_original, nb02);
             }
             src0_row.data = expert_vram ? expert_vram : src0_original + i02*nb02;
 
