@@ -213,13 +213,5 @@ ggml_backend_buffer_type_t * vitriol_sycl_get_extra_bufts(ggml_backend_dev_t dev
         extra_initialized = true;
     }
 
-    /* Match dev to index */
-    for (size_t i = 0; i < GGML_SYCL_MAX_DEVICES; i++) {
-        ggml_backend_buffer_type_t buft = extra_bufts[i][0];
-        if (buft && buft->device == dev) {
-            return extra_bufts[i];
-        }
-    }
-
-    return nullptr;
+    return extra_bufts[0];
 }

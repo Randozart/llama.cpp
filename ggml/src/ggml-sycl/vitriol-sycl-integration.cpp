@@ -110,10 +110,13 @@ static bool lru_ensure_queue(void) {
 
 static bool lru_init_pool(size_t min_expert_size) {
     if (g_lru_pool) return true;
+
+    /* Queue init must happen outside g_lru_init_mtx: lru_ensure_queue locks
+     * the same mutex, and std::mutex is non-recursive (self-deadlock). */
+    if (!lru_ensure_queue()) return false;
+
     std::lock_guard<std::mutex> lock(g_lru_init_mtx);
     if (g_lru_pool) return true;
-
-    if (!lru_ensure_queue()) return false;
 
     size_t pool_size = vitriol_sycl_lru_mb() * 1024ULL * 1024;
     size_t slot_size = (min_expert_size + 255) & ~(size_t)255;

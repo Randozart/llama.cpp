@@ -1041,6 +1041,33 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
         }
     }
 
+    // VITRIOL: GPU extra buffer types (host-streamed expert buffers).
+    // Paired with the owning GPU device and placed first so expert
+    // (MUL_MAT_ID) weights are selected into VITRIOL buffers; SYCL claims
+    // this buffer type in supports_op for MUL_MAT_ID only, so the scheduler
+    // routes the op without copying the weights out of host memory.
+    if (use_extra_bufts) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            auto dev_type = ggml_backend_dev_type(dev);
+            // IGPU: Intel Arc B390 and other integrated GPUs report as IGPU
+            if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                continue;
+            }
+            auto * reg = ggml_backend_dev_backend_reg(dev);
+            auto fn = (ggml_backend_dev_get_extra_bufts_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+            if (!fn) {
+                continue;
+            }
+            ggml_backend_buffer_type_t * extra_bufts = fn(dev);
+            while (extra_bufts && *extra_bufts) {
+                buft_list.emplace_back(dev, *extra_bufts);
+                ++extra_bufts;
+            }
+        }
+    }
+
     // add a host buffer type
     // storing the tensors in a host buffer is useful when the processing of large batches
     // is offloaded to a GPU device, since it reduces the time spent on data transfers

@@ -5020,7 +5020,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    if (ne12 == 1) {
+    /* VITRIOL: the fused path reads experts straight from src0->data, which
+     * lives in host memory when streaming, so fall through to the hooked
+     * loop that swaps in the LRU device copy. */
+    if (ne12 == 1 && !vitriol_sycl_is_enabled()) {
         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
             return;
         }
@@ -6201,6 +6204,17 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
     ggml_backend_sycl_device_context *sycl_ctx =
         (ggml_backend_sycl_device_context *)dev->context;
     int device = sycl_ctx->device;
+
+    /* VITRIOL: host-streamed expert buffers only serve MUL_MAT_ID. Any other
+     * op on a VITRIOL buffer would read host pointers as device USM, so the
+     * weight selection must fall through to the next buffer type. */
+    if (op->op != GGML_OP_MUL_MAT_ID && op->src[0] && op->src[0]->buffer) {
+        extern bool vitriol_sycl_is_vitriol_buffer_type(ggml_backend_buffer_type_t);
+        if (vitriol_sycl_is_vitriol_buffer_type(op->src[0]->buffer->buft)) {
+            return false;
+        }
+    }
+
     switch (op->op) {
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
