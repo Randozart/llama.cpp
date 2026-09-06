@@ -158,9 +158,13 @@ static const ggml_backend_buffer_type_i vitriol_sycl_buft_iface = {
 /* ── Singleton access ──────────────────────────────────────────── */
 
 bool vitriol_sycl_is_vitriol_buffer_type(ggml_backend_buffer_type_t buft) {
-    if (!buft || !buft->context) return false;
-    auto * ctx = (vitriol_sycl_buffer_type_context *)buft->context;
-    return ctx->name == "VITRIOL_SYCL";
+    if (!buft) return false;
+    /* Pointer identity against the singletons: foreign buffer type contexts
+     * must never be cast or read (context layouts differ per backend). */
+    for (int i = 0; i < GGML_SYCL_MAX_DEVICES; i++) {
+        if (buft == vitriol_sycl_get_buffer_type(i)) return true;
+    }
+    return false;
 }
 
 ggml_backend_buffer_type_t vitriol_sycl_get_buffer_type(int device) {
@@ -188,6 +192,61 @@ ggml_backend_buffer_type_t vitriol_sycl_get_buffer_type(int device) {
 
 bool vitriol_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     return vitriol_sycl_is_vitriol_buffer_type(buft);
+}
+
+/* ── Zero-copy mmap wrap (host-ptr buffer) ────────────────────── */
+
+/* The model loader owns the mmap; the buffer only wraps the range so the
+ * scheduler can route MUL_MAT_ID here without copying the weights out of
+ * file-backed pages. free_buffer must NOT release the base. */
+bool vitriol_sycl_buft_supports_host_ptr(ggml_backend_buffer_type_t buft) {
+    return g_vsycl_config.enabled && vitriol_sycl_is_vitriol_buffer_type(buft);
+}
+
+ggml_backend_buffer_t vitriol_sycl_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+    if (!g_vsycl_config.enabled || !ptr || size == 0) {
+        return nullptr;
+    }
+    GGML_UNUSED(dev);
+    GGML_UNUSED(max_tensor_size);
+
+    auto * ctx = new vitriol_sycl_buffer_context{ptr, size};
+    if (g_vsycl_config.verbose) {
+        fprintf(stderr, "VITRIOL-SYCL: wrapped %zu MiB of file-backed pages (zero-copy)\n",
+                size / 1024 / 1024);
+    }
+    return ggml_backend_buffer_init(vitriol_sycl_get_buffer_type(0), {
+        /* .free_buffer    = */ [](ggml_backend_buffer_t buf) {
+            /* base is the loader's mmap - do not release it */
+            delete (vitriol_sycl_buffer_context *)buf->context;
+        },
+        /* .get_base       = */ [](ggml_backend_buffer_t buf) -> void * {
+            return ((vitriol_sycl_buffer_context *)buf->context)->base;
+        },
+        /* .init_tensor    = */ nullptr,
+        /* .memset_tensor  = */ nullptr,
+        /* .set_tensor     = */ [](ggml_backend_buffer_t, ggml_tensor *t, const void *data, size_t offset, size_t size) {
+            memcpy((char *)t->data + offset, data, size);
+        },
+        /* .get_tensor     = */ [](ggml_backend_buffer_t, const ggml_tensor *t, void *data, size_t offset, size_t size) {
+            memcpy(data, (const char *)t->data + offset, size);
+        },
+        /* .set_tensor_2d  = */ [](ggml_backend_buffer_t, ggml_tensor *t, const void *data,
+                size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+            char *base = (char *)t->data + offset;
+            const char *src = (const char *)data;
+            for (size_t i = 0; i < n_copies; i++)
+                memcpy(base + i * stride_tensor, src + i * stride_data, size);
+        },
+        /* .get_tensor_2d  = */ nullptr,
+        /* .cpy_tensor     = */ nullptr,
+        /* .clear          = */ [](ggml_backend_buffer_t buf, uint8_t value) {
+            auto * c = (vitriol_sycl_buffer_context *)buf->context;
+            if (c->base && c->size > 0)
+                memset(c->base, value, c->size);
+        },
+        /* .reset          = */ nullptr,
+    }, ctx, size);
 }
 
 /* ── Extra buffer types (for model loader discovery) ─────────── */

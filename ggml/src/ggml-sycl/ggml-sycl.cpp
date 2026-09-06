@@ -6206,12 +6206,16 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
     int device = sycl_ctx->device;
 
     /* VITRIOL: host-streamed expert buffers only serve MUL_MAT_ID. Any other
-     * op on a VITRIOL buffer would read host pointers as device USM, so the
-     * weight selection must fall through to the next buffer type. */
-    if (op->op != GGML_OP_MUL_MAT_ID && op->src[0] && op->src[0]->buffer) {
+     * op on a VITRIOL buffer would read non-USM host pointers as device
+     * memory, so the weight selection must fall through to the next buffer
+     * type. Scan ALL sources: for MUL (and others) the weight is src[1]. */
+    if (op->op != GGML_OP_MUL_MAT_ID) {
         extern bool vitriol_sycl_is_vitriol_buffer_type(ggml_backend_buffer_type_t);
-        if (vitriol_sycl_is_vitriol_buffer_type(op->src[0]->buffer->buft)) {
-            return false;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (op->src[i] && op->src[i]->buffer &&
+                vitriol_sycl_is_vitriol_buffer_type(op->src[i]->buffer->buft)) {
+                return false;
+            }
         }
     }
 
@@ -7018,6 +7022,16 @@ static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, cons
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
         extern ggml_backend_buffer_type_t * vitriol_sycl_get_extra_bufts(ggml_backend_dev_t);
         return (void *)vitriol_sycl_get_extra_bufts;
+    }
+
+    // VITRIOL: zero-copy mmap wrap of expert weights (file-backed pages)
+    if (strcmp(name, "vitriol_buft_supports_host_ptr") == 0) {
+        extern bool vitriol_sycl_buft_supports_host_ptr(ggml_backend_buffer_type_t);
+        return (void *)vitriol_sycl_buft_supports_host_ptr;
+    }
+    if (strcmp(name, "vitriol_buffer_from_host_ptr") == 0) {
+        extern ggml_backend_buffer_t vitriol_sycl_buffer_from_host_ptr(ggml_backend_dev_t, void *, size_t, size_t);
+        return (void *)vitriol_sycl_buffer_from_host_ptr;
     }
 
     // SYCL doesn't support registering host memory, left here for reference

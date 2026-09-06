@@ -28,6 +28,11 @@ bool vitriol_sycl_is_vitriol_buffer_type(ggml_backend_buffer_type_t buft);
 ggml_backend_buffer_type_t vitriol_sycl_get_buffer_type(int device);
 ggml_backend_buffer_type_t * vitriol_sycl_get_extra_bufts(ggml_backend_dev_t dev);
 
+/* Zero-copy mmap wrap: wrap a loader-owned host range as a VITRIOL buffer */
+bool vitriol_sycl_buft_supports_host_ptr(ggml_backend_buffer_type_t buft);
+ggml_backend_buffer_t vitriol_sycl_buffer_from_host_ptr(
+    ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size);
+
 /* LRU cache */
 void * vitriol_sycl_lru_ensure(
     const void    *tensor_base,

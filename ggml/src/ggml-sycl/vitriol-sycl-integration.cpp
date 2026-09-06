@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 #include <unordered_map>
 #include <list>
 #include <mutex>
@@ -94,6 +95,24 @@ static void detect_token_boundary(int layer_idx) {
 
 /* ── Initialization ────────────────────────────────────────────── */
 
+/* L0 copy engines cannot page-fault: make sure a file-backed (zero-copy
+ * wrapped) range is resident before the device reads it. MADV_WILLNEED
+ * starts kernel readahead for the whole slice; the touch loop then only
+ * blocks on the pages the readahead has not covered yet. */
+static void vitriol_sycl_touch_pages(const void * ptr, size_t size) {
+    static const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    if (!ptr || size == 0 || page == 0) {
+        return;
+    }
+    uintptr_t base = (uintptr_t) ptr & ~(page - 1);
+    madvise((void *) base, size + (uintptr_t)ptr - base + page, MADV_WILLNEED);
+    const volatile char * p = (const volatile char *) ptr;
+    for (size_t off = 0; off < size; off += page) {
+        (void) p[off];
+    }
+    (void) p[size - 1];
+}
+
 static bool lru_ensure_queue(void) {
     if (g_lru_queue) return true;
     std::lock_guard<std::mutex> lock(g_lru_init_mtx);
@@ -142,6 +161,63 @@ static bool lru_init_pool(size_t min_expert_size) {
     return true;
 }
 
+/* Re-create the pool when a larger expert slice appears (e.g. q6_K down
+ * experts after q4_K gate/up sized the pool). Drops the cached contents;
+ * in-flight DMAs are drained first. */
+static bool lru_resize(size_t new_expert_size) {
+    if (!g_lru_pool || !g_lru_queue)
+        return false;
+
+    size_t new_slot_size = (new_expert_size + 255) & ~(size_t)255;
+    if (new_slot_size <= g_lru_slot_size)
+        return true;
+
+    /* Drain in-flight DMAs before freeing the pool */
+    {
+        std::lock_guard<std::mutex> lock(g_lru_mtx);
+        for (int s = 0; s < g_lru_num_slots; s++) {
+            g_lru_slot_events[s].wait();
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_lru_init_mtx);
+    if (new_slot_size <= g_lru_slot_size)
+        return true;
+
+    size_t pool_size = vitriol_sycl_lru_mb() * 1024ULL * 1024;
+    int num_slots = (int)(pool_size / new_slot_size);
+    if (num_slots > VITRIOL_LRU_MAX_SLOTS) num_slots = VITRIOL_LRU_MAX_SLOTS;
+    if (num_slots < 1) {
+        fprintf(stderr, "VITRIOL-SYCL: expert slice %zu bytes exceeds LRU budget\n", new_expert_size);
+        return false;
+    }
+
+    sycl::free(g_lru_pool, *g_lru_queue);
+    g_lru_pool = sycl::malloc_device(pool_size, *g_lru_queue);
+    if (!g_lru_pool) {
+        fprintf(stderr, "VITRIOL-SYCL: LRU pool realloc %zu MB failed\n", pool_size / 1024 / 1024);
+        return false;
+    }
+
+    g_lru_pool_size = pool_size;
+    g_lru_slot_size = new_slot_size;
+    g_lru_num_slots = num_slots;
+    delete[] g_lru_slot_events;
+    g_lru_slot_events = new sycl::event[num_slots];
+
+    {
+        std::lock_guard<std::mutex> mlock(g_lru_mtx);
+        g_lru_map.clear();
+        g_lru_order.clear();
+        g_lru_last_slot = -1;
+    }
+
+    if (vitriol_sycl_verbose())
+        fprintf(stderr, "VITRIOL-SYCL: LRU pool resized: %d slots x %zu bytes\n", num_slots, new_slot_size);
+
+    return true;
+}
+
 /* ── LRU Cache Operations ──────────────────────────────────────── */
 
 void * vitriol_sycl_lru_ensure(
@@ -156,7 +232,7 @@ void * vitriol_sycl_lru_ensure(
     if (!lru_init_pool(expert_size))
         return nullptr;
 
-    if (expert_size > g_lru_slot_size)
+    if (expert_size > g_lru_slot_size && !lru_resize(expert_size))
         return nullptr;
 
     LRUKey key = {(uintptr_t)tensor_base, expert_idx};
@@ -226,6 +302,9 @@ void * vitriol_sycl_lru_ensure(
         g_lru_slot_events[slot].wait();
     }
 
+    /* Fault the source pages in before the copy engine reads them */
+    vitriol_sycl_touch_pages(expert_data, expert_size);
+
     /* Async DMA from host to device */
     void *dst = (char *)g_lru_pool + slot * g_lru_slot_size;
     g_lru_slot_events[slot] = g_lru_queue->memcpy(dst, expert_data, expert_size);
@@ -263,7 +342,7 @@ void vitriol_sycl_lru_prefetch(
     if (!lru_init_pool(expert_size))
         return;
 
-    if (expert_size > g_lru_slot_size)
+    if (expert_size > g_lru_slot_size && !lru_resize(expert_size))
         return;
 
     LRUKey key = {(uintptr_t)tensor_base, expert_idx};
@@ -306,6 +385,8 @@ void vitriol_sycl_lru_prefetch(
     if (slot < g_lru_num_slots) {
         g_lru_slot_events[slot].wait();
     }
+
+    vitriol_sycl_touch_pages(expert_data, expert_size);
 
     void *dst = (char *)g_lru_pool + slot * g_lru_slot_size;
     /* Fire-and-forget DMA */

@@ -1751,12 +1751,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
+        // VITRIOL: extra buffer types may support zero-copy mmap wrapping
+        // (expert weights stay in file-backed pages; the streaming hooks
+        // DMA from there into the device LRU). Queried via proc address
+        // so the model loader stays free of backend-specific includes.
+        bool extra_buft_host_ptr = false;
+        ggml_backend_reg_t buft_reg = ggml_backend_dev_backend_reg(dev);
+
         std::vector<ggml_backend_buffer_ptr> bufs;
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (!is_default_buft && (ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buft_reg) {
+            using vitriol_supports_fn_t = bool (*)(ggml_backend_buffer_type_t);
+            auto fn = (vitriol_supports_fn_t) ggml_backend_reg_get_proc_address(buft_reg, "vitriol_buft_supports_host_ptr");
+            extra_buft_host_ptr = fn && fn(buft);
+        }
+
+        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && (buffer_from_host_ptr_supported || extra_buft_host_ptr) && (is_default_buft || extra_buft_host_ptr)) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1770,7 +1783,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                ggml_backend_buffer_t buf = nullptr;
+                if (extra_buft_host_ptr) {
+                    using vitriol_wrap_fn_t = ggml_backend_buffer_t (*)(ggml_backend_dev_t, void *, size_t, size_t);
+                    auto fn = (vitriol_wrap_fn_t) ggml_backend_reg_get_proc_address(buft_reg, "vitriol_buffer_from_host_ptr");
+                    buf = fn ? fn(dev, (char *) addr + first, last - first, max_size) : nullptr;
+                } else {
+                    buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                }
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
