@@ -31,6 +31,9 @@ struct vitriol_sycl_config_t {
 static vitriol_sycl_config_t g_vsycl_config = {};
 
 void vitriol_sycl_init(void) {
+    /* E34: profiler is mode-independent (works with VITRIOL off too) */
+    vitriol_sycl_profile_init();
+
     const char *mode = getenv("VITRIOL_MODE");
     g_vsycl_config.enabled = mode && (strcmp(mode, "stream") == 0);
     if (!g_vsycl_config.enabled) return;

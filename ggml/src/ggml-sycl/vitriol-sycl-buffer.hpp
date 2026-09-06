@@ -59,6 +59,13 @@ void vitriol_sycl_predictor_update(
     const int32_t *expert_ids,
     int            n_experts);
 
+/* E34: expert-usage profiler */
+void vitriol_sycl_profile_init(void);
+bool vitriol_sycl_profile_active(void);
+void vitriol_sycl_profile_record(
+    const void *tensor_base, const char *ids_host,
+    size_t nb0, size_t nb1, int n_ids, int n_iid1, size_t expert_size);
+
 /* Cleanup */
 void vitriol_sycl_print_stats(void);
 void vitriol_sycl_cleanup(void);

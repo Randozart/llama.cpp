@@ -93,6 +93,102 @@ static void detect_token_boundary(int layer_idx) {
     g_last_layer = layer_idx;
 }
 
+/* ── E34: expert-usage profiler ────────────────────────────────── */
+
+/* Records (tensor_slot, expert_id) selection counts for MUL_MAT_ID across a
+ * real workload. Tensor slots are first-touch indexed: slot//3 approximates
+ * the layer index, slot%3 the tensor kind (gate/up/down; down disambiguated
+ * by its larger expert_size). Dumped as CSV at process exit. */
+
+static bool        g_prof_enabled = false;
+static std::string g_prof_path;
+static std::mutex  g_prof_mtx;
+static std::unordered_map<uintptr_t, int> g_prof_slot_of;
+static std::vector<uintptr_t>             g_prof_bases;
+static std::vector<size_t>                g_prof_sizes;
+static std::vector<std::vector<unsigned long long>> g_prof_counts;
+
+static void vitriol_sycl_profile_dump(void) {
+    if (!g_prof_enabled) {
+        return;
+    }
+    FILE * f = fopen(g_prof_path.c_str(), "w");
+    if (!f) {
+        fprintf(stderr, "VITRIOL-PROFILE: cannot write %s\n", g_prof_path.c_str());
+        return;
+    }
+    fprintf(f, "# VITRIOL expert-usage profile\n");
+    for (size_t s = 0; s < g_prof_bases.size(); s++) {
+        fprintf(f, "# slot %zu base=%p expert_size=%zu\n",
+                s, (void *) g_prof_bases[s], g_prof_sizes[s]);
+    }
+    fprintf(f, "slot,expert,count\n");
+    unsigned long long total = 0;
+    for (size_t s = 0; s < g_prof_counts.size(); s++) {
+        for (size_t e = 0; e < g_prof_counts[s].size(); e++) {
+            if (g_prof_counts[s][e]) {
+                fprintf(f, "%zu,%zu,%llu\n", s, e, g_prof_counts[s][e]);
+                total += g_prof_counts[s][e];
+            }
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "VITRIOL-PROFILE: dumped %zu tensor slots (%llu selections) to %s\n",
+            g_prof_bases.size(), total, g_prof_path.c_str());
+}
+
+void vitriol_sycl_profile_init(void) {
+    const char * p = getenv("VITRIOL_PROFILE");
+    g_prof_enabled = p && p[0] == '1';
+    if (!g_prof_enabled) {
+        return;
+    }
+    const char * path = getenv("VITRIOL_PROFILE_PATH");
+    g_prof_path = path ? path : "/tmp/vitriol-expert-profile.csv";
+    atexit(vitriol_sycl_profile_dump);
+    fprintf(stderr, "VITRIOL-PROFILE: recording expert usage to %s\n", g_prof_path.c_str());
+}
+
+bool vitriol_sycl_profile_active(void) {
+    return g_prof_enabled;
+}
+
+void vitriol_sycl_profile_record(
+    const void *tensor_base, const char *ids_host,
+    size_t nb0, size_t nb1, int n_ids, int n_iid1, size_t expert_size)
+{
+    if (!g_prof_enabled || !tensor_base || !ids_host) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_prof_mtx);
+    uintptr_t base = (uintptr_t) tensor_base;
+    auto it = g_prof_slot_of.find(base);
+    int slot;
+    if (it == g_prof_slot_of.end()) {
+        slot = (int) g_prof_bases.size();
+        g_prof_slot_of[base] = slot;
+        g_prof_bases.push_back(base);
+        g_prof_sizes.push_back(expert_size);
+        g_prof_counts.emplace_back();
+    } else {
+        slot = it->second;
+    }
+    auto & counts = g_prof_counts[slot];
+    for (int iid1 = 0; iid1 < n_iid1; iid1++) {
+        for (int id = 0; id < n_ids; id++) {
+            int32_t e;
+            memcpy(&e, ids_host + iid1 * nb1 + id * nb0, sizeof(e));
+            if (e < 0) {
+                continue;
+            }
+            if ((size_t) e >= counts.size()) {
+                counts.resize((size_t) e + 1, 0);
+            }
+            counts[e]++;
+        }
+    }
+}
+
 /* ── Initialization ────────────────────────────────────────────── */
 
 /* L0 copy engines cannot page-fault: make sure a file-backed (zero-copy

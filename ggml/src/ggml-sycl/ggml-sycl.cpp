@@ -5038,6 +5038,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     // also ensures ctx.mmid_row_mapping_host is drained before we use it again
     SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
 
+    /* E34: expert-usage profiling on real traces */
+    if (vitriol_sycl_profile_active()) {
+        vitriol_sycl_profile_record(src0, ids_host.data(), ids->nb[0], ids->nb[1],
+                                    (int) n_ids, (int) ids->ne[1], (size_t) nb02);
+    }
+
     ggml_tensor src0_row = *src0;
     ggml_tensor src1_row = *src1;
     ggml_tensor dst_row = *dst;
