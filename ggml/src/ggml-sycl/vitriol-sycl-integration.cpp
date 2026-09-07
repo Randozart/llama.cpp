@@ -60,9 +60,12 @@ static struct {
     unsigned long long evictions;
 } g_lru_stats = {};
 
-/* Per-slot event tracking for async DMA sync */
+/* Per-slot event tracking for async DMA sync.
+ * g_lru_pending_slots tracks ALL slots with in-flight DMAs so that
+ * lru_sync can wait for all of them, not just the most recent. */
 static int g_lru_last_slot = -1;
 static bool g_lru_has_pending_dma = false;
+static std::unordered_set<int> g_lru_pending_slots;
 
 /* ── Predictive Prefetcher ─────────────────────────────────────── */
 
@@ -310,6 +313,7 @@ static bool lru_resize(size_t new_expert_size) {
         g_lru_map.clear();
         g_lru_order.clear();
         g_lru_last_slot = -1;
+        g_lru_pending_slots.clear();
     }
 
     if (vitriol_sycl_verbose())
@@ -414,17 +418,30 @@ void * vitriol_sycl_lru_ensure(
         g_lru_slot_events[slot].wait();
     } else {
         g_lru_last_slot = slot;
+        g_lru_pending_slots.insert(slot);
     }
 
     return dst;
 }
 
 void vitriol_sycl_lru_sync(void) {
-    /* In async mode, wait for the last-fired DMA event.
-     * This is called before compute to ensure the expert copy is done.
-     * The predictor prefetch fires DMA for NEXT layer's experts,
-     * which overlap with THIS layer's compute. */
-    if (g_lru_last_slot >= 0 && g_lru_last_slot < g_lru_num_slots) {
+    /* Wait for ALL in-flight DMA events, not just the most recent.
+     * The predictor prefetch fires DMAs for NEXT layer's experts;
+     * multiple may be in flight simultaneously.  Waiting only on the
+     * last slot left earlier DMAs incomplete, causing GPU stalls. */
+    if (!g_lru_pending_slots.empty()) {
+        for (int s : g_lru_pending_slots) {
+            if (s >= 0 && s < g_lru_num_slots)
+                g_lru_slot_events[s].wait();
+        }
+        if (vitriol_sycl_verbose() && g_lru_pending_slots.size() > 1) {
+            fprintf(stderr, "VITRIOL-SYCL: lru_sync drained %zu pending DMAs\n",
+                    g_lru_pending_slots.size());
+        }
+        g_lru_pending_slots.clear();
+        g_lru_last_slot = -1;
+    } else if (g_lru_last_slot >= 0 && g_lru_last_slot < g_lru_num_slots) {
+        /* Fallback for code paths that don't use pending_slots tracking */
         g_lru_slot_events[g_lru_last_slot].wait();
         g_lru_last_slot = -1;
     }
@@ -491,6 +508,7 @@ void vitriol_sycl_lru_prefetch(
     void *dst = (char *)g_lru_pool + slot * g_lru_slot_size;
     /* Fire-and-forget DMA */
     g_lru_slot_events[slot] = g_lru_queue->memcpy(dst, expert_data, expert_size);
+    g_lru_pending_slots.insert(slot);
 }
 
 /* ── Predictive Prefetching ────────────────────────────────────── */
