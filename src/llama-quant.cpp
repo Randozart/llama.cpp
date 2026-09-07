@@ -708,6 +708,23 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
         return params->output_tensor_type;
     }
 
+    // keep already-quantized tensors verbatim unless an explicit --tensor-type names them
+    if (ggml_is_quantized(tensor->type)) {
+        bool named = false;
+        if (!qs.tensor_type_patterns.empty()) {
+            const std::string tensor_name(tensor->name);
+            for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+                if (std::regex_search(tensor_name, pattern)) {
+                    named = true;
+                    break;
+                }
+            }
+        }
+        if (!named) {
+            return tensor->type;
+        }
+    }
+
     ggml_type new_type = default_type;
 
     // get more optimal quantization type based on the tensor shape, layer, etc.
