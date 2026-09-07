@@ -18,6 +18,10 @@
 #include <list>
 #include <mutex>
 #include <vector>
+#include <unordered_set>
+#include <algorithm>
+#include <cerrno>
+#include <sys/mman.h>
 
 /* ── LRU Cache ─────────────────────────────────────────────────── */
 
@@ -556,6 +560,121 @@ void vitriol_sycl_predictor_update(
         g_cur_exp[layer_idx][count++] = e;
     }
     g_cur_cnt[layer_idx] = count;
+}
+
+/* ── E31: hot-expert profile + selective mlock ────────────────── */
+
+/* Parsed from E34 CSV (VITRIOL_HOT_PROFILE): set of per-expert slice
+ * sizes that carry >50% of traffic.  After model load, tensors whose
+ * per-expert size matches are mlocked so the hot pages never fault. */
+
+static std::unordered_set<size_t> g_hot_expert_sizes;
+static bool g_hot_profile_loaded = false;
+static bool g_mlock_unavailable = false;
+
+/* Parse an E34 profile CSV.  Extract all unique expert_size values from
+ * metadata lines and mark them as hot.  Every MoE tensor whose per-expert
+ * slice matches a hot size will be mlocked/preloaded. */
+void vitriol_sycl_load_hot_profile(const char *path) {
+    if (!path || !path[0]) return;
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "VITRIOL-E31: profile not found: %s\n", path);
+        return;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] != '#') continue;
+        const char *p = strstr(line, "expert_size=");
+        if (p) {
+            size_t esz = strtoull(p + 12, nullptr, 10);
+            if (esz > 0) g_hot_expert_sizes.insert(esz);
+        }
+    }
+    fclose(f);
+
+    g_hot_profile_loaded = !g_hot_expert_sizes.empty();
+    if (g_hot_profile_loaded) {
+        fprintf(stderr, "VITRIOL-E31: loaded hot profile %s (%zu unique expert sizes: ",
+                path, g_hot_expert_sizes.size());
+        bool first = true;
+        for (size_t esz : g_hot_expert_sizes) {
+            if (!first) fprintf(stderr, ", ");
+            fprintf(stderr, "%zu", esz);
+            first = false;
+        }
+        fprintf(stderr, ")\n");
+    }
+}
+
+bool vitriol_sycl_hot_profile_loaded(void) {
+    return g_hot_profile_loaded;
+}
+
+/* Selectively mlock hot expert ranges within tensors.
+ * Called after model load while the ggml_context is still alive.
+ * Walks the context's tensor list; for each 3D MoE tensor whose
+ * per-expert size (nbytes / ne[2]) matches a hot expert_size, mlock
+ * the entire tensor range (hot experts are contiguous within it). */
+void vitriol_sycl_mlock_hot_ranges(struct ggml_context *ctx) {
+    if (!g_hot_profile_loaded || !ctx) return;
+
+    size_t total_locked = 0;
+    int n_locked = 0;
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+
+    for (struct ggml_tensor *t = ggml_get_first_tensor(ctx);
+         t; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->ne[2] <= 1) continue; /* not a 3D MoE tensor */
+
+        size_t total = ggml_nbytes(t);
+        size_t per_expert = total / (size_t)t->ne[2];
+
+        if (g_hot_expert_sizes.count(per_expert) == 0) continue;
+
+        /* Page-align the range */
+        uintptr_t start = (uintptr_t)t->data;
+        uintptr_t end   = start + total;
+        uintptr_t astart = start & ~(page - 1);
+        uintptr_t aend   = (end + page - 1) & ~(page - 1);
+
+        if (mlock((void *)astart, aend - astart) == 0) {
+            total_locked += aend - astart;
+            n_locked++;
+        } else if (errno == ENOMEM) {
+            /* RLIMIT_MEMLOCK too low — fall back to madvise in preload */
+            g_mlock_unavailable = true;
+        }
+    }
+
+    if (n_locked > 0)
+        fprintf(stderr, "VITRIOL-E31: mlocked %d MoE tensors (%zu MB) for hot-expert residency\n",
+                n_locked, total_locked / 1024 / 1024);
+    if (g_mlock_unavailable)
+        fprintf(stderr, "VITRIOL-E31: some mlock calls failed (RLIMIT_MEMLOCK), using madvise preload fallback\n");
+}
+
+/* Touch hot pages to fault them into page cache and warm the device LRU.
+ * Called after mlock, before the first inference.  For each hot MoE
+ * tensor, touches one byte per page to bring pages into resident set. */
+void vitriol_sycl_preload_hot_pages(struct ggml_context *ctx) {
+    if (!g_hot_profile_loaded || !ctx) return;
+
+    int n_touched = 0;
+    for (struct ggml_tensor *t = ggml_get_first_tensor(ctx);
+         t; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->ne[2] <= 1) continue;
+        size_t total = ggml_nbytes(t);
+        size_t per_expert = total / (size_t)t->ne[2];
+        if (g_hot_expert_sizes.count(per_expert) == 0) continue;
+        vitriol_sycl_touch_pages(t->data, total);
+        n_touched++;
+    }
+
+    if (n_touched > 0)
+        fprintf(stderr, "VITRIOL-E31: preloaded %d MoE tensors into page cache\n", n_touched);
 }
 
 /* ── Stats ─────────────────────────────────────────────────────── */

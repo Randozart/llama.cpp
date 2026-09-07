@@ -34,6 +34,11 @@ void vitriol_sycl_init(void) {
     /* E34: profiler is mode-independent (works with VITRIOL off too) */
     vitriol_sycl_profile_init();
 
+    /* E31: load hot-expert profile (also mode-independent, used for mlock) */
+    const char *hot_profile = getenv("VITRIOL_HOT_PROFILE");
+    if (hot_profile && hot_profile[0])
+        vitriol_sycl_load_hot_profile(hot_profile);
+
     const char *mode = getenv("VITRIOL_MODE");
     g_vsycl_config.enabled = mode && (strcmp(mode, "stream") == 0);
     if (!g_vsycl_config.enabled) return;
@@ -42,7 +47,7 @@ void vitriol_sycl_init(void) {
     g_vsycl_config.verbose = verbose && strcmp(verbose, "1") == 0;
 
     const char *lru = getenv("VITRIOL_LRU_MB");
-    g_vsycl_config.lru_mb = lru ? strtoul(lru, nullptr, 10) : 2048;
+    g_vsycl_config.lru_mb = lru ? strtoul(lru, nullptr, 10) : 8192;
     if (g_vsycl_config.lru_mb < 64) g_vsycl_config.lru_mb = 64;
 
     const char *pf = getenv("VITRIOL_PREDICTIVE_PREFETCH");

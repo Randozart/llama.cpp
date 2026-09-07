@@ -66,6 +66,12 @@ void vitriol_sycl_profile_record(
     const void *tensor_base, const char *ids_host,
     size_t nb0, size_t nb1, int n_ids, int n_iid1, size_t expert_size);
 
+/* E31: hot-expert profile + selective mlock */
+void vitriol_sycl_load_hot_profile(const char *path);
+bool vitriol_sycl_hot_profile_loaded(void);
+void vitriol_sycl_mlock_hot_ranges(struct ggml_context *ctx);
+void vitriol_sycl_preload_hot_pages(struct ggml_context *ctx);
+
 /* Cleanup */
 void vitriol_sycl_print_stats(void);
 void vitriol_sycl_cleanup(void);
