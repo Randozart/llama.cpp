@@ -39,6 +39,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <dlfcn.h>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1873,6 +1874,37 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+
+    // E31: selectively mlock hot expert ranges + preload pages.
+    // Resolved via runtime symbol lookup to avoid hard link dependency on libggml-sycl.
+    {
+        using hot_loaded_fn  = bool (*)(void);
+        using mlock_fn       = void (*)(ggml_context *);
+        using preload_fn     = void (*)(ggml_context *);
+
+        static hot_loaded_fn p_hot_loaded = nullptr;
+        static mlock_fn      p_mlock      = nullptr;
+        static preload_fn    p_preload    = nullptr;
+        static bool          looked_up = false;
+
+        if (!looked_up) {
+            looked_up = true;
+            /* symbols live in libggml-sycl.so which is loaded at runtime */
+            void *h = dlopen("libggml-sycl.so.0", RTLD_NOW | RTLD_NOLOAD);
+            if (h) {
+                p_hot_loaded = (hot_loaded_fn) dlsym(h, "vitriol_sycl_hot_profile_loaded");
+                p_mlock      = (mlock_fn)      dlsym(h, "vitriol_sycl_mlock_hot_ranges");
+                p_preload    = (preload_fn)    dlsym(h, "vitriol_sycl_preload_hot_pages");
+            }
+        }
+
+        if (p_hot_loaded && p_hot_loaded()) {
+            for (auto & [ctx, buf_map] : ctx_buf_maps) {
+                if (p_mlock)   p_mlock(ctx);
+                if (p_preload) p_preload(ctx);
+            }
         }
     }
 
