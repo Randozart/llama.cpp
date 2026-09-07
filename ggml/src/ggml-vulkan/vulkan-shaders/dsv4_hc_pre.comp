@@ -1,37 +1,59 @@
 #version 450
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#extension GL_EXT_control_flow_attributes : require
 
-layout(push_constant) uniform PushConstants {
+// Collapse the hc residual streams of a token into one, weighted per stream:
+//
+//   dst[i0, it] = sum_ih x[i0, ih, it] * weights[ih, it]
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
     uint n_embd;
-    uint hc;
     uint n_tokens;
-    uint sx0; // nbx0 / sizeof(float)
-    uint sx1; // nbx1 / sizeof(float)
-    uint sx2; // nbx2 / sizeof(float)
-    uint sw0; // nbw0 / sizeof(float)
-    uint sw1; // nbw1 / sizeof(float)
-    uint sd0; // nbd0 / sizeof(float)
-    uint sd1; // nbd1 / sizeof(float)
+
+    uint nbx0; uint nbx1; uint nbx2;   // x
+    uint nbw0; uint nbw1;              // weights
+    uint nbd0; uint nbd1;              // dst
+
+    uint x_offset;
+    uint w_offset;
+    uint d_offset;
 };
 
-layout(binding = 0) readonly  buffer XBuf       { float x[];       };
-layout(binding = 1) readonly  buffer WeightsBuf { float weights[]; };
-layout(binding = 2)           buffer DstBuf     { float dst[];     };
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) readonly buffer W { float data_w[]; };
+layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
+
+const uint hc = 4;
+
+shared float w[hc];
 
 void main() {
-    const uint ir = gl_GlobalInvocationID.x;
-    const uint nr = n_embd * n_tokens;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint it  = gl_WorkGroupID.y;
 
-    if (ir >= nr) return;
+    if (tid < hc) {
+        w[tid] = data_w[w_offset + tid * nbw0 + it * nbw1];
+    }
+    barrier();
 
-    const uint i0 = ir % n_embd;
-    const uint it = ir / n_embd;
-
-    float sum = x[i0 * sx0 + it * sx2] * weights[it * sw1];
-    for (uint ih = 1; ih < hc; ++ih) {
-        sum += x[i0 * sx0 + ih * sx1 + it * sx2] * weights[ih * sw0 + it * sw1];
+    // After the barrier, so every invocation reaches it.
+    const uint i0 = gl_WorkGroupID.x * BLOCK_SIZE + tid;
+    if (i0 >= n_embd) {
+        return;
     }
 
-    dst[i0 * sd0 + it * sd1] = sum;
+    const uint xb = x_offset + i0 * nbx0 + it * nbx2;
+
+    float result = 0.0f;
+    [[unroll]]
+    for (uint ih = 0; ih < hc; ++ih) {
+        result = fma(data_x[xb + ih * nbx1], w[ih], result);
+    }
+
+    data_d[d_offset + i0 * nbd0 + it * nbd1] = result;
 }
