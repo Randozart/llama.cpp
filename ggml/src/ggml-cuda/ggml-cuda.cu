@@ -1998,6 +1998,15 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    /* VITRIOL: streaming experts not pinned to VRAM run through the LRU
+     * per-expert loop, which requires the sync path. Keep this consistent
+     * with the routing decision in ggml_cuda_mul_mat_id. */
+    if (src0->buffer && src0->buffer->buft && vitriol_is_vitriol_buffer_type(src0->buffer->buft)) {
+        if (!vitriol_pin_lookup(src0->data)) {
+            return true;
+        }
+    }
+
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
@@ -2035,31 +2044,63 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    /* VITRIOL: streaming MoE. When the expert tensor lives in the host-RAM
+     * VITRIOL buffer, route through the LRU loop unless the whole tensor is
+     * pinned to VRAM. Pinned tensors keep the fast paths (MMVQ/MMQ/MMF),
+     * reading from the VRAM copy via src0_eff. */
+    ggml_tensor src0_pin_local;
+    const ggml_tensor * src0_eff = src0;
+    bool vitriol_route_lru = false;
+    const bool vitriol_stream = src0->buffer && src0->buffer->buft &&
+        vitriol_is_vitriol_buffer_type(src0->buffer->buft);
+    if (vitriol_stream) {
+        if (vitriol_predictive_enabled()) {
+            vitriol_predictor_prefetch(src0->data, nb02, ctx.stream());
+        }
+        CUdeviceptr pin = vitriol_pin_lookup(src0->data);
+        if (pin) {
+            src0_pin_local = *src0;
+            src0_pin_local.data = (void *) pin;
+            src0_eff = &src0_pin_local;
+        } else if (vitriol_pin_enabled()) {
+            pin = vitriol_pin_ensure(src0->data, nb02, ne02, ctx.stream());
+            if (pin) {
+                src0_pin_local = *src0;
+                src0_pin_local.data = (void *) pin;
+                src0_eff = &src0_pin_local;
+            } else {
+                vitriol_route_lru = true;
+            }
+        } else {
+            vitriol_route_lru = true;
+        }
+    }
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    if (!vitriol_route_lru && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+            if (ggml_is_quantized(src0_eff->type)) {
+                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0_eff->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_q(ctx, src0_eff, src1, ids, dst);
                     return;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_f(ctx, src0_eff, src1, ids, dst);
                     return;
                 }
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+        if (ggml_cuda_should_use_mmq(src0_eff->type, cc, ne12, /*n_experts=*/ne02)) {
+            ggml_cuda_mul_mat_q(ctx, src0_eff, src1, ids, dst);
             return;
         }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-            ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+        if (ggml_cuda_should_use_mmf(src0_eff->type, cc, WARP_SIZE, src0_eff->ne, src0_eff->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            ggml_cuda_mul_mat_f(ctx, src0_eff, src1, ids, dst);
             return;
         }
     }
@@ -2132,12 +2173,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             continue;
         }
 
-        ggml_tensor src0_slice = *src0;
+        ggml_tensor src0_slice = *src0_eff;
         src0_slice.ne[2]    = 1;
         src0_slice.nb[3]    = src0_slice.nb[2];
         src0_slice.op       = GGML_OP_VIEW;
         src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-        src0_slice.data     = (char *) src0->data + i02*nb02;
+        src0_slice.data     = (char *) src0_eff->data + i02*nb02;
 
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));
@@ -2167,11 +2208,56 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
         dst_slice.data   = dst_data_cur;
 
-        ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
-        CUDA_CHECK(cudaGetLastError());
+        /* VITRIOL: LRU-cache this expert's weights in VRAM when streaming.
+         * On hit, remap the slice to the VRAM copy; on miss, fall through
+         * to the host-RAM page (reads over PCIe DMA). */
+        CUdeviceptr expert_vram = 0;
+        bool output_cache_hit = false;
+        if (vitriol_route_lru) {
+            if (vitriol_lazy_lock_active()) {
+                vitriol_ensure_expert_locked(src0_eff->data, (int) i02, nb02);
+            }
+            expert_vram = vitriol_lru_ensure(src0_eff->data, (int) i02,
+                (const char *) src0_eff->data + i02*nb02, nb02, stream);
+            if (expert_vram) {
+                src0_slice.data = (char *) expert_vram;
+            }
+            /* Approximate output cache: single-token-per-expert decode only. */
+            if (vitriol_output_cache_active() && tokens_per_expert[i02] == 1) {
+                const float * cached = vitriol_output_cache_lookup(src0_eff->data, (int) i02);
+                if (cached) {
+                    cuMemcpyDtoDAsync((CUdeviceptr) dst_slice.data, (CUdeviceptr) cached,
+                        (size_t) ne0 * sizeof(float), stream);
+                    CUDA_CHECK(cudaGetLastError());
+                    output_cache_hit = true;
+                }
+            }
+        }
+
+        if (!output_cache_hit) {
+            ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        if (vitriol_route_lru) {
+            if (expert_vram) {
+                vitriol_lru_mark_compute_done(expert_vram, stream);
+            }
+            if (vitriol_output_cache_active() && !output_cache_hit && tokens_per_expert[i02] == 1) {
+                vitriol_output_cache_store(src0_eff->data, (int) i02,
+                    (const float *) dst_slice.data, (size_t) ne0, stream);
+            }
+        }
 
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
+    }
+
+    /* VITRIOL: record actual expert ids so the next call's predictor can
+     * prefetch the same layer of the next token. */
+    if (vitriol_stream && vitriol_predictive_enabled()) {
+        vitriol_predictor_update(src0_eff->data, nb02,
+            (const int32_t *) ids_host.data(), (int) (ne12 * n_expert_used));
     }
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
