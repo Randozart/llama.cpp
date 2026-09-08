@@ -10780,6 +10780,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+    // VITRIOL chunked GDN: MTP-verify shapes (n_tokens = n_draft+1 in {2,3,4,6,8}).
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  6, 1, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  6, 1, 1, false, true,  /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   2, 2, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   8, 2, 1, false, false, /*K=*/3));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
