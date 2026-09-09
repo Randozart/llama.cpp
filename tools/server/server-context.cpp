@@ -4593,6 +4593,18 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     std::string tmpl_default = common_chat_templates_source(meta.chat_params.tmpls.get(), "");
     std::string tmpl_tools   = common_chat_templates_source(meta.chat_params.tmpls.get(), "tool_use");
 
+    // RPC (row-split) servers the engine actually loaded. Device name is
+    // "RPC<n>"; description carries the endpoint "host:port".
+    std::vector<std::string> rpc_servers;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        const char * dev_name = ggml_backend_dev_name(dev);
+        if (dev_name && strncmp(dev_name, "RPC", 3) == 0) {
+            const char * dev_desc = ggml_backend_dev_description(dev);
+            rpc_servers.emplace_back(dev_desc ? dev_desc : dev_name);
+        }
+    }
+
     json props = {
         { "default_generation_settings", default_generation_settings_for_props },
         { "total_slots",                 params.n_parallel },
@@ -4617,6 +4629,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "build_info",                  meta.build_info },
         { "is_sleeping",                 is_sleeping },
         { "cors_proxy_enabled",          params.ui_mcp_proxy },
+        { "rpc_servers",                 rpc_servers },
     };
     if (params.use_jinja) {
         if (!tmpl_tools.empty()) {
