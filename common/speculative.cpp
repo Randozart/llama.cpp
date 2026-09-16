@@ -35,6 +35,12 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    // VITRIOL: legacy alias preserved so blessed configs/fingerprints carry
+    // spec=mtp:1 (upstream merge renamed mtp -> draft-mtp).
+    {"mtp",           COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    // VITRIOL: legacy alias preserved so blessed configs/fingerprints carry
+    // spec=mtp:1 (upstream merge renamed mtp -> draft-mtp).
+    {"mtp",           COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
