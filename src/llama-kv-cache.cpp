@@ -1,5 +1,9 @@
 #include "llama-kv-cache.h"
 
+#include "ggml.h"
+#include "ggml-cuda.h"
+#include "ggml-backend.h"
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -9,10 +13,12 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
@@ -58,6 +64,44 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
         ggml_quantize_chunk(tensor->type, data, tensor->data, 0, 1, n*n, nullptr);
     }
 }
+
+// -- VITRIOL: per-device KV quantization ------------------------------------
+// Env (both take precedence over the global --cache-type-k/v):
+//   VITRIOL_KV_QUANT_GPU<d>     -> applies to both K and V for CUDA device d
+//   VITRIOL_KV_QUANT_K_GPU<d>   -> K-channel quant for device d (wins over above)
+//   VITRIOL_KV_QUANT_V_GPU<d>   -> V-channel quant for device d (wins over above)
+// e.g. keep f16 KV on the 12 GB card, q8_0 KV on the 8 GB card.
+
+static int vitriol_gpu_index_for_dev(const ggml_backend_dev_t dev) {
+    ggml_backend_reg_t cuda_reg = ggml_backend_cuda_reg();
+    const int n_cuda = ggml_backend_cuda_get_device_count();
+    for (int i = 0; i < n_cuda; i++) {
+        if (ggml_backend_reg_dev_get(cuda_reg, i) == dev) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static ggml_type vitriol_kv_quant_env(const char * env_base, int device) {
+    if (device < 0) {
+        return GGML_TYPE_COUNT;
+    }
+    std::string env_name = std::string(env_base) + "_GPU" + std::to_string(device);
+    const char * env_val = std::getenv(env_name.c_str());
+    if (!env_val || !env_val[0]) {
+        return GGML_TYPE_COUNT;
+    }
+    for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+        if (ggml_type_name((ggml_type) t) &&
+            strcmp(ggml_type_name((ggml_type) t), env_val) == 0) {
+            return (ggml_type) t;
+        }
+    }
+    LLAMA_LOG_WARN("%s: unknown %s=%s, ignoring\n", __func__, env_name.c_str(), env_val);
+    return GGML_TYPE_COUNT;
+}
+// -- End VITRIOL per-device KV quantization
 
 //
 // llama_kv_cache
@@ -231,8 +275,33 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        ggml_type layer_type_k = type_k;
+        ggml_type layer_type_v = type_v;
+
+        // VITRIOL: per-device KV quant override (see helper docs above).
+        // Layer split -> each KV layer lives on one GPU; let the tight card
+        // run a smaller quant than the roomy one.
+        {
+            int gpu_idx = -1;
+            const ggml_backend_dev_t bdev = ggml_backend_buft_get_device(buft);
+            if (bdev) {
+                gpu_idx = vitriol_gpu_index_for_dev(bdev);
+            }
+            const ggml_type dev_both = vitriol_kv_quant_env("VITRIOL_KV_QUANT", gpu_idx);
+            const ggml_type dev_k    = vitriol_kv_quant_env("VITRIOL_KV_QUANT_K", gpu_idx);
+            const ggml_type dev_v    = vitriol_kv_quant_env("VITRIOL_KV_QUANT_V", gpu_idx);
+            if (dev_k != GGML_TYPE_COUNT || dev_v != GGML_TYPE_COUNT || dev_both != GGML_TYPE_COUNT) {
+                if (dev_k != GGML_TYPE_COUNT)        layer_type_k = dev_k;
+                else if (dev_both != GGML_TYPE_COUNT) layer_type_k = dev_both;
+                if (dev_v != GGML_TYPE_COUNT)        layer_type_v = dev_v;
+                else if (dev_both != GGML_TYPE_COUNT) layer_type_v = dev_both;
+                LLAMA_LOG_DEBUG("%s: layer %3d: VITRIOL per-device KV quant -> k:%s v:%s (gpu %d)\n",
+                                __func__, il, ggml_type_name(layer_type_k), ggml_type_name(layer_type_v), gpu_idx);
+            }
+        }
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
