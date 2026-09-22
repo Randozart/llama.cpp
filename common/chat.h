@@ -353,6 +353,14 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const common_json 
 
 std::vector<common_chat_tool> common_chat_tools_parse_oaicompat(const common_json & tools);
 
+// VITRIOL: compact "Available tools: ..." reminder injected near the generation
+// point so SWA-windowed models (Mellum2: 21/28 layers attend only the last 1024
+// tokens) keep tool awareness across long conversations. Names + call-envelope
+// hint, ~100-150 tokens. trigger_marker is the template's per-call trigger
+// (e.g. "<tool_call>" for the hermes/Mellum2 template, "[TOOL_CALLS]" for
+// Ministral/Qwen) - the model must emit it to engage the lazy grammar.
+std::string common_chat_tools_reminder(const std::vector<common_chat_tool> & tools, const std::string & trigger_marker);
+
 common_chat_continuation common_chat_continuation_parse(const common_json & value);
 
 // DEPRECATED: only used in tests

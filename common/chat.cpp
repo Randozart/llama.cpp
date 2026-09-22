@@ -608,6 +608,25 @@ std::vector<common_chat_tool> common_chat_tools_parse_oaicompat(const json & too
     return result;
 }
 
+std::string common_chat_tools_reminder(const std::vector<common_chat_tool> & tools, const std::string & trigger_marker) {
+    if (tools.empty()) {
+        return "";
+    }
+
+    const std::string marker = trigger_marker.empty() ? "<tool_call>" : trigger_marker;
+
+    std::string reminder = "<|im_start|>system\nAvailable tools: ";
+    for (size_t i = 0; i < tools.size(); ++i) {
+        if (i > 0) {
+            reminder += ", ";
+        }
+        reminder += tools[i].name;
+    }
+    reminder += "\nTo call a tool, emit " + marker + " followed by {\"name\": \"<tool>\", \"arguments\": {...}}.\n<|im_end|>\n";
+
+    return reminder;
+}
+
 common_chat_continuation common_chat_continuation_parse(const common_json & value) {
     if (value.is_boolean() && value.get<bool>()) {
         return COMMON_CHAT_CONTINUATION_AUTO;
