@@ -17,6 +17,7 @@ struct cfg {
     bool     on      = false;
     uint32_t every_n = 16;
     float    dec     = 0.90f;
+    float    min_fill = 0.5f;   // score only when cache is >= this fraction full
 };
 
 const cfg & get_cfg() {
@@ -36,6 +37,12 @@ const cfg & get_cfg() {
                 const float f = strtof(e, nullptr);
                 if (f > 0.0f && f <= 1.0f) {
                     out.dec = f;
+                }
+            }
+            if (const char * e = getenv("VITRIOL_KV_SCORE_MIN_FILL")) {
+                const float f = strtof(e, nullptr);
+                if (f >= 0.0f && f <= 1.0f) {
+                    out.min_fill = f;
                 }
             }
         }
@@ -70,6 +77,10 @@ float decay() {
 
 uint32_t every() {
     return get_cfg().every_n;
+}
+
+float min_fill() {
+    return get_cfg().min_fill;
 }
 
 void begin_batch(const bool is_single_token) {

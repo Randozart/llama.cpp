@@ -2844,6 +2844,16 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+float llama_kv_cache_context::fill_ratio() const {
+    if (kv->get_size() == 0) {
+        return 0.0f;
+    }
+    // n_kv is the filled cell count for the current batch (set during batch
+    // setup), the reliable fill signal - sinfos[i_cur] is stale at decode
+    // start, and get_cells() indexes by seq, not stream.
+    return (float) n_kv / (float) kv->get_size();
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }

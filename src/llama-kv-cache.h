@@ -421,6 +421,11 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // VITRIOL: current fill ratio (used/size) of the active stream's cells,
+    // in [0,1]. Used by the attention probe to skip scoring while the cache
+    // has plenty of headroom (scores only matter near the window edge).
+    float fill_ratio() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 

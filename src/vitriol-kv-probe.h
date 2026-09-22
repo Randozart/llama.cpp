@@ -46,6 +46,12 @@ bool enabled();
 float decay();
 uint32_t every();
 
+// VITRIOL (2026-09-22): minimum cache fill ratio (used/size) below which
+// scoring is skipped. Scores only matter near the window edge (eviction
+// cannot fire while the cache has headroom); skipping short decodes removes
+// the per-scored-step graph rebuild + stream sync overhead.
+float min_fill();
+
 // Called at the start of a decode batch. Arms scoring for single-token
 // batches on their cadence; prompt batches never consume cadence.
 void begin_batch(bool is_single_token);

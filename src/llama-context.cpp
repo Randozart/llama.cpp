@@ -1347,7 +1347,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    const bool vitriol_probe_armed = vitriol_probe::active();
+    // VITRIOL (2026-09-22): probe armed only when the cache is deep enough.
+    // Scores only matter near the window edge (eviction cannot fire while the
+    // cache has headroom); skipping low-fill decodes removes the per-scored-
+    // step graph rebuild + stream sync overhead (~18% shallow-decode penalty).
+    // Gated on a valid kv-cache context with fill >= VITRIOL_KV_SCORE_MIN_FILL.
+    bool vitriol_probe_armed = vitriol_probe::active();
+    if (vitriol_probe_armed) {
+        auto * kv_ctx = dynamic_cast<llama_kv_cache_context *>(mctx);
+        if (!kv_ctx || kv_ctx->fill_ratio() < vitriol_probe::min_fill()) {
+            vitriol_probe_armed = false;
+        }
+    }
 
     if (!graph_reuse_disable && !vitriol_probe_armed && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
