@@ -10,8 +10,10 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
-#include "llama-sampler.h"
 #include "llama.h"
+#include "llama-kv-cache.h"
+#include "llama-sampler.h"
+#include "vitriol-kv-probe.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -1345,7 +1347,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const bool vitriol_probe_armed = vitriol_probe::active();
+
+    if (!graph_reuse_disable && !vitriol_probe_armed && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1372,6 +1376,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        // VITRIOL LULL Phase 1: append the attention-probe scoring subgraph
+        // at the tail, after all model nodes exist (builders own the graph
+        // during build; tail insertion cannot break their ordering checks).
+        if (vitriol_probe_armed) {
+            vitriol_probe::append_scores(res->get_ctx(), gf);
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -1645,6 +1656,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+
+    // VITRIOL LULL Phase 1: arm the attention probe for single-token decode
+    // batches (cadence handled inside the module).
+    vitriol_probe::begin_batch(batch_inp.n_tokens == 1);
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1982,6 +1997,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
+
+    // VITRIOL LULL Phase 1: download+apply probe scores for this decode step.
+    // tensor_get inside synchronizes the producing stream (ms-scale at 131k).
+    vitriol_probe::finish_pending();
 
     // set output mappings
     if (n_outputs > 0) {
@@ -4327,4 +4346,15 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+// VITRIOL context lifecycle (2026-09-03): ejected-cells counter for the
+// officina gauge (see llama_kv_vitriol_evicted in llama.h). The memory is
+// a llama_kv_cache for standard attention; hybrid memories report 0.
+uint64_t llama_kv_vitriol_evicted(const struct llama_context * ctx) {
+    if (!ctx) {
+        return 0;
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    return kv ? kv->vitriol_evicted_total() : 0;
 }

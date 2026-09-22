@@ -1626,6 +1626,11 @@ extern "C" {
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
 
+    // VITRIOL context lifecycle (2026-09-03): cells ejected from the KV
+    // cache since boot - sparse eviction + eager floor sweep. Counter for
+    // the officina ejected-tokens gauge.
+    LLAMA_API uint64_t llama_kv_vitriol_evicted(const struct llama_context * ctx);
+
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,

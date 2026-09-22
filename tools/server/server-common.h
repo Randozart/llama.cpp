@@ -474,6 +474,10 @@ struct server_metrics {
     uint64_t n_decode     = 0;
     uint64_t n_busy_slots = 0;
 
+    // VITRIOL context lifecycle: KV cells ejected since boot (sparse
+    // eviction + eager floor sweep) - surfaced as llamacpp:kv_ejected_total.
+    uint64_t n_kv_ejected = 0;
+
     uint64_t n_draft_tokens      = 0; // Total draft tokens generated
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model

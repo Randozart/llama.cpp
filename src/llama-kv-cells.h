@@ -43,6 +43,7 @@ public:
             ext[i].reset();
             shift[i] =  0;
             seq[i].reset();
+            score[i] =  0.0f;
         }
 
         has_shift = false;
@@ -71,6 +72,7 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
+        score.resize(n);
 
         reset();
     }
@@ -401,6 +403,18 @@ public:
         return ext[i];
     }
 
+    // VITRIOL: per-cell attention-probe importance score (vitriol-kv-probe).
+    // Accumulated with exponential decay; consumed by evict_sparse().
+    float score_get(uint32_t i) const {
+        assert(i < pos.size());
+        return score[i];
+    }
+
+    void score_set(uint32_t i, float s) {
+        assert(i < pos.size());
+        score[i] = s;
+    }
+
     // note: call only if the cell is not empty
     llama_pos get_shift(uint32_t i) const {
         assert(i < pos.size());
@@ -492,6 +506,9 @@ private:
 
     // stores extra info per cell
     std::vector<llama_kv_cell_ext> ext;
+
+    // VITRIOL: per-cell attention-probe importance score (see score_get/set)
+    std::vector<float> score;
 
     // this array accumulates any applied shifts to the pos array since the last reset_shift() call
     // this is used to queue multiple updates to the pos array, which in the end can be applied in one go:

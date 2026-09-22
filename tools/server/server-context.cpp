@@ -865,7 +865,9 @@ public:
     }
 
     server_metrics get_metrics() const {
-        return metrics;
+        auto m = metrics;
+        m.n_kv_ejected = ctx_tgt ? llama_kv_vitriol_evicted(ctx_tgt) : 0;
+        return m;
     }
 
     void reset_metrics_bucket() {

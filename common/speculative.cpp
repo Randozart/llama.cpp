@@ -2536,7 +2536,11 @@ common_speculative_init_result::common_speculative_init_result(
     }
 
     // the draft context holds as many tokens per sequence as the target context
-    cparams.n_ctx = llama_n_ctx(ctx_tgt);
+    // VITRIOL (2026-09-17): capped at n_ctx_train - the server caps per-slot
+    // context at the training length (server-context.cpp n_ctx_slot), so the
+    // draft never needs more rows than that. At 393K unified pools this saves
+    // ~0.5 GiB of draft KV that would otherwise OOM dev1.
+    cparams.n_ctx = std::min<uint32_t>(llama_n_ctx(ctx_tgt), (uint32_t) std::max(0, llama_model_n_ctx_train(model_tgt)));
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
@@ -2566,6 +2570,9 @@ common_speculative_init_result::common_speculative_init_result(
     } else if (spec_mtp) {
         model_path = params.model.path;
 
+        LOG_INF("%s: draft cparams: n_ctx=%u type_k=%s type_v=%s n_seq=%u\n", __func__,
+                cparams.n_ctx, ggml_type_name(cparams.type_k), ggml_type_name(cparams.type_v),
+                cparams.n_seq_max);
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
 
         llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams);

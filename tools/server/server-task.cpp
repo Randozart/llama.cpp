@@ -1586,6 +1586,10 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "kv_ejected_total",
+            "VITRIOL sparse-KV: KV cells ejected since boot (attention-scored eviction + eager floor sweep)",
+            (double) metrics.n_kv_ejected
         },
     };
 

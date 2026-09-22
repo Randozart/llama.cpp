@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "vitriol-kv-probe.h"
 
 #include <algorithm>
 #include <cassert>
@@ -788,7 +789,17 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     for (const auto & ubatch : ubatches) {
         // only find a suitable slot for the ubatch. don't modify the cells yet
-        const auto sinfo_new = find_slot(ubatch, false);
+        auto sinfo_new = find_slot(ubatch, false);
+        if (sinfo_new.empty()) {
+            // VITRIOL: try sparse eviction before giving up
+            const char * vitriol_kv_mode = std::getenv("VITRIOL_KV_MODE");
+            if (vitriol_kv_mode && strcmp(vitriol_kv_mode, "sparse") == 0) {
+                uint32_t n_evicted = evict_sparse(ubatch.n_tokens, 4);
+                if (n_evicted > 0) {
+                    sinfo_new = find_slot(ubatch, false);
+                }
+            }
+        }
         if (sinfo_new.empty()) {
             success = false;
             break;
@@ -2834,4 +2845,208 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+//
+// VITRIOL LULL Phase 1 - attention-probe scoring (see vitriol-kv-probe.h)
+//
+
+void llama_kv_cache_context::vitriol_probe_reset() const {
+    kv->vitriol_probe_reset();
+    if (sinfos[i_cur].n_stream() == 1) {
+        kv->v_probe_strm = sinfos[i_cur].strm[0];
+    }
+}
+
+void llama_kv_cache_context::vitriol_probe_mark_output(ggml_tensor * out, uint32_t n_layers) const {
+    kv->v_probe_out     = out;
+    kv->v_probe_layers  = n_layers;
+    kv->v_probe_pending = true;
+}
+
+void llama_kv_cache_context::vitriol_probe_finish() const {
+    kv->vitriol_probe_finish();
+}
+
+void llama_kv_cache::vitriol_probe_reset() {
+    v_probe_acc     = nullptr;
+    v_probe_out     = nullptr;
+    v_probe_layers  = 0;
+    v_probe_pending = false;
+}
+
+bool llama_kv_cache::vitriol_probe_pending() const {
+    return v_probe_pending;
+}
+
+void llama_kv_cache::vitriol_probe_mark_output(ggml_tensor * out, uint32_t n_layers) {
+    v_probe_out     = out;
+    v_probe_layers  = n_layers;
+    v_probe_pending = true;
+}
+
+void llama_kv_cache::vitriol_probe_finish() {
+    if (!v_probe_pending || !v_probe_out) {
+        return;
+    }
+
+    const uint32_t n_kv = (uint32_t)(v_probe_out->ne[0] * v_probe_out->ne[1]);
+
+    std::vector<float> scores(n_kv);
+    ggml_backend_tensor_get(v_probe_out, scores.data(), 0, n_kv * sizeof(float));
+
+    const float dec = vitriol_probe::decay();
+    auto & cells    = v_cells[v_probe_strm];
+
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        fprintf(stderr, "VITRIOL_KV_SCORE: probe active, n_kv=%u layers=%u decay=%.2f\n",
+                n_kv, v_probe_layers, dec);
+    }
+
+    uint32_t mapped = 0;
+    for (uint32_t j = 0; j < n_kv && j < cells.size(); ++j) {
+        if (cells.is_empty(j)) {
+            continue;
+        }
+        cells.score_set(j, dec * cells.score_get(j) + scores[j]);
+        mapped++;
+    }
+
+    LLAMA_LOG_DEBUG("%s: applied probe scores to %u/%u cells (layers=%u)\n",
+            __func__, mapped, n_kv, v_probe_layers);
+
+    v_probe_pending = false;
+    v_probe_acc     = nullptr;
+    v_probe_out     = nullptr;
+
+    // Eager ejection (owner request 2026-09-03, context lifecycle Stage 5):
+    // "dump the moment it's certain not to be needed." A cell whose decayed
+    // score fell below VITRIOL_KV_FLOOR has been unattended for tens of
+    // decode steps - the model will not miss it. Sinks (first 4, matching
+    // the evict_sparse call site) and the recent window
+    // (VITRIOL_KV_PROTECT positions behind pos_max, default 2048) never
+    // sweep. Floor 0 = off (demand-driven eviction only, the pre-eager
+    // behavior). Sweeps ride the probe cadence.
+    {
+        static const float floor_sc = [] {
+            const char * f = getenv("VITRIOL_KV_FLOOR");
+            return f ? (float) atof(f) : 0.0f;
+        }();
+        static const int32_t protect = [] {
+            const char * p = getenv("VITRIOL_KV_PROTECT");
+            return p ? (int32_t) atoi(p) : 2048;
+        }();
+        if (floor_sc > 0.0f) {
+            int32_t pos_max = INT32_MIN;
+            for (uint32_t j = 0; j < cells.size(); ++j) {
+                if (!cells.is_empty(j)) {
+                    pos_max = std::max(pos_max, cells.pos_get(j));
+                }
+            }
+            if (pos_max != INT32_MIN) {
+                const int32_t recent_floor = pos_max - protect;
+                uint32_t swept = 0;
+                for (uint32_t j = 4; j < cells.size(); ++j) { // sinks, cf. evict_sparse call
+                    if (cells.is_empty(j)) {
+                        continue;
+                    }
+                    if (cells.pos_get(j) > recent_floor) {
+                        continue;
+                    }
+                    if (cells.score_get(j) < floor_sc) {
+                        cells.rm(j);
+                        swept++;
+                    }
+                }
+                if (swept > 0) {
+                    v_evicted_total += swept;
+                    static uint32_t s_sweeps = 0;
+                    if ((++s_sweeps & 0x07) == 1) {
+                        fprintf(stderr,
+                                "VITRIOL_KV_EAGER: swept %u cells below floor %.3f (protect %d)\n",
+                                swept, floor_sc, protect);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// VITRIOL: evict low-importance cells to free slots for new tokens.
+// Importance = accumulated attention-probe scores (vitriol-kv-probe.h);
+// falls back to arbitrary-middle ordering when scores are all zero (probe
+// disabled). Always preserves attention sinks (first n_sinks cells) and a
+// recent window of 2*n_needed positions. Demand-driven: only called when
+// find_slot() cannot place an ubatch.
+uint32_t llama_kv_cache::evict_sparse(uint32_t n_needed, uint32_t n_sinks) {
+    uint32_t total = 0;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        auto & cells = v_cells[s];
+        if (cells.get_used() == 0) {
+            continue;
+        }
+
+        const uint32_t n_evict = cells.get_used() + n_needed - cells.size();
+
+        // newest position still alive in this stream (for the recent window)
+        int32_t pos_max = INT32_MIN;
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i)) {
+                pos_max = std::max(pos_max, cells.pos_get(i));
+            }
+        }
+        if (pos_max == INT32_MIN) {
+            continue;
+        }
+        const int32_t recent_floor = pos_max - (int32_t)(n_needed * 2);
+
+        // collect every evictable cell, then evict globally-lowest scores
+        std::vector<std::pair<float, uint32_t>> candidates;
+        float sc_min = 0.0f, sc_max = 0.0f;
+        for (uint32_t i = n_sinks; i < cells.size(); ++i) {
+            if (cells.is_empty(i)) {
+                continue;
+            }
+            if (cells.pos_get(i) > recent_floor) {
+                continue; // recent window
+            }
+            const float sc = cells.score_get(i);
+            if (candidates.empty()) {
+                sc_min = sc_max = sc;
+            } else {
+                sc_min = std::min(sc_min, sc);
+                sc_max = std::max(sc_max, sc);
+            }
+            candidates.push_back({sc, i});
+        }
+
+        if ((uint32_t) candidates.size() < n_evict) {
+            continue; // not enough evictable middle - refuse (caller fails)
+        }
+
+        std::sort(candidates.begin(), candidates.end(),
+            [](const auto & a, const auto & b) { return a.first < b.first; });
+
+        uint32_t evicted = 0;
+        for (auto & [sc, idx] : candidates) {
+            if (evicted >= n_evict) break;
+            cells.rm(idx);
+            evicted++;
+        }
+
+        static uint32_t s_evict_events = 0;
+        if ((++s_evict_events & 0x07) == 1) {
+            fprintf(stderr,
+                    "VITRIOL_KV_EVICT: freed %u cells (score range %.3f..%.3f over %zu candidates)\n",
+                    evicted, sc_min, sc_max, candidates.size());
+        }
+
+        total += evicted;
+        v_evicted_total += evicted;
+    }
+
+    return total;
 }
