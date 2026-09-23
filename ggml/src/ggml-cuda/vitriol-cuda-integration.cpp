@@ -529,7 +529,7 @@ void vitriol_ensure_expert_locked(const void * tensor_base, int expert_idx, size
     /* Store-backed: populate the pinned slice from the raw-zone store before
      * locking, so ggml reads expert bytes that came off Optane (O_DIRECT),
      * not from the (empty) anon mmap. */
-    if (g_vitriol_config.store_backed) {
+    if (g_vitriol_config.store_backed && g_store_handle) {
         const uint32_t tid = store_tid_for(tensor_base);
         if (tid != UINT32_MAX) {
             const auto & t = vitriol::store_tensor_desc_at(g_store_handle, tid);

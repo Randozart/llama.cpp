@@ -340,19 +340,34 @@ static const struct ggml_backend_buffer_type_i vitriol_buffer_type_interface = {
 /* ── Lazy buffer type (pageable, no mlock, no cudaHostRegister) ── */
 
 static ggml_backend_buffer_t vitriol_buffer_type_alloc_buffer_lazy(ggml_backend_buffer_type_t buft, size_t size) {
+    vitriol::store * store = nullptr;
+    if (g_vitriol_config.store_backed) {
+        const char * spath = vitriol_store_path();
+        if (spath) {
+            auto o = vitriol::store_open(spath, O_RDONLY);
+            if (o) {
+                store = *o;
+                vitriol_store_set_handle(store);
+            } else {
+                fprintf(stderr, "VITRIOL: store_open(%s) failed: %d\n", spath, (int)o.error());
+            }
+        }
+    }
     void * ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (ptr == MAP_FAILED) {
         fprintf(stderr, "VITRIOL: lazy mmap(%zu) failed: %m\n", size);
+        if (store) vitriol::store_close(store);
         return nullptr;
     }
     /* No mlock, no cudaHostRegister, no MAP_POPULATE — done lazily
      * per-expert via vitriol_ensure_expert_locked(). Pages are faulted
      * in on first memcpy during tensor loading, so no memset needed. */
     if (g_vitriol_config.verbose)
-        printf("VITRIOL: lazy buffer — pageable mmap (%zu MiB, not locked)\n",
-               size / 1024 / 1024);
+        printf("VITRIOL: lazy buffer — pageable mmap (%zu MiB, not locked%s)\n",
+               size / 1024 / 1024, store ? ", store-backed" : "");
     auto * ctx = new vitriol_buffer_context{ptr, size};
+    ctx->store = store;
     return ggml_backend_buffer_init(buft, vitriol_buffer_interface, ctx, size);
 }
 
