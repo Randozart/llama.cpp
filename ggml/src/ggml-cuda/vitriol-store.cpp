@@ -253,10 +253,14 @@ std::expected<void, store_error> store_mkfs(
     }
 
     // Preallocate: extend file to full length so later pwrite/read is O(1).
+    // Skip on block devices (raw partitions) - ftruncate is invalid there
+    // and the device already has fixed size.
+    struct stat sb;
+    const bool is_block = (fstat(fd, &sb) == 0) && S_ISBLK(sb.st_mode);
     const uint64_t total = s.kv_ring_bytes > 0
         ? (s.kv_base + s.kv_ring_bytes)
         : (s.embed_base + s.embed_bytes);
-    if (ftruncate(fd, static_cast<off_t>(total)) != 0) {
+    if (!is_block && ftruncate(fd, static_cast<off_t>(total)) != 0) {
         close(fd);
         return std::unexpected(store_error::io_error);
     }
