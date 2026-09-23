@@ -1,5 +1,5 @@
-// vitriol-store-self-test: mkfs a store file, write slots, read back, verify.
-// C++26 per docs/cpp26-conventions.md. Run: g++ -std=c++26 ... && ./a.out
+// vitriol-store-self-test: mkfs a store file, write tensors, read back, verify.
+// C++26 per docs/cpp26-conventions.md. Run: g++ -std=c++26 ... -luring && ./a.out
 #include "vitriol-store.h"
 #include <cstdio>
 #include <cstring>
@@ -13,43 +13,57 @@ int main() {
     const char * path = "/tmp/opencode/store_selftest.bin";
     unlink(path);
 
-    const uint32_t n_slots = 16;
+    // 3 expert tensors: 2 routed (512 experts each, 128 B slices), 1 shexp (1, 4096 B)
+    std::vector<store_tensor_desc> tensors = {
+        {0, 0, 512, 128, 0},
+        {0, 2, 512, 128, 0},
+        {0, 3, 1, 4096, 0},
+    };
     const uint64_t embed = 4096 * 3;
     const uint64_t kv = 0;
 
-    // mkfs
-    auto m = store_mkfs(path, n_slots, embed, kv);
+    auto m = store_mkfs(path, tensors, embed, kv);
     if (!m) { printf("mkfs FAIL: %d\n", (int)m.error()); return 1; }
     printf("mkfs ok\n");
 
-    // open
     auto o = store_open(path, O_RDWR);
     if (!o) { printf("open FAIL: %d\n", (int)o.error()); return 1; }
     store * st = *o;
-    printf("open ok: experts=%u slot_size=%u embed=%llu\n",
-           store_expert_count(st), store_slot_size(st),
-           (unsigned long long)store_embed_bytes(st));
-    if (store_expert_count(st) != n_slots) { printf("count mismatch\n"); return 1; }
+    printf("open ok: tensors=%u embed=%llu\n",
+           store_tensor_count(st), (unsigned long long)store_embed_bytes(st));
+    if (store_tensor_count(st) != 3) { printf("count mismatch\n"); return 1; }
 
-    // write slot pattern + read back
-    std::vector<uint8_t> pat(store_slot_size(st));
-    for (uint32_t s = 0; s < n_slots; ++s) {
-        for (size_t i = 0; i < pat.size(); ++i) pat[i] = (uint8_t)(s * 31 + i);
-        ssize_t w = store_write_slot(st, s, pat.data());
-        if (w != (ssize_t)pat.size()) { printf("write slot %u FAIL (%zd)\n", s, w); return 1; }
-    }
-    printf("wrote %u slots\n", n_slots);
+    // write tensor 0 (512 experts x 128 B) with distinct per-expert patterns
+    std::vector<uint8_t> t0(512 * 128);
+    for (uint32_t e = 0; e < 512; ++e)
+        for (int i = 0; i < 128; ++i)
+            t0[e * 128 + i] = (uint8_t)(e * 7 + i);
+    ssize_t w = store_write_expert_tensor(st, 0, t0.data());
+    if (w != (ssize_t)t0.size()) { printf("write t0 FAIL (%zd)\n", w); return 1; }
 
-    std::vector<uint8_t> rd(store_slot_size(st));
-    for (uint32_t s = 0; s < n_slots; ++s) {
-        for (size_t i = 0; i < rd.size(); ++i) rd[i] = 0;
-        ssize_t r = store_read_slot(st, s, rd.data());
-        if (r != (ssize_t)rd.size()) { printf("read slot %u FAIL (%zd)\n", s, r); return 1; }
-        for (size_t i = 0; i < rd.size(); ++i) {
-            if (rd[i] != (uint8_t)(s * 31 + i)) { printf("data mismatch slot %u @%zu\n", s, i); return 1; }
-        }
+    // write shexp tensor
+    std::vector<uint8_t> shexp(4096, 0x5A);
+    w = store_write_expert_tensor(st, 2, shexp.data());
+    if (w != (ssize_t)shexp.size()) { printf("write shexp FAIL (%zd)\n", w); return 1; }
+    printf("wrote tensors\n");
+
+    // read back expert slices via store_read_expert
+    for (uint32_t e = 0; e < 512; ++e) {
+        std::vector<uint8_t> rd(128, 0);
+        ssize_t r = store_read_expert(st, 0, e, rd.data());
+        if (r != 128) { printf("read expert %u FAIL (%zd)\n", e, r); return 1; }
+        for (int i = 0; i < 128; ++i)
+            if (rd[i] != (uint8_t)(e * 7 + i)) { printf("data mismatch e=%u @%d\n", e, i); return 1; }
     }
-    printf("slot readback ok\n");
+    printf("expert slice readback ok (512 slices)\n");
+
+    // shexp readback
+    std::vector<uint8_t> sr(4096, 0);
+    ssize_t rr = store_read_expert(st, 2, 0, sr.data());
+    if (rr != 4096) { printf("shexp read FAIL\n"); return 1; }
+    for (int i = 0; i < 4096; ++i)
+        if (sr[i] != 0x5A) { printf("shexp mismatch @%d\n", i); return 1; }
+    printf("shexp readback ok\n");
 
     // embed write/read
     std::vector<std::byte> ep(embed, std::byte{0xAB});
@@ -58,21 +72,18 @@ int main() {
     std::vector<std::byte> er(embed);
     ssize_t eres = store_read_embed(st, 0, std::span<std::byte>(er));
     if (eres != (ssize_t)embed) { printf("embed read FAIL\n"); return 1; }
-    for (size_t i = 0; i < embed; ++i) {
+    for (size_t i = 0; i < embed; ++i)
         if (er[i] != std::byte{0xAB}) { printf("embed mismatch @%zu\n", i); return 1; }
-    }
     printf("embed readback ok\n");
 
-    // async path
-    std::vector<uint8_t> ar(store_slot_size(st));
-    for (size_t i = 0; i < ar.size(); ++i) ar[i] = 0;
-    int aq = store_read_slot_async(st, 3, ar.data());
+    // async path: read expert 3 of tensor 0
+    std::vector<uint8_t> ar(128, 0);
+    int aq = store_read_expert_async(st, 0, 3, ar.data());
     if (aq != 0) { printf("async queue FAIL\n"); return 1; }
-    ssize_t arres = store_read_slot_wait(st);
-    if (arres != (ssize_t)ar.size()) { printf("async wait FAIL (%zd)\n", arres); return 1; }
-    for (size_t i = 0; i < ar.size(); ++i) {
-        if (ar[i] != (uint8_t)(3 * 31 + i)) { printf("async mismatch @%zu\n", i); return 1; }
-    }
+    ssize_t arres = store_read_expert_wait(st);
+    if (arres != 128) { printf("async wait FAIL (%zd)\n", arres); return 1; }
+    for (int i = 0; i < 128; ++i)
+        if (ar[i] != (uint8_t)(3 * 7 + i)) { printf("async mismatch @%d\n", i); return 1; }
     printf("async readback ok\n");
 
     store_close(st);

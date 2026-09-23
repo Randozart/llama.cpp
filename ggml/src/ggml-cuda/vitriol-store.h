@@ -64,11 +64,14 @@ enum class store_error {
 struct store;
 struct store_impl;
 
-// Persistent per-slot descriptor (index zone). Dense array [0, expert_count).
-struct store_slot_desc {
-    uint32_t layer;     // layer index (for LRU key reconstruction)
-    uint32_t expert;    // expert index within layer
-    uint64_t offset;    // file offset where slot lives (= expert_base + slot*stride)
+// Persistent per-expert-tensor descriptor (index zone). Dense array [0, n_tensors).
+// Experts within a tensor are contiguous at slice_bytes stride.
+struct store_tensor_desc {
+    uint32_t layer;         // layer index
+    uint32_t kind;          // 0=ffn_up, 1=ffn_gate, 2=ffn_down, 3=shexp
+    uint32_t n_experts;     // 512 routed (or 1 shared expert)
+    uint32_t slice_bytes;   // per-expert on-disk bytes (IQ-quantized, exact)
+    uint64_t store_offset;  // byte offset of this tensor in the EXPERT zone
 };
 
 // ---- boundary API (std::expected) ------------------------------------------
@@ -84,49 +87,54 @@ void store_close(store * st);
 uint32_t store_expert_count(const store * st) pre(st != nullptr);
 uint32_t store_slot_size(const store * st) pre(st != nullptr);
 uint64_t store_embed_bytes(const store * st) pre(st != nullptr);
+uint32_t store_tensor_count(const store * st) pre(st != nullptr);
+const store_tensor_desc & store_tensor_desc_at(const store * st, uint32_t tid)
+    pre(st != nullptr)
+    pre(tid < store_tensor_count(st));
 
 // ---- hot read path (scalar returns, no expected) ---------------------------
 
-// Read one expert slot into dst (slot_size bytes). Returns bytes read, or -1.
-// Caller MUST ensure dst points to >= slot_size bytes. This is the hot MoE
-// path - scalar return only.
-ssize_t store_read_slot(store * st, uint32_t slot, void * dst)
+// Read one expert slice of tensor `tid`, expert index `expert_idx`, into dst
+// (slice_bytes). Returns bytes read, or -1. This is the hot MoE path - scalar.
+ssize_t store_read_expert(store * st, uint32_t tid, uint32_t expert_idx, void * dst)
     pre(st != nullptr)
     pre(dst != nullptr)
-    pre(slot < store_expert_count(st));
+    pre(tid < store_tensor_count(st))
+    pre(expert_idx < store_tensor_desc_at(st, tid).n_experts);
 
-// Read a slice of the embed tensor. Sequential bulk path.
+// Read a slice of the embed tensor. Sequential/random-row bulk path.
 // Returns bytes read, or -1.
 ssize_t store_read_embed(store * st, uint64_t offset, std::span<std::byte> dst)
     pre(st != nullptr)
     pre(offset + dst.size() <= store_embed_bytes(st));
 
-// Asynchronous read of one expert slot via io_uring. Queues the op; wait
-// with store_read_slot_wait. Returns 0 queued, -1 error.
-int store_read_slot_async(store * st, uint32_t slot, void * dst)
+// Asynchronous read of one expert slice via io_uring. Queues the op; wait
+// with store_read_expert_wait. Returns 0 queued, -1 error.
+int store_read_expert_async(store * st, uint32_t tid, uint32_t expert_idx, void * dst)
     pre(st != nullptr)
     pre(dst != nullptr)
-    pre(slot < store_expert_count(st));
+    pre(tid < store_tensor_count(st))
+    pre(expert_idx < store_tensor_desc_at(st, tid).n_experts);
 
 // Wait for the outstanding async op. Returns bytes read or -1.
-ssize_t store_read_slot_wait(store * st) pre(st != nullptr);
+ssize_t store_read_expert_wait(store * st) pre(st != nullptr);
 
 // ---- mkfs ------------------------------------------------------------------
 
-// Format a raw device/file. Computes zones from expert_count + embed_bytes.
-// kv_bytes reserved (P3). Returns expected<store_error>; 0 (none) on success.
+// Format a raw device/file. Writes super + tensor index; caller then streams
+// expert/embed data with store_write_expert_tensor / store_write_embed.
 std::expected<void, store_error> store_mkfs(
     const char * path,
-    uint32_t expert_count,
+    std::span<const store_tensor_desc> tensors,
     uint64_t embed_bytes,
     uint64_t kv_bytes)
     pre(path != nullptr);
 
-// Write one expert slot's bytes (used by mkfs tool to populate).
-ssize_t store_write_slot(store * st, uint32_t slot, const void * src)
+// Write one expert tensor's full data (mkfs tool). src == n_experts*slice_bytes.
+ssize_t store_write_expert_tensor(store * st, uint32_t tid, const void * src)
     pre(st != nullptr)
     pre(src != nullptr)
-    pre(slot < store_expert_count(st));
+    pre(tid < store_tensor_count(st));
 
 // Write the embed tensor bytes (mkfs tool).
 ssize_t store_write_embed(store * st, uint64_t offset, std::span<const std::byte> src)

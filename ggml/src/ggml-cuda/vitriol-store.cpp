@@ -2,8 +2,8 @@
 //
 // Raw-device layout:
 //   [0x0000] super 4K (2 copies at +0 and +4096)
-//   [index]  dense store_slot_desc array (expert_count entries)
-//   [expert] expert_count * 2 MiB slots
+//   [index]  dense store_tensor_desc array (n_tensors) + CRC trailer
+//   [expert] per-tensor contiguous expert slices (tensor store_offset)
 //   [embed]  embed_bytes sequential
 //   [kv]     kv_ring_bytes (reserved, P3)
 //
@@ -40,12 +40,14 @@ struct store {
     int fd = -1;
     uint32_t flags = 0;
     store_super super{};
-    std::unique_ptr<store_slot_desc[]> index;
+    std::unique_ptr<store_tensor_desc[]> index;
+    uint32_t n_tensors = 0;
 
     // io_uring state
     bool uring_ok = false;
     struct io_uring ring;
-    uint32_t async_slot = 0;
+    uint32_t async_tid = 0;
+    uint32_t async_expert = 0;
 
     ~store() {
         if (uring_ok) {
@@ -76,7 +78,7 @@ static store_error write_super_at(int fd, uint64_t off, const store_super & s) {
 }
 
 static store_error write_super(int fd, store_super & s) {
-    // CRC over first 4092 bytes; crc32 field itself excluded.
+    // CRC over bytes 0..4091; crc32 is the last field at 4092 (excluded).
     s.crc32 = 0;
     std::span<const std::byte> bytes(
         reinterpret_cast<const std::byte *>(&s), VITRIOL_STORE_BLK - 4);
@@ -103,23 +105,18 @@ std::expected<store *, store_error> store_open(const char * path, int flags)
         return std::unexpected(store_error::io_error);
     }
     if (!super_valid(s0) && !super_valid(s1)) {
-        fprintf(stderr, "store_open: magic0=%08x ver0=%u crc0=%08x calc0=%08x | magic1=%08x ver1=%u crc1=%08x calc1=%08x\n",
-            s0.magic, s0.version, s0.crc32,
-            store_crc32(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&s0), VITRIOL_STORE_BLK-4)),
-            s1.magic, s1.version, s1.crc32,
-            store_crc32(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&s1), VITRIOL_STORE_BLK-4)));
         return std::unexpected(store_error::not_a_store);
     }
-    // Prefer the valid copy; if both valid, primary wins.
     st->super = super_valid(s0) ? s0 : s1;
 
-    // Load index zone.
-    const uint64_t index_bytes =
-        static_cast<uint64_t>(st->super.expert_count) * sizeof(store_slot_desc);
-    if (index_bytes > 0) {
-        auto idx = std::make_unique<store_slot_desc[]>(st->super.expert_count);
+    // Load index zone: dense store_tensor_desc array + CRC trailer.
+    const uint32_t n_tensors = st->super.expert_count;  // field reused as tensor count
+    st->n_tensors = n_tensors;
+    if (n_tensors > 0) {
+        auto idx = std::make_unique<store_tensor_desc[]>(n_tensors);
         const std::byte * ip = reinterpret_cast<const std::byte *>(idx.get());
-        const uint64_t index_crc_base = index_bytes;
+        const uint64_t index_bytes =
+            static_cast<uint64_t>(n_tensors) * sizeof(store_tensor_desc);
         uint64_t stored_crc = 0;
         if (pread(fd, const_cast<std::byte *>(ip), index_bytes,
                   static_cast<off_t>(STORE_INDEX_BASE)) !=
@@ -129,7 +126,7 @@ std::expected<store *, store_error> store_open(const char * path, int flags)
                 static_cast<ssize_t>(sizeof(stored_crc))) {
             return std::unexpected(store_error::io_error);
         }
-        std::span<const std::byte> idx_bytes(ip, index_crc_base);
+        std::span<const std::byte> idx_bytes(ip, index_bytes);
         if (store_crc32(idx_bytes) != stored_crc) {
             return std::unexpected(store_error::index_corrupt);
         }
@@ -160,15 +157,25 @@ uint64_t store_embed_bytes(const store * st) {
     return st->super.embed_bytes;
 }
 
-uint64_t store_slot_offset(const store * st, uint32_t slot)
-    pre(st != nullptr)
-    pre(slot < st->super.expert_count) {
-    return st->super.expert_base + static_cast<uint64_t>(slot) * st->super.expert_stride;
+uint32_t store_tensor_count(const store * st) {
+    return st->n_tensors;
 }
 
-ssize_t store_read_slot(store * st, uint32_t slot, void * dst) {
-    const uint64_t off = store_slot_offset(st, slot);
-    const size_t len = static_cast<size_t>(st->super.expert_stride);
+const store_tensor_desc & store_tensor_desc_at(const store * st, uint32_t tid) {
+    return st->index[tid];
+}
+
+uint64_t store_expert_offset(const store * st, uint32_t tid, uint32_t expert_idx)
+    pre(st != nullptr)
+    pre(tid < st->n_tensors)
+    pre(expert_idx < st->index[tid].n_experts) {
+    return st->index[tid].store_offset +
+        static_cast<uint64_t>(expert_idx) * st->index[tid].slice_bytes;
+}
+
+ssize_t store_read_expert(store * st, uint32_t tid, uint32_t expert_idx, void * dst) {
+    const uint64_t off = store_expert_offset(st, tid, expert_idx);
+    const size_t len = st->index[tid].slice_bytes;
     return pread(st->fd, dst, len, static_cast<off_t>(off));
 }
 
@@ -180,23 +187,23 @@ ssize_t store_read_embed(store * st, uint64_t offset, std::span<std::byte> dst) 
                  static_cast<off_t>(st->super.embed_base + offset));
 }
 
-int store_read_slot_async(store * st, uint32_t slot, void * dst) {
+int store_read_expert_async(store * st, uint32_t tid, uint32_t expert_idx, void * dst) {
     if (!st->uring_ok) {
-        // pread fallback: synchronous read.
-        return store_read_slot(st, slot, dst) < 0 ? -1 : 0;
+        return store_read_expert(st, tid, expert_idx, dst) < 0 ? -1 : 0;
     }
-    st->async_slot = slot;
+    st->async_tid = tid;
+    st->async_expert = expert_idx;
     struct io_uring_sqe * sqe = io_uring_get_sqe(&st->ring);
     if (!sqe) {
         return -1;
     }
-    const uint64_t off = store_slot_offset(st, slot);
-    io_uring_prep_read(sqe, st->fd, dst, st->super.expert_stride, off);
+    const uint64_t off = store_expert_offset(st, tid, expert_idx);
+    io_uring_prep_read(sqe, st->fd, dst, st->index[tid].slice_bytes, off);
     io_uring_submit(&st->ring);
     return 0;
 }
 
-ssize_t store_read_slot_wait(store * st) {
+ssize_t store_read_expert_wait(store * st) {
     if (!st->uring_ok) {
         return -1;
     }
@@ -206,17 +213,12 @@ ssize_t store_read_slot_wait(store * st) {
     }
     const int res = cqe->res;
     io_uring_cqe_seen(&st->ring, cqe);
-    if (res < 0) {
-        return -1;
-    }
-    // Copy from registered fixed buffer into caller-provided location is done
-    // by the caller using store's async buffer. This API copies out.
-    return res;
+    return res < 0 ? -1 : res;
 }
 
 std::expected<void, store_error> store_mkfs(
     const char * path,
-    uint32_t expert_count,
+    std::span<const store_tensor_desc> tensors,
     uint64_t embed_bytes,
     uint64_t kv_bytes)
     pre(path != nullptr) {
@@ -228,15 +230,19 @@ std::expected<void, store_error> store_mkfs(
     store_super s{};
     s.magic = VITRIOL_STORE_MAGIC;
     s.version = VITRIOL_STORE_VERSION;
-    s.expert_count = expert_count;
-    s.expert_stride = VITRIOL_STORE_SLOT;
+    s.expert_count = static_cast<uint32_t>(tensors.size());
+    s.expert_stride = VITRIOL_STORE_SLOT;  // alignment unit; real stride per-tensor
     s.expert_base = STORE_INDEX_BASE +
-        static_cast<uint64_t>(expert_count) * sizeof(store_slot_desc) +
+        static_cast<uint64_t>(tensors.size()) * sizeof(store_tensor_desc) +
         sizeof(uint64_t);  // + index CRC trailer
-    // align expert zone to 1 MiB
     s.expert_base = (s.expert_base + (1024*1024 - 1)) & ~(uint64_t)(1024*1024 - 1);
-    s.embed_base = s.expert_base +
-        static_cast<uint64_t>(expert_count) * s.expert_stride;
+
+    // Compute expert zone total = sum of tensor bytes (exact, no padding).
+    uint64_t expert_bytes = 0;
+    for (const auto & t : tensors) {
+        expert_bytes += static_cast<uint64_t>(t.n_experts) * t.slice_bytes;
+    }
+    s.embed_base = s.expert_base + expert_bytes;
     s.embed_bytes = embed_bytes;
     if (kv_bytes > 0) {
         s.kv_base = s.embed_base + embed_bytes;
@@ -250,7 +256,6 @@ std::expected<void, store_error> store_mkfs(
     }
 
     // Preallocate: extend file to full length so later pwrite/read is O(1).
-    // kv_ring_bytes=0 means no KV zone; total = end of embed zone.
     const uint64_t total = s.kv_ring_bytes > 0
         ? (s.kv_base + s.kv_ring_bytes)
         : (s.embed_base + s.embed_bytes);
@@ -259,24 +264,26 @@ std::expected<void, store_error> store_mkfs(
         return std::unexpected(store_error::io_error);
     }
 
-    // Write a valid (empty) index: count=0 means "mkfs, no slots yet" is
-    // handled by caller via store_write_slot. We write an index CRC trailer.
-    uint64_t idx_crc = 0;  // empty index -> CRC of zero bytes = 0
-    if (expert_count > 0) {
-        std::unique_ptr<store_slot_desc[]> idx(new store_slot_desc[expert_count]());
-        const uint64_t idx_bytes =
-            static_cast<uint64_t>(expert_count) * sizeof(store_slot_desc);
-        const std::byte * ip = reinterpret_cast<const std::byte *>(idx.get());
-        if (pwrite(fd, ip, idx_bytes, static_cast<off_t>(STORE_INDEX_BASE)) !=
-                static_cast<ssize_t>(idx_bytes)) {
-            close(fd);
-            return std::unexpected(store_error::io_error);
-        }
-        idx_crc = store_crc32(std::span<const std::byte>(ip, idx_bytes));
+    // Write index zone: tensors with store_offset assigned sequentially.
+    std::unique_ptr<store_tensor_desc[]> idx(new store_tensor_desc[tensors.size()]);
+    uint64_t off = s.expert_base;
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        idx[i] = tensors[i];
+        idx[i].store_offset = off;
+        off += static_cast<uint64_t>(tensors[i].n_experts) * tensors[i].slice_bytes;
     }
+    const uint64_t index_bytes =
+        static_cast<uint64_t>(tensors.size()) * sizeof(store_tensor_desc);
+    const std::byte * ip = reinterpret_cast<const std::byte *>(idx.get());
+    if (pwrite(fd, ip, index_bytes, static_cast<off_t>(STORE_INDEX_BASE)) !=
+            static_cast<ssize_t>(index_bytes)) {
+        close(fd);
+        return std::unexpected(store_error::io_error);
+    }
+    const uint64_t idx_crc = store_crc32(
+        std::span<const std::byte>(ip, index_bytes));
     if (pwrite(fd, &idx_crc, sizeof(idx_crc),
-               static_cast<off_t>(STORE_INDEX_BASE +
-                   static_cast<uint64_t>(expert_count) * sizeof(store_slot_desc))) !=
+               static_cast<off_t>(STORE_INDEX_BASE + index_bytes)) !=
         static_cast<ssize_t>(sizeof(idx_crc))) {
         close(fd);
         return std::unexpected(store_error::io_error);
@@ -286,10 +293,10 @@ std::expected<void, store_error> store_mkfs(
     return {};
 }
 
-ssize_t store_write_slot(store * st, uint32_t slot, const void * src) {
-    const uint64_t off = store_slot_offset(st, slot);
-    return pwrite(st->fd, src, static_cast<size_t>(st->super.expert_stride),
-                  static_cast<off_t>(off));
+ssize_t store_write_expert_tensor(store * st, uint32_t tid, const void * src) {
+    const store_tensor_desc & t = st->index[tid];
+    const uint64_t bytes = static_cast<uint64_t>(t.n_experts) * t.slice_bytes;
+    return pwrite(st->fd, src, bytes, static_cast<off_t>(t.store_offset));
 }
 
 ssize_t store_write_embed(store * st, uint64_t offset, std::span<const std::byte> src) {
