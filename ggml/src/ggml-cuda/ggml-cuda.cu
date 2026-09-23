@@ -5438,6 +5438,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
+    // VITRIOL: host-streamed expert buffers only serve MUL_MAT_ID. Any other
+    // op on a VITRIOL buffer would read host pointers as device pointers.
+    // Reject so weight selection falls through to the next buffer type.
+    if (op->op != GGML_OP_MUL_MAT_ID && op->src[0] && op->src[0]->buffer) {
+        extern bool vitriol_is_vitriol_buffer_type(ggml_backend_buffer_type_t);
+        if (vitriol_is_vitriol_buffer_type(op->src[0]->buffer->buft)) {
+            return false;
+        }
+    }
+
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
@@ -6067,6 +6077,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    // VITRIOL: expose extra buffer types so the model loader discovers the
+    // VITRIOL host buft and routes expert (MUL_MAT_ID) weights into it.
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        extern ggml_backend_buffer_type_t * vitriol_cuda_get_extra_bufts(ggml_backend_dev_t);
+        return (void *)vitriol_cuda_get_extra_bufts;
     }
     return nullptr;
 }

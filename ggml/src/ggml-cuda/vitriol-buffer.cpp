@@ -46,7 +46,7 @@ bool vitriol_is_vitriol_buffer_type(ggml_backend_buffer_type_t buft) {
      * within our known range by matching the name string. Since get_name
      * now points to CUDA host's function, we check the context name. */
     auto * ctx = (vitriol_buffer_type_context *)buft->context;
-    return ctx->name == "VITRIOL";
+    return ctx->name == "VITRIOL" || ctx->name == "VITRIOL_LAZY";
 }
 
 /* VITRIOL buffer context */
@@ -432,4 +432,29 @@ ggml_backend_buffer_type_t vitriol_get_buffer_type_lazy(int device) {
     if (device >= ggml_backend_cuda_get_device_count())
         return nullptr;
     return &types[device];
+}
+
+/* ── Extra buffer types (model loader discovery) ───────────────────
+ * Null-terminated per-device array returned via
+ * ggml_backend_dev_get_extra_bufts so make_cpu_buft_list discovers the
+ * VITRIOL buft and routes expert (MUL_MAT_ID) weights into host-pinned
+ * buffers instead of normal CUDA VRAM. Mirrors the SYCL fix (5fb6a67a9).
+ * ──────────────────────────────────────────────────────────────────*/
+ggml_backend_buffer_type_t * vitriol_cuda_get_extra_bufts(ggml_backend_dev_t dev) {
+    if (g_vitriol_config.mode != VITRIOL_MODE_STREAM) return nullptr;
+    GGML_UNUSED(dev);
+
+    static ggml_backend_buffer_type_t extra_bufts[GGML_CUDA_MAX_DEVICES + 1];
+    static bool extra_initialized = false;
+    if (!extra_initialized) {
+        const int n_devs = ggml_backend_cuda_get_device_count();
+        for (int i = 0; i < n_devs && i < GGML_CUDA_MAX_DEVICES; i++) {
+            extra_bufts[i] = g_vitriol_config.max_locked_mb > 0
+                ? vitriol_get_buffer_type_lazy(i)
+                : vitriol_get_buffer_type(i);
+        }
+        extra_bufts[n_devs] = nullptr;
+        extra_initialized = true;
+    }
+    return extra_bufts;
 }
