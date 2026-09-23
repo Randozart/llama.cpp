@@ -447,9 +447,9 @@ static uint32_t store_tid_for(const void * tensor_base) {
 }
 
 /* Set the global store handle (from vitriol_buffer_type_alloc_buffer). */
-void vitriol_store_set_handle(vitriol::store * st) {
+void vitriol_store_set_handle(void * st) {
     std::lock_guard<std::mutex> lock(g_store_mtx);
-    g_store_handle = st;
+    g_store_handle = static_cast<vitriol::store *>(st);
 }
 
 /* ── Locked-Slice LRU (Lazy/Chunked Page Locking) ──────────────
@@ -474,7 +474,10 @@ static uint64_t                 g_locked_bytes    = 0;
 static uint64_t                 g_locked_epoch    = 1;
 
 void vitriol_ensure_expert_locked(const void * tensor_base, int expert_idx, size_t expert_size) {
-    if (!vitriol_lazy_lock_active()) return;
+    /* Store-backed fill runs regardless of lazy-lock budget (the slice must be
+     * populated before decode either way); the mlock/register part below is
+     * budget-gated. */
+    if (!vitriol_lazy_lock_active() && !g_vitriol_config.store_backed) return;
     if (expert_size == 0) return;
 
     std::lock_guard<std::mutex> lock(g_locked_mtx);

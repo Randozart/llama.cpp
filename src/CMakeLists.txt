@@ -7,6 +7,13 @@ llama_add_compile_flags()
 # llama
 
 file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
+# VITRIOL: orphaned MTP arch experiments (untracked, unregistered in
+# llama-arch.cpp/llama-model.h) break the build. Exclude until the MTP
+# arch work re-registers them.
+list(REMOVE_ITEM LLAMA_MODELS_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/gemma4_mtp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/qwen35-mtp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/qwen35moe-mtp.cpp)
 
 add_library(llama
             ../include/llama.h
