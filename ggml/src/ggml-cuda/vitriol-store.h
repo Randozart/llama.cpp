@@ -65,12 +65,16 @@ struct store;
 struct store_impl;
 
 // Persistent per-expert-tensor descriptor (index zone). Dense array [0, n_tensors).
-// Experts within a tensor are contiguous at slice_bytes stride.
+// Each expert occupies a PADDED slot (stride = align_up_512(slice_bytes)) so
+// every store offset is 512-aligned (O_DIRECT requires it on block devices).
+// data_bytes = real on-disk bytes; slice_bytes = padded slot size (512-mult).
 struct store_tensor_desc {
     uint32_t layer;         // layer index
     uint32_t kind;          // 0=ffn_up, 1=ffn_gate, 2=ffn_down, 3=shexp
     uint32_t n_experts;     // 512 routed (or 1 shared expert)
-    uint32_t slice_bytes;   // per-expert on-disk bytes (IQ-quantized, exact)
+    uint32_t slice_bytes;   // padded per-expert slot (align_up_512(data_bytes))
+    uint32_t data_bytes;    // real per-expert on-disk bytes
+    uint32_t _pad0;
     uint64_t store_offset;  // byte offset of this tensor in the EXPERT zone
 };
 

@@ -113,7 +113,8 @@ int main(int argc, char ** argv) {
                 t.layer = (uint32_t)layer;
                 t.kind = (uint32_t)kind;
                 t.n_experts = (uint32_t)n_experts;
-                t.slice_bytes = (uint32_t)(size / n_experts);
+                t.data_bytes = (uint32_t)(size / n_experts);
+                t.slice_bytes = (uint32_t)((size / n_experts + 511) & ~(uint64_t)511);
                 tensors.push_back(t);
             } else if (strstr(name, "per_layer_token_embd.weight")) {
                 embed_bytes = size;
@@ -151,34 +152,40 @@ int main(int argc, char ** argv) {
         for (const auto & t : shard_tensors[si]) {
             const int kind = expert_kind(t.name.c_str());
             if (kind >= 0) {
-                store_tensor_desc & desc = tensors[tidx];
-                const size_t bytes = (size_t)desc.n_experts * desc.slice_bytes;
-                std::vector<char> buf(bytes);
-                ssize_t r = pread(fd, buf.data(), bytes, (off_t)t.data_off);
-                if (r != (ssize_t)bytes) {
+                const store_tensor_desc & desc = tensors[tidx];
+                // source holds n_experts * data_bytes (real, contiguous)
+                const size_t real = (size_t)desc.n_experts * desc.data_bytes;
+                std::vector<char> buf(real);
+                ssize_t r = pread(fd, buf.data(), real, (off_t)t.data_off);
+                if (r != (ssize_t)real) {
                     fprintf(stderr, "mkfs: read %s failed (%zd): %s\n", t.name.c_str(), r, strerror(errno));
                     return 1;
                 }
                 ssize_t w = store_write_expert_tensor(st, tidx, buf.data());
-                if (w != (ssize_t)bytes) {
+                if (w != (ssize_t)real) {
                     fprintf(stderr, "mkfs: write %s failed (%zd)\n", t.name.c_str(), w);
                     return 1;
                 }
                 if (tidx % 16 == 0 || tidx + 1 == tensors.size()) {
-                    printf("  expert %zu/%zu: %s (%zu B)\n", tidx + 1, tensors.size(), t.name.c_str(), bytes);
+                    printf("  expert %zu/%zu: %s (%zu B real, %u B slot)\n",
+                           tidx + 1, tensors.size(), t.name.c_str(), real, desc.slice_bytes);
                 }
                 ++tidx;
             } else if (strstr(t.name.c_str(), "per_layer_token_embd.weight")) {
-                // stream embed in 16 MiB chunks
-                std::vector<char> buf(16 * 1024 * 1024);
+                // stream embed in 16 MiB chunks, last chunk padded to 512.
+                const size_t CHUNK = 16 * 1024 * 1024;
+                std::vector<char> buf(CHUNK);
                 uint64_t copied = 0;
                 while (copied < embed_bytes) {
-                    const size_t chunk = std::min(buf.size(), embed_bytes - copied);
+                    const size_t remaining = embed_bytes - copied;
+                    const size_t chunk = std::min(CHUNK, remaining);
+                    const size_t padded = (chunk + 511) & ~(size_t)511;
                     ssize_t r = pread(fd, buf.data(), chunk, (off_t)(t.data_off + copied));
                     if (r != (ssize_t)chunk) { fprintf(stderr, "mkfs: embed read failed\n"); return 1; }
+                    if (padded > chunk) std::memset(buf.data() + chunk, 0, padded - chunk);
                     ssize_t w = store_write_embed(st, copied,
-                        std::span<const std::byte>((const std::byte *)buf.data(), chunk));
-                    if (w != (ssize_t)chunk) { fprintf(stderr, "mkfs: embed write failed\n"); return 1; }
+                        std::span<const std::byte>((const std::byte *)buf.data(), padded));
+                    if (w != (ssize_t)padded) { fprintf(stderr, "mkfs: embed write failed (%zd)\n", w); return 1; }
                     copied += chunk;
                 }
                 printf("  embed copied %llu bytes\n", (unsigned long long)copied);

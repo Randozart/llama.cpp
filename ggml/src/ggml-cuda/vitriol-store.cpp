@@ -36,11 +36,34 @@ uint32_t store_crc32(std::span<const std::byte> data) {
     return ~crc;
 }
 
+// 4096-aligned buffer (O_DIRECT requires 512B alignment on block devices).
+// Also round the I/O length up to 512 so every pwrite/pread length is a
+// 512-multiple (O_DIRECT rejects partial sectors).
+static uint64_t align_up_512(uint64_t n) {
+    return (n + 511) & ~(uint64_t)511;
+}
+
+template <typename T>
+struct aligned_deleter {
+    void operator()(T * p) const { std::free(p); }
+};
+
+template <typename T>
+using aligned_ptr = std::unique_ptr<T, aligned_deleter<T>>;
+
+template <typename T>
+aligned_ptr<T> aligned_new(size_t count) {
+    void * p = std::aligned_alloc(4096, count * sizeof(T));
+    if (!p) return nullptr;
+    std::memset(p, 0, count * sizeof(T));
+    return aligned_ptr<T>(static_cast<T *>(p));
+}
+
 struct store {
     int fd = -1;
     uint32_t flags = 0;
     store_super super{};
-    std::unique_ptr<store_tensor_desc[]> index;
+    aligned_ptr<store_tensor_desc> index;
     uint32_t n_tensors = 0;
 
     // io_uring state
@@ -99,9 +122,16 @@ std::expected<store *, store_error> store_open(const char * path, int flags)
     st->fd = fd;
     st->flags = flags;
 
-    store_super s0, s1;
-    if (pread(fd, &s0, VITRIOL_STORE_BLK, 0) != VITRIOL_STORE_BLK ||
-        pread(fd, &s1, VITRIOL_STORE_BLK, VITRIOL_STORE_BLK) != VITRIOL_STORE_BLK) {
+    // super blocks: read into 4096-aligned buffers (O_DIRECT requires it).
+    auto sb0 = aligned_new<store_super>(1);
+    auto sb1 = aligned_new<store_super>(1);
+    if (!sb0 || !sb1) {
+        return std::unexpected(store_error::io_error);
+    }
+    const store_super & s0 = *sb0;
+    const store_super & s1 = *sb1;
+    if (pread(fd, sb0.get(), VITRIOL_STORE_BLK, 0) != VITRIOL_STORE_BLK ||
+        pread(fd, sb1.get(), VITRIOL_STORE_BLK, VITRIOL_STORE_BLK) != VITRIOL_STORE_BLK) {
         return std::unexpected(store_error::io_error);
     }
     if (!super_valid(s0) && !super_valid(s1)) {
@@ -113,23 +143,30 @@ std::expected<store *, store_error> store_open(const char * path, int flags)
     const uint32_t n_tensors = st->super.expert_count;  // field reused as tensor count
     st->n_tensors = n_tensors;
     if (n_tensors > 0) {
-        auto idx = std::make_unique<store_tensor_desc[]>(n_tensors);
-        const std::byte * ip = reinterpret_cast<const std::byte *>(idx.get());
-        const uint64_t index_bytes =
-            static_cast<uint64_t>(n_tensors) * sizeof(store_tensor_desc);
-        uint64_t stored_crc = 0;
-        if (pread(fd, const_cast<std::byte *>(ip), index_bytes,
-                  static_cast<off_t>(STORE_INDEX_BASE)) !=
-                static_cast<ssize_t>(index_bytes) ||
-            pread(fd, &stored_crc, sizeof(stored_crc),
-                  static_cast<off_t>(STORE_INDEX_BASE + index_bytes)) !=
-                static_cast<ssize_t>(sizeof(stored_crc))) {
+        auto idx = aligned_new<store_tensor_desc>(n_tensors);
+        if (!idx) {
             return std::unexpected(store_error::io_error);
         }
+        const uint64_t index_bytes =
+            static_cast<uint64_t>(n_tensors) * sizeof(store_tensor_desc);
+        const uint64_t zone_bytes = align_up_512(index_bytes + sizeof(uint64_t));
+        auto zone = aligned_new<std::byte>(zone_bytes);
+        if (!zone) {
+            return std::unexpected(store_error::io_error);
+        }
+        if (pread(fd, zone.get(), zone_bytes,
+                  static_cast<off_t>(STORE_INDEX_BASE)) !=
+                static_cast<ssize_t>(zone_bytes)) {
+            return std::unexpected(store_error::io_error);
+        }
+        const std::byte * ip = zone.get();
         std::span<const std::byte> idx_bytes(ip, index_bytes);
+        uint64_t stored_crc = 0;
+        std::memcpy(&stored_crc, ip + index_bytes, sizeof(stored_crc));
         if (store_crc32(idx_bytes) != stored_crc) {
             return std::unexpected(store_error::index_corrupt);
         }
+        std::memcpy(idx.get(), ip, index_bytes);
         st->index = std::move(idx);
     }
 
@@ -162,17 +199,18 @@ uint32_t store_tensor_count(const store * st) {
 }
 
 const store_tensor_desc & store_tensor_desc_at(const store * st, uint32_t tid) {
-    return st->index[tid];
+    return st->index.get()[tid];
 }
 
 uint64_t store_expert_offset(const store * st, uint32_t tid, uint32_t expert_idx) {
-    return st->index[tid].store_offset +
-        static_cast<uint64_t>(expert_idx) * st->index[tid].slice_bytes;
+    // Padded stride (512-multiple) keeps every offset O_DIRECT-aligned.
+    return st->index.get()[tid].store_offset +
+        static_cast<uint64_t>(expert_idx) * st->index.get()[tid].slice_bytes;
 }
 
 ssize_t store_read_expert(store * st, uint32_t tid, uint32_t expert_idx, void * dst) {
     const uint64_t off = store_expert_offset(st, tid, expert_idx);
-    const size_t len = st->index[tid].slice_bytes;
+    const size_t len = st->index.get()[tid].slice_bytes;  // padded, 512-multiple
     return pread(st->fd, dst, len, static_cast<off_t>(off));
 }
 
@@ -195,7 +233,7 @@ int store_read_expert_async(store * st, uint32_t tid, uint32_t expert_idx, void 
         return -1;
     }
     const uint64_t off = store_expert_offset(st, tid, expert_idx);
-    io_uring_prep_read(sqe, st->fd, dst, st->index[tid].slice_bytes, off);
+    io_uring_prep_read(sqe, st->fd, dst, st->index.get()[tid].slice_bytes, off);
     io_uring_submit(&st->ring);
     return 0;
 }
@@ -266,26 +304,34 @@ std::expected<void, store_error> store_mkfs(
     }
 
     // Write index zone: tensors with store_offset assigned sequentially.
-    std::unique_ptr<store_tensor_desc[]> idx(new store_tensor_desc[tensors.size()]);
+    auto idx = aligned_new<store_tensor_desc>(tensors.size());
+    if (!idx) {
+        close(fd);
+        return std::unexpected(store_error::io_error);
+    }
     uint64_t off = s.expert_base;
     for (size_t i = 0; i < tensors.size(); ++i) {
-        idx[i] = tensors[i];
-        idx[i].store_offset = off;
+        idx.get()[i] = tensors[i];
+        idx.get()[i].store_offset = off;
         off += static_cast<uint64_t>(tensors[i].n_experts) * tensors[i].slice_bytes;
     }
     const uint64_t index_bytes =
         static_cast<uint64_t>(tensors.size()) * sizeof(store_tensor_desc);
-    const std::byte * ip = reinterpret_cast<const std::byte *>(idx.get());
-    if (pwrite(fd, ip, index_bytes, static_cast<off_t>(STORE_INDEX_BASE)) !=
-            static_cast<ssize_t>(index_bytes)) {
+    const uint64_t zone_bytes = align_up_512(index_bytes + sizeof(uint64_t));
+    // one aligned block: [index data][crc64]; length rounded to 512.
+    auto zone = aligned_new<std::byte>(zone_bytes);
+    if (!zone) {
         close(fd);
         return std::unexpected(store_error::io_error);
     }
+    std::byte * zp = zone.get();
+    std::memcpy(zp, idx.get(), index_bytes);
     const uint64_t idx_crc = store_crc32(
-        std::span<const std::byte>(ip, index_bytes));
-    if (pwrite(fd, &idx_crc, sizeof(idx_crc),
-               static_cast<off_t>(STORE_INDEX_BASE + index_bytes)) !=
-        static_cast<ssize_t>(sizeof(idx_crc))) {
+        std::span<const std::byte>(
+            reinterpret_cast<const std::byte *>(idx.get()), index_bytes));
+    std::memcpy(zp + index_bytes, &idx_crc, sizeof(idx_crc));
+    if (pwrite(fd, zp, zone_bytes, static_cast<off_t>(STORE_INDEX_BASE)) !=
+            static_cast<ssize_t>(zone_bytes)) {
         close(fd);
         return std::unexpected(store_error::io_error);
     }
@@ -295,9 +341,25 @@ std::expected<void, store_error> store_mkfs(
 }
 
 ssize_t store_write_expert_tensor(store * st, uint32_t tid, const void * src) {
-    const store_tensor_desc & t = st->index[tid];
-    const uint64_t bytes = static_cast<uint64_t>(t.n_experts) * t.slice_bytes;
-    return pwrite(st->fd, src, bytes, static_cast<off_t>(t.store_offset));
+    const store_tensor_desc & t = st->index.get()[tid];
+    const uint8_t * s = static_cast<const uint8_t *>(src);
+    // Source holds n_experts * data_bytes (contiguous, real). Store layout is
+    // n_experts padded slots (slice_bytes each). Copy real data + zero pad.
+    auto slot = aligned_new<std::byte>(t.slice_bytes);
+    if (!slot) {
+        return -1;
+    }
+    for (uint32_t e = 0; e < t.n_experts; ++e) {
+        std::memset(slot.get(), 0, t.slice_bytes);
+        std::memcpy(slot.get(), s + (size_t)e * t.data_bytes, t.data_bytes);
+        const uint64_t off = t.store_offset +
+            static_cast<uint64_t>(e) * t.slice_bytes;
+        if (pwrite(st->fd, slot.get(), t.slice_bytes, static_cast<off_t>(off)) !=
+            static_cast<ssize_t>(t.slice_bytes)) {
+            return -1;
+        }
+    }
+    return static_cast<ssize_t>((uint64_t)t.n_experts * t.data_bytes);
 }
 
 ssize_t store_write_embed(store * st, uint64_t offset, std::span<const std::byte> src) {
