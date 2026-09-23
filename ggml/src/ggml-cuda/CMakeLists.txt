@@ -103,6 +103,13 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu" "*.cpp")
+    # VITRIOL: exclude standalone g++ harnesses (they carry main()) from the
+    # library GLOB - duplicate-symbol link collision with any consumer.
+    list(REMOVE_ITEM GGML_SOURCES_CUDA
+        ${CMAKE_CURRENT_SOURCE_DIR}/vitriol_ce_d2b.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vitriol_ce_spike.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vitriol-store-test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vitriol_copy_engine.cpp)
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -262,6 +269,24 @@ if (CUDAToolkit_FOUND)
     endif()
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+
+    # VITRIOL: host-side store is C++26 with contracts (see
+    # docs/cpp26-conventions.md). Per-file standard bump - rest of fork stays
+    # C++17 (nvcc-parsed). -fcontracts + ignore semantic = zero runtime cost.
+    set(VITRIOL_CXX26_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/vitriol-store.cpp
+    )
+    set_source_files_properties(${VITRIOL_CXX26_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-std=c++26;-fcontracts;-fcontract-evaluation-semantic=ignore"
+    )
+    # io_uring async path (optional: store falls back to pread if absent).
+    find_library(VITRIOL_URING_LIB NAMES uring)
+    if (VITRIOL_URING_LIB)
+        target_link_libraries(ggml-cuda PRIVATE ${VITRIOL_URING_LIB})
+        message(STATUS "VITRIOL store: liburing found - io_uring async path enabled")
+    else()
+        message(STATUS "VITRIOL store: liburing not found - pread fallback")
+    endif()
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()
