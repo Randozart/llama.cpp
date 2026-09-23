@@ -452,6 +452,17 @@ void vitriol_store_set_handle(void * st) {
     g_store_handle = static_cast<vitriol::store *>(st);
 }
 
+/* Loader hook: return true to SKIP the GGUF read_raw for a host-buffer
+ * tensor in store-backed mode, and register the tensor's data addr ->
+ * store tid by name so the LRU can fill it from the store on demand. */
+bool vitriol_skip_host_read(struct ggml_tensor * cur) {
+    if (!g_vitriol_config.store_backed) return false;
+    if (!cur || !cur->name || !cur->data) return false;
+    if (store_kind_from_name(cur->name) < 0) return false;  // not an expert
+    vitriol_store_register_tensor((const void *)cur->data, cur->name);
+    return true;
+}
+
 /* ── Locked-Slice LRU (Lazy/Chunked Page Locking) ──────────────
  * Tracks which (tensor_base, expert_idx) pairs are currently
  * page-locked via mlock + cudaHostRegister. Keeps total locked

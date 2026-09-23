@@ -1684,12 +1684,19 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
-                if (check_tensors) {
-                    validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
-                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
-                    }));
+                // VITRIOL: store-backed expert tensors are filled on demand
+                // from the raw-zone store (vitriol_ensure_expert_locked ->
+                // store_read_expert). Skip the GGUF read so the buffer stays
+                // empty for the store to populate (avoids the 84G mmap/read).
+                extern bool vitriol_skip_host_read(struct ggml_tensor * cur);
+                if (!vitriol_skip_host_read(cur)) {
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(cur->data, n_size);
+                    if (check_tensors) {
+                        validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
+                            return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                        }));
+                    }
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
