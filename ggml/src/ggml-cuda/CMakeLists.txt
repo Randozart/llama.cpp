@@ -287,6 +287,28 @@ if (CUDAToolkit_FOUND)
     else()
         message(STATUS "VITRIOL store: liburing not found - pread fallback")
     endif()
+
+    # VITRIOL store mkfs tool - standalone host binary (GGUF -> store).
+    # Not part of the library GLOB; built only when GGML_VITRIOL_MKFS=ON.
+    option(GGML_VITRIOL_MKFS "Build the vitriol-store-mkfs tool" OFF)
+    if (GGML_VITRIOL_MKFS)
+        add_executable(vitriol-store-mkfs
+            ${CMAKE_CURRENT_SOURCE_DIR}/vitriol-store-mkfs.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/vitriol-store.cpp
+        )
+        set_source_files_properties(
+            ${CMAKE_CURRENT_SOURCE_DIR}/vitriol-store-mkfs.cpp
+            PROPERTIES COMPILE_OPTIONS "-std=c++26;-fcontracts;-fcontract-evaluation-semantic=ignore"
+        )
+        target_link_libraries(vitriol-store-mkfs PRIVATE ggml-base)
+        if (VITRIOL_URING_LIB)
+            target_link_libraries(vitriol-store-mkfs PRIVATE ${VITRIOL_URING_LIB})
+        endif()
+        target_include_directories(vitriol-store-mkfs PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/ggml/include
+        )
+    endif()
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()

@@ -91,6 +91,10 @@ uint32_t store_tensor_count(const store * st) pre(st != nullptr);
 const store_tensor_desc & store_tensor_desc_at(const store * st, uint32_t tid)
     pre(st != nullptr)
     pre(tid < store_tensor_count(st));
+uint64_t store_expert_offset(const store * st, uint32_t tid, uint32_t expert_idx)
+    pre(st != nullptr)
+    pre(tid < store_tensor_count(st))
+    pre(expert_idx < store_tensor_desc_at(st, tid).n_experts);
 
 // ---- hot read path (scalar returns, no expected) ---------------------------
 

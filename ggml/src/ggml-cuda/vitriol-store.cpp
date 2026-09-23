@@ -165,10 +165,7 @@ const store_tensor_desc & store_tensor_desc_at(const store * st, uint32_t tid) {
     return st->index[tid];
 }
 
-uint64_t store_expert_offset(const store * st, uint32_t tid, uint32_t expert_idx)
-    pre(st != nullptr)
-    pre(tid < st->n_tensors)
-    pre(expert_idx < st->index[tid].n_experts) {
+uint64_t store_expert_offset(const store * st, uint32_t tid, uint32_t expert_idx) {
     return st->index[tid].store_offset +
         static_cast<uint64_t>(expert_idx) * st->index[tid].slice_bytes;
 }
