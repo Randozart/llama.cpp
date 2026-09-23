@@ -507,10 +507,11 @@ void vitriol_ensure_expert_locked(const void * tensor_base, int expert_idx, size
         const locked_slice & s = g_locked_slices[victim];
         const void * addr = (const char *)s.tensor_base + (ptrdiff_t)s.expert_idx * (ptrdiff_t)s.size;
 
-        cudaError_t err = cudaHostUnregister((void *)addr);
-        if (err != cudaSuccess && g_vitriol_config.verbose) {
-            fprintf(stderr, "VITRIOL: cudaHostUnregister evict failed: %s\n", cudaGetErrorString(err));
-        }
+        // Keep the cudaHostRegister on evict - it only pins the page for DMA
+        // and has no cost beyond that (pinned allocs bypass RLIMIT_MEMLOCK per
+        // AGENTS.md). Unregistering while the decode stream may still reference
+        // the page makes subsequent DMA fail with "pointer does not correspond
+        // to a registered memory region". munlock alone frees the RLIMIT budget.
         munlock(addr, s.size);
 
         g_locked_bytes -= s.size;
@@ -942,6 +943,9 @@ static bool lru_init_pool(size_t min_expert_size, int device) {
     int    needed_slots = (int)(pool_size / needed_slot);
     if (needed_slots > VITRIOL_LRU_MAX_SLOTS) needed_slots = VITRIOL_LRU_MAX_SLOTS;
     if (needed_slots < 1) needed_slots = 1;
+    if (getenv("VITRIOL_LRU_DBG"))
+        fprintf(stderr, "VITRIOL_LRU_DBG pool dev=%d min_expert=%zu slot=%zu slots=%d pool_mb=%zu\n",
+                device, min_expert_size, needed_slot, needed_slots, pool_size/1024/1024);
 
     /* Stream must exist before slots events are created, and both must be
      * bound to this device's context. */
