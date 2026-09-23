@@ -275,6 +275,8 @@ if (CUDAToolkit_FOUND)
     # C++17 (nvcc-parsed). -fcontracts + ignore semantic = zero runtime cost.
     set(VITRIOL_CXX26_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/vitriol-store.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vitriol-cuda-integration.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vitriol-buffer.cpp
     )
     set_source_files_properties(${VITRIOL_CXX26_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-std=c++26;-fcontracts;-fcontract-evaluation-semantic=ignore"

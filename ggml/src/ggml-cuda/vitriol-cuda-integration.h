@@ -41,6 +41,7 @@ typedef struct {
     bool verbose;
     bool benchmark;
     bool disk_offload;
+    bool store_backed;        // 0=mmap GGUF (default), 1=read experts from store
     bool output_cache;
     int  pin_first_n_layers;  // 0=off, N=pin first N model layers' expert tensors in VRAM
     int  pin_tensors_per_layer;  // auto-detected: number of tensor ops per model layer (default 2 for fused gate+up + down)
@@ -50,6 +51,13 @@ typedef struct {
 } vitriol_config_t;
 
 extern vitriol_config_t g_vitriol_config;
+
+/* Store backing path (host-only; null when VITRIOL_STORE unset). */
+const char * vitriol_store_path(void);
+
+/* Store-backed fill hooks (host-only; no-ops when store disabled). */
+void vitriol_store_register_tensor(const void * tensor_base, const char * name);
+void vitriol_store_set_handle(void * st);
 
 void vitriol_cuda_init(void);
 

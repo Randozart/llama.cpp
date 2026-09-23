@@ -15,6 +15,7 @@
 
 #include "vitriol-buffer.h"
 #include "vitriol-cuda-integration.h"
+#include "vitriol-store.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,6 +53,8 @@ bool vitriol_is_vitriol_buffer_type(ggml_backend_buffer_type_t buft) {
 struct vitriol_buffer_context {
     void * base;
     size_t size;
+    /* store backing (store_backed mode): handle for LRU-fill reads */
+    vitriol::store * store = nullptr;
 };
 
 /* ── Atexit cleanup guard ──────────────────────────────────────── */
@@ -101,6 +104,9 @@ static void vitriol_buffer_free(ggml_backend_buffer_t buffer) {
         munmap(ctx->base, ctx->size);
         fprintf(stderr, "VITRIOL: Memory locks released. Safe to shutdown.\n");
     }
+    if (ctx->store) {
+        vitriol::store_close(ctx->store);
+    }
     delete ctx;
 }
 
@@ -109,8 +115,21 @@ static void * vitriol_buffer_get_base(ggml_backend_buffer_t buffer) {
     return ctx->base;
 }
 
+static bool vitriol_name_is_expert(const char * name) {
+    return name && (strstr(name, "ffn_up_exps") || strstr(name, "ffn_gate_exps") ||
+                    strstr(name, "ffn_down_exps") || strstr(name, "shexp"));
+}
+
 static void vitriol_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(tensor);
+    if (g_vitriol_config.store_backed && vitriol_name_is_expert(tensor->name)) {
+        /* Store-backed expert tensor: do NOT copy from `data`. Expert bytes
+         * are filled on demand from the raw-zone store via
+         * vitriol_ensure_expert_locked -> store_read_expert. Register the
+         * tensor's base address so the LRU can resolve tid for the fill. */
+        vitriol_store_register_tensor((const void *)tensor->data, tensor->name);
+        return;
+    }
     memcpy((char *)tensor->data + offset, data, size);
     GGML_UNUSED(buffer);
 }
@@ -159,9 +178,57 @@ static bool vitriol_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
 
 static ggml_backend_buffer_t vitriol_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     bool disk_offload = g_vitriol_config.disk_offload;
+    bool store_backed = g_vitriol_config.store_backed;
     void * ptr = nullptr;
+    vitriol::store * store = nullptr;
 
-    if (disk_offload) {
+    if (store_backed) {
+        /* Store-backed: pinned host RAM filled from the raw-zone store on
+         * demand (vitriol_ensure_expert_locked reads via store_read_expert).
+         * The store handle is kept in the buffer context for those reads. */
+        const char * spath = vitriol_store_path();
+        if (!spath) {
+            fprintf(stderr, "VITRIOL: store_backed but no store path\n");
+            return nullptr;
+        }
+        auto o = vitriol::store_open(spath, O_RDONLY);
+        if (!o) {
+            fprintf(stderr, "VITRIOL: store_open(%s) failed: %d\n", spath, (int)o.error());
+            return nullptr;
+        }
+        store = *o;
+        vitriol_store_set_handle(store);
+        if (g_vitriol_config.verbose)
+            printf("VITRIOL: store-backed buffer (tensors=%u embed=%llu)\n",
+                   vitriol::store_tensor_count(store),
+                   (unsigned long long)vitriol::store_embed_bytes(store));
+        /* pinned host RAM, same as the stream-mode anon branch below */
+        ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        if (ptr == MAP_FAILED) {
+            fprintf(stderr, "VITRIOL: store mmap(%zu) failed: %m\n", size);
+            vitriol::store_close(store);
+            return nullptr;
+        }
+        {
+            volatile char * touch = (volatile char *)ptr;
+            for (size_t offset = 0; offset < size; offset += 4096) {
+                touch[offset] = 0;
+            }
+        }
+        madvise(ptr, size, MADV_HUGEPAGE);
+        if (mlock(ptr, size) != 0) {
+            fprintf(stderr, "VITRIOL: store mlock(%zu) failed: %m\n", size);
+        }
+        cudaError_t err = cudaHostRegister(ptr, size, 0);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "VITRIOL: store cudaHostRegister(%zu) failed: %s\n",
+                    size, cudaGetErrorString(err));
+            munmap(ptr, size);
+            vitriol::store_close(store);
+            return nullptr;
+        }
+    } else if (disk_offload) {
         const char * model_path = getenv("VITRIOL_MODEL_PATH");
         if (!model_path || !*model_path) {
             fprintf(stderr, "VITRIOL: disk offload requires VITRIOL_MODEL_PATH\n");
@@ -240,6 +307,7 @@ static ggml_backend_buffer_t vitriol_buffer_type_alloc_buffer(ggml_backend_buffe
     }
 
     auto * ctx = new vitriol_buffer_context{ptr, size};
+    ctx->store = store;
 
     /* Register atexit cleanup guard (first allocation only) */
     {

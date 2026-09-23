@@ -12,7 +12,15 @@
 #include <cuda_runtime.h>
 #include <sys/mman.h>
 
+#include "vitriol-store.h"
+
 vitriol_config_t g_vitriol_config;
+
+/* Store backing: host-only (this file is g++-compiled; header stays nvcc-safe).
+ * Path lives here, not in vitriol_config_t (C++20 ceiling on nvcc headers). */
+static char g_store_path[256] = {0};
+
+const char * vitriol_store_path(void) { return g_store_path[0] ? g_store_path : nullptr; }
 
 static struct vitriol_config_init {
     vitriol_config_init() {
@@ -295,6 +303,20 @@ void vitriol_cuda_init(void) {
     if (disk_env && strcmp(disk_env, "1") == 0)
         g_vitriol_config.disk_offload = true;
 
+    /* Store backing: VITRIOL_STORE=1 + VITRIOL_STORE_PATH=/dev/... selects the
+     * raw-zone store as the expert cold source (O_DIRECT, no page cache).
+     * Non-destructive: mmap path remains default when unset. */
+    const char* store_env = getenv("VITRIOL_STORE");
+    if (store_env && strcmp(store_env, "1") == 0) {
+        const char* sp = getenv("VITRIOL_STORE_PATH");
+        if (sp && *sp) {
+            snprintf(g_store_path, sizeof(g_store_path), "%s", sp);
+            g_vitriol_config.store_backed = true;
+        } else {
+            fprintf(stderr, "VITRIOL: VITRIOL_STORE=1 requires VITRIOL_STORE_PATH\n");
+        }
+    }
+
     const char* oc_env = getenv("VITRIOL_OUTPUT_CACHE");
     if (oc_env && strcmp(oc_env, "1") == 0)
         g_vitriol_config.output_cache = true;
@@ -358,6 +380,76 @@ void vitriol_cuda_init(void) {
         atexit(vitriol_cuda_cleanup_vram);
         atexit(vitriol_cuda_print_stats);
     }
+}
+
+/* ── Store-backed fill ───────────────────────────────────────────
+ * Maps a ggml tensor's data address (tensor_base) to its store tid so the
+ * LRU can populate pinned RAM from the raw-zone store (store_read_expert).
+ * Registration happens in vitriol_buffer_set_tensor (store mode) which
+ * supplies the ggml tensor name (blk.N.<role>); tid is resolved against the
+ * store's descriptor table (layer + kind).
+ * ────────────────────────────────────────────────────────────────*/
+
+static vitriol::store * g_store_handle = nullptr;
+static std::mutex g_store_mtx;
+
+#define VITRIOL_STORE_MAX_REGS 4096
+struct store_reg {
+    const void * tensor_base;
+    uint32_t     tid;
+};
+static store_reg g_store_regs[VITRIOL_STORE_MAX_REGS];
+static int       g_n_store_regs = 0;
+
+/* Role string → store kind. Matches mkfs store_tensor_desc.kind encoding. */
+static int store_kind_from_name(const char * name) {
+    if (strstr(name, "ffn_up_exps"))    return 0;
+    if (strstr(name, "ffn_gate_exps"))  return 1;
+    if (strstr(name, "ffn_down_exps"))  return 2;
+    if (strstr(name, "shexp"))          return 3;
+    return -1;
+}
+
+static int store_layer_from_name(const char * name) {
+    const char * b = strstr(name, "blk.");
+    if (!b) return -1;
+    return atoi(b + 4);
+}
+
+/* Register tensor_base -> store tid by name. Called from buffer set_tensor. */
+void vitriol_store_register_tensor(const void * tensor_base, const char * name) {
+    if (!g_vitriol_config.store_backed) return;
+    if (!tensor_base || !name) return;
+    std::lock_guard<std::mutex> lock(g_store_mtx);
+    const int role = store_kind_from_name(name);
+    const int layer = store_layer_from_name(name);
+    if (role < 0 || layer < 0 || !g_store_handle) return;
+    const uint32_t n = vitriol::store_tensor_count(g_store_handle);
+    for (uint32_t tid = 0; tid < n; ++tid) {
+        const auto & t = vitriol::store_tensor_desc_at(g_store_handle, tid);
+        if (t.layer == (uint32_t)layer && t.kind == (uint32_t)role) {
+            if (g_n_store_regs < VITRIOL_STORE_MAX_REGS) {
+                g_store_regs[g_n_store_regs++] = { tensor_base, tid };
+            }
+            if (g_vitriol_config.verbose)
+                printf("VITRIOL: store reg %s -> tid %u (base %p)\n", name, tid, tensor_base);
+            return;
+        }
+    }
+}
+
+/* Resolve tensor_base -> store tid, or UINT32_MAX if not registered. */
+static uint32_t store_tid_for(const void * tensor_base) {
+    for (int i = 0; i < g_n_store_regs; i++) {
+        if (g_store_regs[i].tensor_base == tensor_base) return g_store_regs[i].tid;
+    }
+    return UINT32_MAX;
+}
+
+/* Set the global store handle (from vitriol_buffer_type_alloc_buffer). */
+void vitriol_store_set_handle(vitriol::store * st) {
+    std::lock_guard<std::mutex> lock(g_store_mtx);
+    g_store_handle = st;
 }
 
 /* ── Locked-Slice LRU (Lazy/Chunked Page Locking) ──────────────
@@ -429,6 +521,28 @@ void vitriol_ensure_expert_locked(const void * tensor_base, int expert_idx, size
 
     /* Lock this slice */
     const void * addr = (const char *)tensor_base + (ptrdiff_t)expert_idx * (ptrdiff_t)expert_size;
+
+    /* Store-backed: populate the pinned slice from the raw-zone store before
+     * locking, so ggml reads expert bytes that came off Optane (O_DIRECT),
+     * not from the (empty) anon mmap. */
+    if (g_vitriol_config.store_backed) {
+        const uint32_t tid = store_tid_for(tensor_base);
+        if (tid != UINT32_MAX) {
+            const auto & t = vitriol::store_tensor_desc_at(g_store_handle, tid);
+            const size_t real = t.data_bytes;
+            if (real > 0 && real <= expert_size) {
+                ssize_t r = vitriol::store_read_expert(g_store_handle, tid,
+                                                       (uint32_t)expert_idx, (void *)addr);
+                if (r != (ssize_t)real) {
+                    fprintf(stderr, "VITRIOL: store fill tid=%u e=%d FAIL (%zd)\n",
+                            tid, expert_idx, r);
+                } else if (g_vitriol_config.verbose) {
+                    printf("VITRIOL: store fill tid=%u e=%d (%zu B) <- %p\n",
+                           tid, expert_idx, real, addr);
+                }
+            }
+        }
+    }
 
     if (mlock(addr, expert_size) != 0) {
         static bool warned = false;
