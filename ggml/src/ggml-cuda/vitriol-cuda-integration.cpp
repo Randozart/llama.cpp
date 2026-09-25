@@ -4,10 +4,42 @@
 #include "ggml-backend.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <cerrno>
 #include <string.h>
+
+/* ── Rust streaming backend (optional, VITRIOL_RUST=1) ─────────────
+ * When built with VITRIOL_RUST_LIB and enabled via env, the LRU/store hot
+ * path is implemented by the vitriol-stream crate (safe Rust). The C++
+ * implementation below remains the default path. See
+ * .opencode/plans/vitriol-stream-rust-hybrid-2026-09-25.md. */
+/* CUdeviceptr-sized unsigned int; matches Rust usize on this ABI. */
+typedef unsigned long long usize_t_rs;
+
+extern "C" {
+usize_t_rs vs_lru_ensure(const void * tensor_base, int expert_idx,
+                         const void * expert_data, size_t expert_size,
+                         void * compute_stream);
+void vs_lru_mark_compute_done(usize_t_rs vram_ptr, void * stream);
+int  vs_bind_tensor_named(void * tensor_base, const char * name,
+                          size_t tensor_bytes, size_t row_bytes);
+int  vs_open_store(const char * path);
+int  vs_init(void);
+void vs_print_stats(void);
+}
+
+bool vitriol_rust_enabled(void) {
+    static const bool enabled = getenv("VITRIOL_RUST") != nullptr;
+    return enabled;
+}
+
+#include <cstring>
 #include <unordered_map>
 #include <list>
 #include <mutex>
+#include <algorithm>
+#include <atomic>
+#include <ctime>
+#include <vector>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <sys/mman.h>
@@ -15,6 +47,12 @@
 #include "vitriol-store.h"
 
 vitriol_config_t g_vitriol_config;
+
+enum class store_source {
+    gguf,
+    device,
+};
+static store_source g_store_source = store_source::device;
 
 /* Store backing: host-only (this file is g++-compiled; header stays nvcc-safe).
  * Path lives here, not in vitriol_config_t (C++20 ceiling on nvcc headers). */
@@ -68,8 +106,14 @@ struct LRUKeyHash {
     }
 };
 
-static std::unordered_map<LRUKey, int, LRUKeyHash> g_lru_map;
-static std::list<LRUKey> g_lru_order;
+/* Per-device LRU bookkeeping. These were file-scope globals while pools,
+ * slot sizes and slot counts are per-device arrays; any future second pool
+ * (GPU 1) would then mix devices in map.size() and victim scans. The slots
+ * a compute stream is still reading are tracked in g_lru_compute_pending
+ * and excluded from victim selection. */
+static std::unordered_map<LRUKey, int, LRUKeyHash> g_lru_map[GGML_CUDA_MAX_DEVICES];
+static std::list<LRUKey> g_lru_order[GGML_CUDA_MAX_DEVICES];
+static std::vector<bool> g_lru_compute_pending[GGML_CUDA_MAX_DEVICES];
 static std::mutex        g_lru_mtx;
 
 /* Dedicated stream for async DMA; per-slot events for sync.
@@ -90,7 +134,6 @@ static struct LRUStats {
 static std::unordered_map<uintptr_t, CUdeviceptr> g_pin_map;
 static std::mutex          g_pin_mtx;
 static size_t              g_pinned_bytes = 0;
-static bool                g_pin_init_done = false;
 
 /* Monolithic VRAM pool per device for all pinned tensors.
  * Allocated once on first pin for a given device; subdivided per tensor. */
@@ -274,6 +317,28 @@ static int vitriol_current_device(void) {
     return dev;
 }
 
+/* VITRIOL_LRU_STRICT=1: block the CPU until each expert H2D has completed
+ * before returning from the LRU. Diagnostic toggle for ordering bugs in the
+ * streaming path; leaves the normal async path untouched. */
+static bool vitriol_lru_strict(void) {
+    static const bool strict = getenv("VITRIOL_LRU_STRICT") != nullptr;
+    return strict;
+}
+
+static unsigned long long vitriol_fnv1a(const void * p, size_t n) {
+    const unsigned char * b = (const unsigned char *) p;
+    /* FNV-1a 64-bit offset basis. NOTE: this constant was truncated
+     * (1469598103934665603) until 2026-09-25; hashes recorded in session
+     * logs/plans dated before that use the old basis and are internally
+     * consistent but are NOT standard FNV-1a. */
+    unsigned long long h = 14695981039346656037ULL;
+    for (size_t i = 0; i < n; i++) {
+        h ^= b[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 /* ── Initialization ──────────────────────────────────────────────── */
 
 static void vitriol_cuda_cleanup_vram(void);
@@ -314,6 +379,20 @@ void vitriol_cuda_init(void) {
             g_vitriol_config.store_backed = true;
         } else {
             fprintf(stderr, "VITRIOL: VITRIOL_STORE=1 requires VITRIOL_STORE_PATH\n");
+        }
+        const char * source_env = getenv("VITRIOL_STORE_SOURCE");
+        if (source_env) {
+            if (strcmp(source_env, "store") == 0) {
+                g_store_source = store_source::device;
+            } else if (strcmp(source_env, "gguf") == 0) {
+                g_store_source = store_source::gguf;
+            } else {
+                fprintf(stderr, "VITRIOL: invalid VITRIOL_STORE_SOURCE=%s\n", source_env);
+            }
+        }
+        if (g_vitriol_config.verbose) {
+            printf("VITRIOL: store source=%s\n",
+                   g_store_source == store_source::device ? "store" : "gguf");
         }
     }
 
@@ -382,86 +461,192 @@ void vitriol_cuda_init(void) {
     }
 }
 
-/* ── Store-backed fill ───────────────────────────────────────────
- * Maps a ggml tensor's data address (tensor_base) to its store tid so the
- * LRU can populate pinned RAM from the raw-zone store (store_read_expert).
- * Registration happens in vitriol_buffer_set_tensor (store mode) which
- * supplies the ggml tensor name (blk.N.<role>); tid is resolved against the
- * store's descriptor table (layer + kind).
- * ────────────────────────────────────────────────────────────────*/
+/* ── Store-backed fill ─────────────────────────────────────────── */
 
-static vitriol::store * g_store_handle = nullptr;
 static std::mutex g_store_mtx;
 
-#define VITRIOL_STORE_MAX_REGS 4096
-struct store_reg {
-    const void * tensor_base;
-    uint32_t     tid;
+struct store_buffer_reg {
+    ggml_backend_buffer_t buffer;
+    vitriol::store * store;
+    const void * base;
+    size_t size;
 };
-static store_reg g_store_regs[VITRIOL_STORE_MAX_REGS];
-static int       g_n_store_regs = 0;
 
-/* Role string → store kind. Matches mkfs store_tensor_desc.kind encoding. */
+struct store_tensor_reg {
+    ggml_backend_buffer_t buffer;
+    vitriol::store * store;
+    uint32_t tid;
+};
+
+struct store_pointer_hash {
+    size_t operator()(const void * p) const noexcept {
+        size_t x = std::hash<const void *>{}(p);
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27;
+        x *= 0x94d049bb133111ebULL;
+        return x ^ (x >> 31);
+    }
+};
+
+static std::vector<store_buffer_reg> g_store_buffers;
+static std::unordered_map<const void *, store_tensor_reg, store_pointer_hash> g_store_tensors;
+static std::atomic<bool> g_store_binding_failed{false};
+static size_t g_store_max_expert_bytes = 0;
+
 static int store_kind_from_name(const char * name) {
+    if (!name) return -1;
     if (strstr(name, "ffn_up_exps"))    return 0;
     if (strstr(name, "ffn_gate_exps"))  return 1;
     if (strstr(name, "ffn_down_exps"))  return 2;
-    if (strstr(name, "shexp"))          return 3;
     return -1;
 }
 
 static int store_layer_from_name(const char * name) {
+    if (!name) return -1;
     const char * b = strstr(name, "blk.");
-    if (!b) return -1;
-    return atoi(b + 4);
+    return b ? atoi(b + 4) : -1;
 }
 
-/* Register tensor_base -> store tid by name. Called from buffer set_tensor. */
-void vitriol_store_register_tensor(const void * tensor_base, const char * name) {
-    if (!g_vitriol_config.store_backed) return;
-    if (!tensor_base || !name) return;
+static void release_locked_range(const void * base, size_t size);
+
+static bool store_buffer_for(
+        ggml_backend_buffer_t buffer,
+        store_buffer_reg & out) {
     std::lock_guard<std::mutex> lock(g_store_mtx);
-    const int role = store_kind_from_name(name);
-    const int layer = store_layer_from_name(name);
-    if (role < 0 || layer < 0 || !g_store_handle) return;
-    const uint32_t n = vitriol::store_tensor_count(g_store_handle);
-    for (uint32_t tid = 0; tid < n; ++tid) {
-        const auto & t = vitriol::store_tensor_desc_at(g_store_handle, tid);
-        if (t.layer == (uint32_t)layer && t.kind == (uint32_t)role) {
-            if (g_n_store_regs < VITRIOL_STORE_MAX_REGS) {
-                g_store_regs[g_n_store_regs++] = { tensor_base, tid };
-            }
-            if (g_vitriol_config.verbose)
-                printf("VITRIOL: store reg %s -> tid %u (base %p)\n", name, tid, tensor_base);
-            return;
+    for (const auto & reg : g_store_buffers) {
+        if (reg.buffer == buffer) {
+            out = reg;
+            return true;
         }
     }
+    return false;
 }
 
-/* Resolve tensor_base -> store tid, or UINT32_MAX if not registered. */
-static uint32_t store_tid_for(const void * tensor_base) {
-    for (int i = 0; i < g_n_store_regs; i++) {
-        if (g_store_regs[i].tensor_base == tensor_base) return g_store_regs[i].tid;
-    }
-    return UINT32_MAX;
-}
-
-/* Set the global store handle (from vitriol_buffer_type_alloc_buffer). */
-void vitriol_store_set_handle(void * st) {
+bool vitriol_store_register_buffer(
+        ggml_backend_buffer_t buffer,
+        void * store_handle,
+        const void * base,
+        size_t size) {
+    if (!buffer || !store_handle || !base || size == 0) return false;
+    auto * store = static_cast<vitriol::store *>(store_handle);
     std::lock_guard<std::mutex> lock(g_store_mtx);
-    g_store_handle = static_cast<vitriol::store *>(st);
-}
-
-/* Loader hook: return true to SKIP the GGUF read_raw for a host-buffer
- * tensor in store-backed mode, and register the tensor's data addr ->
- * store tid by name so the LRU can fill it from the store on demand. */
-bool vitriol_skip_host_read(struct ggml_tensor * cur) {
-    if (!g_vitriol_config.store_backed) return false;
-    if (!cur || !cur->name || !cur->data) return false;
-    if (store_kind_from_name(cur->name) < 0) return false;  // not an expert
-    vitriol_store_register_tensor((const void *)cur->data, cur->name);
+    for (auto & reg : g_store_buffers) {
+        if (reg.buffer == buffer) {
+            reg.store = store;
+            reg.base = base;
+            reg.size = size;
+            return true;
+        }
+    }
+    g_store_buffers.push_back({buffer, store, base, size});
     return true;
 }
+
+bool vitriol_store_bind_tensor(
+        ggml_backend_buffer_t buffer,
+        const void * tensor_base,
+        const char * name,
+        size_t tensor_bytes,
+        size_t row_bytes) {
+    if (!g_vitriol_config.store_backed || !tensor_base || !name) return false;
+    if (vitriol_rust_enabled()) {
+        /* Rust mode: the store and binding table live in the crate; the
+         * buffer handle is irrelevant there. */
+        return vs_bind_tensor_named((void *) tensor_base, name,
+                                    tensor_bytes, row_bytes) == 1;
+    }
+    if (!buffer) return false;
+
+    store_buffer_reg buffer_reg;
+    if (!store_buffer_for(buffer, buffer_reg)) return false;
+
+    const int role = store_kind_from_name(name);
+    const int layer = store_layer_from_name(name);
+    if (role < 0 || layer < 0) return false;
+
+    const uint32_t count = vitriol::store_tensor_count(buffer_reg.store);
+    for (uint32_t tid = 0; tid < count; ++tid) {
+        const auto & desc = vitriol::store_tensor_desc_at(buffer_reg.store, tid);
+        if (desc.layer != static_cast<uint32_t>(layer) || desc.kind != static_cast<uint32_t>(role)) {
+            continue;
+        }
+        if (desc.n_experts == 0 || desc.data_bytes == 0 || desc.slice_bytes < desc.data_bytes ||
+            row_bytes != desc.data_bytes ||
+            static_cast<uint64_t>(desc.n_experts) * desc.data_bytes != tensor_bytes) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(g_store_mtx);
+        g_store_max_expert_bytes = std::max(g_store_max_expert_bytes,
+            static_cast<size_t>(desc.data_bytes));
+        const auto found = g_store_tensors.find(tensor_base);
+        if (found != g_store_tensors.end()) {
+            return found->second.buffer == buffer && found->second.store == buffer_reg.store &&
+                found->second.tid == tid;
+        }
+        g_store_tensors.emplace(tensor_base, store_tensor_reg{buffer, buffer_reg.store, tid});
+        if (g_vitriol_config.verbose) {
+            printf("VITRIOL: store reg %s -> tid %u (base %p, %zu B)\n",
+                   name, tid, tensor_base, tensor_bytes);
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool store_binding_for(
+        const void * tensor_base,
+        vitriol::store *& store,
+        uint32_t & tid) {
+    std::lock_guard<std::mutex> lock(g_store_mtx);
+    const auto found = g_store_tensors.find(tensor_base);
+    if (found == g_store_tensors.end()) return false;
+    store = found->second.store;
+    tid = found->second.tid;
+    return true;
+}
+
+void vitriol_store_release_buffer(
+        ggml_backend_buffer_t buffer,
+        const void * base,
+        size_t size) {
+    if (!vitriol_store_source_device()) release_locked_range(base, size);
+    std::lock_guard<std::mutex> lock(g_store_mtx);
+    for (auto it = g_store_tensors.begin(); it != g_store_tensors.end();) {
+        if (it->second.buffer == buffer) {
+            it = g_store_tensors.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    g_store_buffers.erase(
+        std::remove_if(g_store_buffers.begin(), g_store_buffers.end(),
+            [buffer](const store_buffer_reg & reg) { return reg.buffer == buffer; }),
+        g_store_buffers.end());
+}
+
+bool vitriol_store_source_device(void) {
+    return g_store_source == store_source::device;
+}
+
+bool vitriol_skip_host_read(struct ggml_tensor * cur) {
+    if (!g_vitriol_config.store_backed || !cur || !cur->buffer) return false;
+    if (!vitriol_store_bind_tensor(cur->buffer, cur->data, cur->name,
+                                   ggml_nbytes(cur), cur->nb[2])) {
+        g_store_binding_failed.store(true, std::memory_order_relaxed);
+        return false;
+    }
+    return vitriol_store_source_device();
+}
+
+struct store_stats {
+    uint64_t fills = 0;
+    uint64_t bytes = 0;
+    uint64_t failures = 0;
+    uint64_t read_ns = 0;
+};
+static store_stats g_store_stats;
+
 
 /* ── Locked-Slice LRU (Lazy/Chunked Page Locking) ──────────────
  * Tracks which (tensor_base, expert_idx) pairs are currently
@@ -469,110 +654,274 @@ bool vitriol_skip_host_read(struct ggml_tensor * cur) {
  * bytes below g_vitriol_config.max_locked_mb. Evicts by LRU.
  * ───────────────────────────────────────────────────────────────*/
 
-#define VITRIOL_MAX_LOCKED_SLICES 1024
-
-struct locked_slice {
+struct locked_key {
     const void * tensor_base;
-    int          expert_idx;
-    size_t       size;
-    uint64_t     last_used;  // timestamp for LRU eviction
+    uint32_t     expert_idx;
+
+    bool operator==(const locked_key & other) const noexcept {
+        return tensor_base == other.tensor_base && expert_idx == other.expert_idx;
+    }
 };
 
-static std::mutex               g_locked_mtx;
-static locked_slice             g_locked_slices[VITRIOL_MAX_LOCKED_SLICES];
-static int                      g_n_locked_slices = 0;
-static uint64_t                 g_locked_bytes    = 0;
-static uint64_t                 g_locked_epoch    = 1;
+struct locked_key_hash {
+    size_t operator()(const locked_key & key) const noexcept {
+        size_t value = std::hash<const void *>{}(key.tensor_base);
+        value ^= std::hash<uint32_t>{}(key.expert_idx) + 0x9e3779b9U + (value << 6) + (value >> 2);
+        value ^= value >> 30;
+        value *= 0xbf58476d1ce4e5b9ULL;
+        value ^= value >> 27;
+        value *= 0x94d049bb133111ebULL;
+        return value ^ (value >> 31);
+    }
+};
+
+using locked_order = std::list<locked_key>;
+
+struct locked_value {
+    size_t              stride;
+    int                 device;
+    locked_order::iterator order_it;
+};
+
+static constexpr size_t VITRIOL_MAX_LOCKED_SLICES = 1U << 20;
+
+static std::mutex g_locked_mtx;
+static locked_order g_locked_order;
+static std::unordered_map<locked_key, locked_value, locked_key_hash> g_locked_slices;
+static uint64_t g_locked_bytes = 0;
+
+struct host_registration {
+    const void * addr;
+    size_t size;
+    int device;
+};
+static std::vector<host_registration> g_orphan_registrations;
+
+static void * locked_address(const locked_key & key, size_t stride) {
+    return const_cast<std::byte *>(
+        static_cast<const std::byte *>(key.tensor_base) +
+        static_cast<size_t>(key.expert_idx) * stride);
+}
+
+static bool unregister_host_range(void * addr, int device, bool synchronize) {
+    if (synchronize) {
+        cudaSetDevice(device);
+        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+    } else {
+        cudaSetDevice(device);
+    }
+    const cudaError_t err = cudaHostUnregister(addr);
+    return err == cudaSuccess;
+}
+
+static void retire_locked_value(const locked_key & key, const locked_value & value) {
+    void * addr = locked_address(key, value.stride);
+    if (!unregister_host_range(addr, value.device, true)) {
+        g_orphan_registrations.push_back({addr, value.stride, value.device});
+    }
+    munlock(addr, value.stride);
+    g_locked_bytes -= value.stride;
+}
+
+static void release_locked_range(const void * base, size_t size) {
+    if (!base || size == 0) return;
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        cudaSetDevice(device);
+        cudaDeviceSynchronize();
+    }
+
+    const auto * begin = static_cast<const std::byte *>(base);
+    const auto * end = begin + size;
+    std::lock_guard<std::mutex> lock(g_locked_mtx);
+    for (auto it = g_locked_order.begin(); it != g_locked_order.end();) {
+        const locked_key key = *it;
+        const auto found = g_locked_slices.find(key);
+        if (found == g_locked_slices.end()) {
+            it = g_locked_order.erase(it);
+            continue;
+        }
+        const locked_value value = found->second;
+        const auto * addr = static_cast<const std::byte *>(locked_address(key, value.stride));
+        if (addr >= begin && addr < end) {
+            if (!unregister_host_range(const_cast<std::byte *>(addr), value.device, false)) {
+                g_orphan_registrations.push_back({addr, value.stride, value.device});
+            }
+            munlock(addr, value.stride);
+            g_locked_bytes -= value.stride;
+            g_locked_slices.erase(found);
+            it = g_locked_order.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = g_orphan_registrations.begin(); it != g_orphan_registrations.end();) {
+        const auto * addr = static_cast<const std::byte *>(it->addr);
+        if (addr >= begin && addr < end) {
+            unregister_host_range(const_cast<std::byte *>(addr), it->device, false);
+            it = g_orphan_registrations.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+struct store_bounce_slot {
+    void * allocation = nullptr;
+    void * aligned = nullptr;
+    size_t capacity = 0;
+    CUevent event = nullptr;
+};
+
+static std::vector<store_bounce_slot> g_store_bounce[GGML_CUDA_MAX_DEVICES];
+static size_t g_store_bounce_next[GGML_CUDA_MAX_DEVICES] = {};
+static std::mutex g_store_bounce_mtx[GGML_CUDA_MAX_DEVICES];
+
+static constexpr int VITRIOL_STORE_BOUNCE_SLOTS = 16;
+static constexpr size_t VITRIOL_STORE_BOUNCE_ALIGN = 512;
+
+static size_t aligned_size(size_t size, size_t alignment) {
+    return (size + alignment - 1) / alignment * alignment;
+}
+
+static store_bounce_slot * store_bounce_acquire(int device, size_t size) {
+    std::lock_guard<std::mutex> lock(g_store_bounce_mtx[device]);
+    if (g_store_bounce[device].empty()) {
+        fprintf(stderr, "VITRIOL: store bounce ring not initialized (GPU %d)\n", device);
+        return nullptr;
+    }
+    const size_t index = g_store_bounce_next[device] % g_store_bounce[device].size();
+    ++g_store_bounce_next[device];
+    store_bounce_slot & slot = g_store_bounce[device][index];
+    if (slot.capacity < size || !slot.aligned || !slot.event) {
+        fprintf(stderr, "VITRIOL: store bounce slot %d too small (%zu < %zu)\n",
+                static_cast<int>(index), slot.capacity, size);
+        return nullptr;
+    }
+    if (cuEventSynchronize(slot.event) != CUDA_SUCCESS) {
+        fprintf(stderr, "VITRIOL: store bounce event sync failed (GPU %d)\n", device);
+        return nullptr;
+    }
+    return &slot;
+}
+
+static bool store_bounce_init(int device, size_t expert_size) {
+    std::lock_guard<std::mutex> lock(g_store_bounce_mtx[device]);
+    if (!g_store_bounce[device].empty()) return true;
+
+    const size_t capacity = aligned_size(expert_size, VITRIOL_STORE_BOUNCE_ALIGN);
+    cudaSetDevice(device);
+    for (int i = 0; i < VITRIOL_STORE_BOUNCE_SLOTS; ++i) {
+        store_bounce_slot slot;
+        const cudaError_t alloc = cudaHostAlloc(&slot.allocation,
+            capacity + VITRIOL_STORE_BOUNCE_ALIGN, cudaHostAllocPortable);
+        if (alloc != cudaSuccess) {
+            fprintf(stderr, "VITRIOL: cudaHostAlloc bounce failed (GPU %d): %s\n",
+                    device, cudaGetErrorString(alloc));
+            return false;
+        }
+        slot.aligned = static_cast<std::byte *>(slot.allocation) +
+            (VITRIOL_STORE_BOUNCE_ALIGN -
+             reinterpret_cast<uintptr_t>(slot.allocation) % VITRIOL_STORE_BOUNCE_ALIGN);
+        slot.capacity = capacity;
+        if (cuEventCreate(&slot.event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) {
+            fprintf(stderr, "VITRIOL: cuEventCreate bounce failed (GPU %d)\n", device);
+            cudaFreeHost(slot.allocation);
+            return false;
+        }
+        g_store_bounce[device].push_back(slot);
+    }
+    return true;
+}
+
+static bool store_read_bounce(
+        const void * tensor_base,
+        int expert_idx,
+        size_t expert_size,
+        store_bounce_slot & bounce) {
+    vitriol::store * store = nullptr;
+    uint32_t tid = 0;
+    if (!store_binding_for(tensor_base, store, tid)) {
+        fprintf(stderr, "VITRIOL: store H2D has no exact tensor binding\n");
+        return false;
+    }
+    if (!store || tid >= vitriol::store_tensor_count(store) ||
+        static_cast<uint32_t>(expert_idx) >= vitriol::store_tensor_desc_at(store, tid).n_experts ||
+        vitriol::store_tensor_desc_at(store, tid).data_bytes != expert_size) {
+        fprintf(stderr, "VITRIOL: store H2D geometry mismatch (tid=%u e=%d)\n", tid, expert_idx);
+        return false;
+    }
+
+    timespec start{};
+    timespec finish{};
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    const ssize_t result = vitriol::store_read_expert(
+        store, tid, static_cast<uint32_t>(expert_idx), bounce.aligned, expert_size);
+    clock_gettime(CLOCK_MONOTONIC, &finish);
+    g_store_stats.read_ns +=
+        static_cast<uint64_t>(finish.tv_sec - start.tv_sec) * 1000000000ULL +
+        static_cast<uint64_t>(finish.tv_nsec - start.tv_nsec);
+    if (result != static_cast<ssize_t>(expert_size)) {
+        g_store_stats.failures++;
+        fprintf(stderr, "VITRIOL: store H2D read FAIL tid=%u e=%d (%zd)\n",
+                tid, expert_idx, result);
+        return false;
+    }
+    g_store_stats.fills++;
+    g_store_stats.bytes += expert_size;
+    return true;
+}
 
 void vitriol_ensure_expert_locked(const void * tensor_base, int expert_idx, size_t expert_size) {
-    /* Store-backed fill runs regardless of lazy-lock budget (the slice must be
-     * populated before decode either way); the mlock/register part below is
-     * budget-gated. */
-    if (!vitriol_lazy_lock_active() && !g_vitriol_config.store_backed) return;
-    if (expert_size == 0) return;
+    if (!tensor_base || expert_idx < 0 || expert_size == 0) return;
+    if (!vitriol_lazy_lock_active() || vitriol_store_source_device()) return;
 
     std::lock_guard<std::mutex> lock(g_locked_mtx);
-
-    /* Check if already locked */
-    for (int i = 0; i < g_n_locked_slices; i++) {
-        if (g_locked_slices[i].tensor_base == tensor_base &&
-            g_locked_slices[i].expert_idx == expert_idx) {
-            g_locked_slices[i].last_used = g_locked_epoch++;
+    const locked_key key{tensor_base, static_cast<uint32_t>(expert_idx)};
+    const auto found = g_locked_slices.find(key);
+    if (found != g_locked_slices.end()) {
+        if (found->second.stride == expert_size) {
+            g_locked_order.splice(g_locked_order.begin(), g_locked_order, found->second.order_it);
             return;
         }
+        const locked_key old_key = key;
+        const locked_value old_value = found->second;
+        g_locked_order.erase(old_value.order_it);
+        g_locked_slices.erase(found);
+        retire_locked_value(old_key, old_value);
     }
 
-    /* Evict if at budget limit */
-    const uint64_t max_bytes = (uint64_t)g_vitriol_config.max_locked_mb * 1024 * 1024;
-    while (g_locked_bytes + expert_size > max_bytes && g_n_locked_slices > 0) {
-        /* Find LRU victim */
-        int victim = 0;
-        uint64_t oldest = g_locked_slices[0].last_used;
-        for (int i = 1; i < g_n_locked_slices; i++) {
-            if (g_locked_slices[i].last_used < oldest) {
-                oldest = g_locked_slices[i].last_used;
-                victim = i;
-            }
+    const uint64_t max_bytes = static_cast<uint64_t>(g_vitriol_config.max_locked_mb) * 1024 * 1024;
+    if (max_bytes == 0 || expert_size > max_bytes) return;
+    while (!g_locked_order.empty() &&
+           (g_locked_bytes > max_bytes || expert_size > max_bytes - g_locked_bytes ||
+            g_locked_slices.size() >= VITRIOL_MAX_LOCKED_SLICES)) {
+        const locked_key victim_key = g_locked_order.back();
+        const auto victim = g_locked_slices.find(victim_key);
+        if (victim == g_locked_slices.end()) {
+            g_locked_order.pop_back();
+            continue;
         }
-
-        const locked_slice & s = g_locked_slices[victim];
-        const void * addr = (const char *)s.tensor_base + (ptrdiff_t)s.expert_idx * (ptrdiff_t)s.size;
-
-        // Keep the cudaHostRegister on evict - it only pins the page for DMA
-        // and has no cost beyond that (pinned allocs bypass RLIMIT_MEMLOCK per
-        // AGENTS.md). Unregistering while the decode stream may still reference
-        // the page makes subsequent DMA fail with "pointer does not correspond
-        // to a registered memory region". munlock alone frees the RLIMIT budget.
-        munlock(addr, s.size);
-
-        g_locked_bytes -= s.size;
-        g_n_locked_slices--;
-
-        /* Swap last slot into victim position */
-        if (victim < g_n_locked_slices) {
-            g_locked_slices[victim] = g_locked_slices[g_n_locked_slices];
-        }
+        const locked_value victim_value = victim->second;
+        g_locked_order.pop_back();
+        g_locked_slices.erase(victim);
+        retire_locked_value(victim_key, victim_value);
     }
 
-    /* Lock this slice */
-    const void * addr = (const char *)tensor_base + (ptrdiff_t)expert_idx * (ptrdiff_t)expert_size;
-
-    /* Store-backed: populate the pinned slice from the raw-zone store before
-     * locking, so ggml reads expert bytes that came off Optane (O_DIRECT),
-     * not from the (empty) anon mmap. */
-    if (g_vitriol_config.store_backed && g_store_handle) {
-        const uint32_t tid = store_tid_for(tensor_base);
-        if (tid != UINT32_MAX) {
-            const auto & t = vitriol::store_tensor_desc_at(g_store_handle, tid);
-            const size_t real = t.data_bytes;
-            if (real > 0 && real <= expert_size) {
-                ssize_t r = vitriol::store_read_expert(g_store_handle, tid,
-                                                       (uint32_t)expert_idx, (void *)addr);
-                if (r != (ssize_t)real) {
-                    fprintf(stderr, "VITRIOL: store fill tid=%u e=%d FAIL (%zd)\n",
-                            tid, expert_idx, r);
-                } else if (g_vitriol_config.verbose) {
-                    printf("VITRIOL: store fill tid=%u e=%d (%zu B) <- %p\n",
-                           tid, expert_idx, real, addr);
-                }
-            }
-        }
-    }
-
+    void * addr = locked_address(key, expert_size);
     if (mlock(addr, expert_size) != 0) {
         static bool warned = false;
         if (!warned) {
-            fprintf(stderr, "VITRIOL: mlock slice(%zu) failed: %m — subsequent failures suppressed\n", expert_size);
+            fprintf(stderr, "VITRIOL: mlock slice(%zu) failed: %s\n", expert_size, strerror(errno));
             warned = true;
         }
         return;
     }
 
-    cudaError_t err = cudaHostRegister((void *)addr, expert_size, 0);
+    const cudaError_t err = cudaHostRegister(addr, expert_size, 0);
     if (err != cudaSuccess) {
         static bool warned = false;
         if (!warned) {
-            fprintf(stderr, "VITRIOL: cudaHostRegister slice(%zu) failed: %s — subsequent failures suppressed\n",
+            fprintf(stderr, "VITRIOL: cudaHostRegister slice(%zu) failed: %s\n",
                     expert_size, cudaGetErrorString(err));
             warned = true;
         }
@@ -580,18 +929,15 @@ void vitriol_ensure_expert_locked(const void * tensor_base, int expert_idx, size
         return;
     }
 
-    /* Record */
-    int slot = g_n_locked_slices++;
-    g_locked_slices[slot].tensor_base = tensor_base;
-    g_locked_slices[slot].expert_idx  = expert_idx;
-    g_locked_slices[slot].size        = expert_size;
-    g_locked_slices[slot].last_used   = g_locked_epoch++;
+    const auto order_it = g_locked_order.insert(g_locked_order.begin(), key);
+    int device = vitriol_current_device();
+    g_locked_slices.emplace(key, locked_value{expert_size, device, order_it});
     g_locked_bytes += expert_size;
 
     if (g_vitriol_config.verbose) {
         printf("VITRIOL: locked slice (tensor=%p, expert=%d, size=%zu, total_locked=%lu MiB)\n",
-               (const void *)tensor_base, expert_idx, expert_size,
-               (unsigned long)(g_locked_bytes / 1024 / 1024));
+               tensor_base, expert_idx, expert_size,
+               static_cast<unsigned long>(g_locked_bytes / 1024 / 1024));
     }
 }
 
@@ -798,6 +1144,7 @@ CUdeviceptr vitriol_pin_ensure(
     int64_t        n_experts,
     CUstream       stream)
 {
+    if (vitriol_store_source_device()) return 0;
     if (!tensor_base || tensor_nb02 == 0 || n_experts <= 0)
         return 0;
 
@@ -872,8 +1219,9 @@ CUdeviceptr vitriol_pin_ensure(
     g_pin_pool_offset[dev] += total_size;
 
     /* Async H2D copy of the full tensor to VRAM.
-     * In lazy mode, ensure all expert pages are locked first. */
-    if (vitriol_lazy_lock_active()) {
+     * In lazy mode, ensure all expert pages are locked first.
+     * Store mode has no host expert bytes; pinning is not supported. */
+    if (vitriol_lazy_lock_active() && !vitriol_store_source_device()) {
         for (int64_t i = 0; i < n_experts; i++) {
             vitriol_ensure_expert_locked(tensor_base, (int)i, tensor_nb02);
         }
@@ -951,6 +1299,10 @@ static bool lru_init_pool(size_t min_expert_size, int device) {
     }
 
     size_t needed_slot = (min_expert_size + 255) & ~(size_t)255;
+    if (g_store_max_expert_bytes > 0) {
+        needed_slot = std::max(needed_slot,
+            aligned_size(g_store_max_expert_bytes, static_cast<size_t>(256)));
+    }
     int    needed_slots = (int)(pool_size / needed_slot);
     if (needed_slots > VITRIOL_LRU_MAX_SLOTS) needed_slots = VITRIOL_LRU_MAX_SLOTS;
     if (needed_slots < 1) needed_slots = 1;
@@ -985,6 +1337,11 @@ static bool lru_init_pool(size_t min_expert_size, int device) {
         for (int i = 0; i < g_lru_num_slots[device]; i++)
             cuEventCreate(&g_lru_slot_events[device][i], CU_EVENT_DISABLE_TIMING);
     }
+    g_lru_compute_pending[device].assign(g_lru_num_slots[device], false);
+    if (g_store_source == store_source::device &&
+        !store_bounce_init(device, needed_slot)) {
+        return false;
+    }
 
     return true;
 }
@@ -998,19 +1355,38 @@ CUdeviceptr vitriol_lru_ensure(
     size_t         expert_size,
     CUstream       compute_stream)
 {
-    if (!expert_data || expert_size == 0 || !tensor_base)
+    if (vitriol_rust_enabled()) {
+        /* Mirror the C++ sequence: the runtime must have the device's
+         * primary context current before any driver call (cuMemAlloc
+         * returns CUDA_ERROR_INVALID_CONTEXT otherwise). */
+        int rs_dev = 0;
+        cudaGetDevice(&rs_dev);
+        cudaSetDevice(rs_dev);
+        const usize_t_rs r = vs_lru_ensure(tensor_base, expert_idx,
+            expert_data, expert_size, (void *) compute_stream);
+        if (r == (usize_t_rs) -1) {
+            GGML_ABORT("VITRIOL(rust) LRU protocol violation");
+        }
+        return (CUdeviceptr) r;
+    }
+    const bool store_device = g_store_source == store_source::device;
+    if (!store_device && (!expert_data || expert_size == 0) && !tensor_base)
         return 0;
+    if (store_device && (!tensor_base || expert_size == 0))
+        GGML_ABORT("VITRIOL store H2D called with invalid geometry");
 
     int dev = vitriol_current_device();
 
     if (!lru_ensure_stream(dev))
-        return 0;
+        GGML_ABORT("VITRIOL failed to create LRU stream");
     if (!lru_init_pool(expert_size, dev))
-        return 0;
+        GGML_ABORT("VITRIOL failed to initialize LRU pool");
 
-    /* Expert doesn't fit in fixed-size slot → bypass cache, read from host. */
-    if (expert_size > g_lru_slot_size[dev])
+    if (expert_size > g_lru_slot_size[dev]) {
+        if (store_device)
+            GGML_ABORT("VITRIOL store expert exceeds LRU slot");
         return 0;
+    }
 
     LRUKey key = { dev, (uintptr_t)tensor_base, expert_idx };
 
@@ -1021,15 +1397,20 @@ CUdeviceptr vitriol_lru_ensure(
     cudaSetDevice(dev);
 
     /* Check cache */
+    auto & lru_map   = g_lru_map[dev];
+    auto & lru_order = g_lru_order[dev];
     {
         std::lock_guard<std::mutex> lock(g_lru_mtx);
-        auto it = g_lru_map.find(key);
-        if (it != g_lru_map.end()) {
-            g_lru_order.remove(key);
-            g_lru_order.push_front(key);
+        auto it = lru_map.find(key);
+        if (it != lru_map.end()) {
+            lru_order.remove(key);
+            lru_order.push_front(key);
             g_lru_stats.hits++;
             /* Wait for any in-flight prefetch DMA on this slot */
             cuStreamWaitEvent(cstream, g_lru_slot_events[dev][it->second], 0);
+            if ((int)g_lru_compute_pending[dev].size() > it->second) {
+                g_lru_compute_pending[dev][it->second] = true;
+            }
             return g_lru_pool[dev] + (size_t)it->second * g_lru_slot_size[dev];
         }
     }
@@ -1040,48 +1421,103 @@ CUdeviceptr vitriol_lru_ensure(
     int slot;
     {
         std::lock_guard<std::mutex> lock(g_lru_mtx);
-        if ((int)g_lru_map.size() < g_lru_num_slots[dev]) {
-            slot = (int)g_lru_map.size();
+        if ((int)lru_map.size() < g_lru_num_slots[dev]) {
+            slot = (int)lru_map.size();
         } else {
             // PROVENANCE: inspiration — kimi-k3-in-c (Apache-2.0; re-derived, not copied).
             // Three-state cache principle: skip INFLIGHT slots in victim selection. Pick
             // the LRU candidate whose last DMA has COMPLETED (cuEventQuery == SUCCESS)
             // instead of blindly evicting the LRU and stalling on its in-flight fill.
-            LRUKey evict = g_lru_order.back();
-            for (auto it = std::prev(g_lru_order.end()); it != g_lru_order.begin(); --it) {
-                auto mit = g_lru_map.find(*it);
-                int s = (mit != g_lru_map.end()) ? mit->second : -1;
-                if (s >= 0 && s < g_lru_num_slots[dev] &&
+            LRUKey evict = lru_order.back();
+            for (auto it = std::prev(lru_order.end()); it != lru_order.begin(); --it) {
+                auto mit = lru_map.find(*it);
+                int s = (mit != lru_map.end()) ? mit->second : -1;
+                bool pending = s >= 0 && s < (int)g_lru_compute_pending[dev].size() &&
+                    g_lru_compute_pending[dev][s];
+                if (s >= 0 && s < g_lru_num_slots[dev] && !pending &&
                     cuEventQuery(g_lru_slot_events[dev][s]) == CUDA_SUCCESS) {
                     evict = *it;
                     break;
                 }
             }
-            g_lru_order.remove(evict);
-            auto eit = g_lru_map.find(evict);
-            slot = (eit != g_lru_map.end()) ? eit->second : 0;
-            if (eit != g_lru_map.end()) g_lru_map.erase(eit);
+            lru_order.remove(evict);
+            auto eit = lru_map.find(evict);
+            /* A missing entry means map/order desync. Falling back to slot 0
+             * would alias two keys onto one slot: silent weight corruption. */
+            if (eit == lru_map.end())
+                GGML_ABORT("VITRIOL LRU map/order desync");
+            slot = eit->second;
+            lru_map.erase(eit);
             g_lru_stats.evictions++;
         }
-        g_lru_map[key] = slot;
-        g_lru_order.push_front(key);
+        lru_map[key] = slot;
+        lru_order.push_front(key);
+        if ((int)g_lru_compute_pending[dev].size() > slot) {
+            g_lru_compute_pending[dev][slot] = true;
+        }
     }
 
     CUdeviceptr dst = g_lru_pool[dev] + (size_t)slot * g_lru_slot_size[dev];
+
+    store_bounce_slot * bounce = nullptr;
+    if (store_device) {
+        bounce = store_bounce_acquire(dev, expert_size);
+        if (!bounce)
+            GGML_ABORT("VITRIOL failed to acquire store bounce slot");
+        if (!store_read_bounce(tensor_base, expert_idx, expert_size, *bounce))
+            GGML_ABORT("VITRIOL store H2D read failed");
+    }
 
     /* Wait for compute to finish reading this slot before overwriting it */
     cuStreamWaitEvent(g_lru_stream[dev], g_lru_slot_events[dev][slot], 0);
 
     /* Async DMA on dedicated stream, then make compute stream wait */
-    CUresult r;
-    r = cuMemcpyHtoDAsync(dst, expert_data, expert_size, g_lru_stream[dev]);
-    if (r != CUDA_SUCCESS) return 0;
+    const void * copy_source = store_device ? bounce->aligned : expert_data;
+    static const bool hash_dbg = getenv("VITRIOL_LRU_HASH") != nullptr;
+    if (hash_dbg)
+        fprintf(stderr, "VITRIOL_LRU_HASH dev=%d tensor=%p expert=%d size=%zu src=%016llx\n",
+                dev, tensor_base, expert_idx, expert_size,
+                vitriol_fnv1a(copy_source, expert_size));
+    CUresult r = cuMemcpyHtoDAsync(dst, copy_source, expert_size, g_lru_stream[dev]);
+    if (r != CUDA_SUCCESS)
+        GGML_ABORT("VITRIOL LRU H2D failed");
+
+    if (bounce) {
+        r = cuEventRecord(bounce->event, g_lru_stream[dev]);
+        if (r != CUDA_SUCCESS)
+            GGML_ABORT("VITRIOL bounce event record failed");
+    }
 
     r = cuEventRecord(g_lru_slot_events[dev][slot], g_lru_stream[dev]);
-    if (r != CUDA_SUCCESS) return 0;
+    if (r != CUDA_SUCCESS)
+        GGML_ABORT("VITRIOL LRU event record failed");
+
+    static const bool vram_hash_dbg = getenv("VITRIOL_LRU_VRAM_HASH") != nullptr;
+    if (vram_hash_dbg) {
+        /* Verify the DMA landed the exact bytes: block until the H2D is
+         * done, read the slot back over D2H, hash both sides. */
+        if (cuStreamSynchronize(g_lru_stream[dev]) != CUDA_SUCCESS)
+            GGML_ABORT("VITRIOL vram-hash sync failed");
+        std::vector<char> vbuf(expert_size);
+        if (cudaMemcpy(vbuf.data(), (const void *) dst, expert_size,
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            GGML_ABORT("VITRIOL vram-hash D2H failed");
+        unsigned long long vh = vitriol_fnv1a(vbuf.data(), expert_size);
+        unsigned long long sh = vitriol_fnv1a(copy_source, expert_size);
+        fprintf(stderr, "VITRIOL_LRU_VRAM_HASH dev=%d tensor=%p expert=%d size=%zu src=%016llx vram=%016llx %s\n",
+                dev, tensor_base, expert_idx, expert_size, sh, vh,
+                sh == vh ? "OK" : "MISMATCH");
+    }
 
     r = cuStreamWaitEvent(cstream, g_lru_slot_events[dev][slot], 0);
-    if (r != CUDA_SUCCESS) return 0;
+    if (r != CUDA_SUCCESS)
+        GGML_ABORT("VITRIOL LRU compute wait failed");
+
+    if (vitriol_lru_strict()) {
+        r = cuStreamSynchronize(g_lru_stream[dev]);
+        if (r != CUDA_SUCCESS)
+            GGML_ABORT("VITRIOL LRU strict sync failed");
+    }
 
     return dst;
 }
@@ -1108,9 +1544,11 @@ static void vitriol_lru_prefetch_async(
     LRUKey key = { dev, (uintptr_t)tensor_base, expert_idx };
 
     /* Check cache — if already present, DMA was already submitted */
+    auto & lru_map   = g_lru_map[dev];
+    auto & lru_order = g_lru_order[dev];
     {
         std::lock_guard<std::mutex> lock(g_lru_mtx);
-        if (g_lru_map.find(key) != g_lru_map.end())
+        if (lru_map.find(key) != lru_map.end())
             return;
     }
 
@@ -1120,18 +1558,23 @@ static void vitriol_lru_prefetch_async(
     int slot;
     {
         std::lock_guard<std::mutex> lock(g_lru_mtx);
-        if ((int)g_lru_map.size() < g_lru_num_slots[dev]) {
-            slot = (int)g_lru_map.size();
+        if ((int)lru_map.size() < g_lru_num_slots[dev]) {
+            slot = (int)lru_map.size();
         } else {
-            LRUKey evict = g_lru_order.back();
-            g_lru_order.pop_back();
-            auto eit = g_lru_map.find(evict);
-            slot = (eit != g_lru_map.end()) ? eit->second : 0;
-            if (eit != g_lru_map.end()) g_lru_map.erase(eit);
+            LRUKey evict = lru_order.back();
+            lru_order.pop_back();
+            auto eit = lru_map.find(evict);
+            if (eit == lru_map.end())
+                GGML_ABORT("VITRIOL prefetch LRU map/order desync");
+            slot = eit->second;
+            lru_map.erase(eit);
             g_lru_stats.evictions++;
         }
-        g_lru_map[key] = slot;
-        g_lru_order.push_front(key);
+        lru_map[key] = slot;
+        lru_order.push_front(key);
+        if ((int)g_lru_compute_pending[dev].size() > slot) {
+            g_lru_compute_pending[dev][slot] = true;
+        }
     }
 
     CUdeviceptr dst = g_lru_pool[dev] + (size_t)slot * g_lru_slot_size[dev];
@@ -1153,6 +1596,7 @@ void vitriol_lru_prefetch(
     CUstream       compute_stream)
 {
     (void)compute_stream;
+    if (vitriol_store_source_device()) return;
     if (vitriol_lazy_lock_active()) {
         vitriol_ensure_expert_locked(tensor_base, expert_idx, expert_size);
     }
@@ -1181,6 +1625,10 @@ ggml_backend_buffer_type_t vitriol_get_expert_buffer_type_dev(int device) {
 }
 
 void vitriol_lru_mark_compute_done(CUdeviceptr vram_ptr, CUstream stream) {
+    if (vitriol_rust_enabled()) {
+        vs_lru_mark_compute_done((usize_t_rs) vram_ptr, (void *) stream);
+        return;
+    }
     if (!vram_ptr)
         return;
     /* Find which device's pool this pointer belongs to, then record the
@@ -1196,6 +1644,9 @@ void vitriol_lru_mark_compute_done(CUdeviceptr vram_ptr, CUstream stream) {
             /* stream is the compute stream on the same device (layer split
              * keeps a tensor's compute and cache on one GPU). */
             cuEventRecord(g_lru_slot_events[dev][slot], stream);
+            if ((int)g_lru_compute_pending[dev].size() > slot) {
+                g_lru_compute_pending[dev][slot] = false;
+            }
             return;
         }
     }
@@ -1203,6 +1654,21 @@ void vitriol_lru_mark_compute_done(CUdeviceptr vram_ptr, CUstream stream) {
 
 void vitriol_cuda_cleanup_vram(void) {
     for (int dev = 0; dev < GGML_CUDA_MAX_DEVICES; dev++) {
+        {
+            std::lock_guard<std::mutex> lock(g_store_bounce_mtx[dev]);
+            for (auto & slot : g_store_bounce[dev]) {
+                if (slot.event) {
+                    cudaSetDevice(dev);
+                    cuEventDestroy(slot.event);
+                }
+                if (slot.allocation) {
+                    cudaSetDevice(dev);
+                    cudaFreeHost(slot.allocation);
+                }
+            }
+            g_store_bounce[dev].clear();
+            g_store_bounce_next[dev] = 0;
+        }
         if (g_lru_slot_events[dev]) {
             cudaSetDevice(dev);
             for (int i = 0; i < g_lru_num_slots[dev]; i++)
@@ -1252,10 +1718,16 @@ void vitriol_cuda_cleanup_vram(void) {
 }
 
 void vitriol_cuda_print_stats(void) {
+    if (vitriol_rust_enabled()) {
+        vs_print_stats();
+        /* Fall through: C++ counters are idle in Rust mode but cheap to
+         * print for provenance. */
+    }
     uint64_t total = g_lru_stats.hits + g_lru_stats.misses;
     float hr = (total > 0) ? 100.0f * (float)g_lru_stats.hits / (float)total : 0.0f;
     printf("=== VITRIOL Statistics ===\n");
     printf("Mode: %d\n", g_vitriol_config.mode);
+    printf("Store Source: %s\n", vitriol_store_source_device() ? "store" : "gguf");
     for (int has_pool = 0; has_pool < GGML_CUDA_MAX_DEVICES; has_pool++) {
         if (g_lru_pool[has_pool] != 0) {
             printf("LRU Cache (GPU %d): pool=%llu MB, slots=%d, slot_size=%zu\n",
@@ -1285,6 +1757,17 @@ void vitriol_cuda_print_stats(void) {
         printf("Output Cache Misses: %llu\n", g_output_cache_stats.misses);
         printf("Output Cache Hit Rate: %.2f%%\n", oc_hr);
     }
-    printf("Strategy: RAM Shot + LRU VRAM cache\n");
+    {
+        std::lock_guard<std::mutex> lock(g_locked_mtx);
+        printf("Locked Slices: %zu\n", g_locked_slices.size());
+        printf("Locked MB: %llu\n", static_cast<unsigned long long>(g_locked_bytes / 1024 / 1024));
+        printf("Orphan Registrations: %zu\n", g_orphan_registrations.size());
+    }
+    printf("Store Fills: %llu\n", static_cast<unsigned long long>(g_store_stats.fills));
+    printf("Store Bytes: %llu\n", static_cast<unsigned long long>(g_store_stats.bytes));
+    printf("Store Failures: %llu\n", static_cast<unsigned long long>(g_store_stats.failures));
+    printf("Store Read ms: %llu\n", static_cast<unsigned long long>(g_store_stats.read_ns / 1000000ULL));
+    printf("Strategy: %s\n", vitriol_store_source_device() ?
+           "Optane store -> pinned bounce -> LRU VRAM" : "RAM Shot + LRU VRAM cache");
     printf("===============================\n");
 }

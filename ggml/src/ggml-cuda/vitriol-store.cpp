@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cstdio>
 #include <memory>
+#include <vector>
 
 #include <liburing.h>
 
@@ -59,6 +60,10 @@ aligned_ptr<T> aligned_new(size_t count) {
     return aligned_ptr<T>(static_cast<T *>(p));
 }
 
+struct alignas(512) store_scratch_block {
+    std::byte data[512];
+};
+
 struct store {
     int fd = -1;
     uint32_t flags = 0;
@@ -71,6 +76,8 @@ struct store {
     struct io_uring ring;
     uint32_t async_tid = 0;
     uint32_t async_expert = 0;
+    uint32_t async_data_bytes = 0;
+    uint32_t async_slice_bytes = 0;
 
     ~store() {
         if (uring_ok) {
@@ -208,10 +215,28 @@ uint64_t store_expert_offset(const store * st, uint32_t tid, uint32_t expert_idx
         static_cast<uint64_t>(expert_idx) * st->index.get()[tid].slice_bytes;
 }
 
-ssize_t store_read_expert(store * st, uint32_t tid, uint32_t expert_idx, void * dst) {
+ssize_t store_read_expert(store * st, uint32_t tid, uint32_t expert_idx, void * dst, size_t dst_size) {
+    if (!st || !dst || tid >= st->n_tensors) return -1;
+    const store_tensor_desc & t = st->index.get()[tid];
+    if (expert_idx >= t.n_experts || t.data_bytes == 0 || t.slice_bytes < t.data_bytes ||
+        dst_size != t.data_bytes) {
+        return -1;
+    }
+
     const uint64_t off = store_expert_offset(st, tid, expert_idx);
-    const size_t len = st->index.get()[tid].slice_bytes;  // padded, 512-multiple
-    return pread(st->fd, dst, len, static_cast<off_t>(off));
+    ssize_t r;
+    if (std::is_sufficiently_aligned<512>(dst) && dst_size >= t.slice_bytes) {
+        r = pread(st->fd, dst, t.slice_bytes, static_cast<off_t>(off));
+    } else {
+        thread_local std::vector<store_scratch_block> scratch;
+        const size_t blocks = (static_cast<size_t>(t.slice_bytes) + 511) / 512;
+        scratch.resize(blocks);
+        r = pread(st->fd, scratch.data(), t.slice_bytes, static_cast<off_t>(off));
+        if (r == static_cast<ssize_t>(t.slice_bytes)) {
+            std::memcpy(dst, scratch.data(), t.data_bytes);
+        }
+    }
+    return r == static_cast<ssize_t>(t.slice_bytes) ? static_cast<ssize_t>(t.data_bytes) : -1;
 }
 
 ssize_t store_read_embed(store * st, uint64_t offset, std::span<std::byte> dst) {
@@ -222,23 +247,44 @@ ssize_t store_read_embed(store * st, uint64_t offset, std::span<std::byte> dst) 
                  static_cast<off_t>(st->super.embed_base + offset));
 }
 
-int store_read_expert_async(store * st, uint32_t tid, uint32_t expert_idx, void * dst) {
-    if (!st->uring_ok) {
-        return store_read_expert(st, tid, expert_idx, dst) < 0 ? -1 : 0;
+int store_read_expert_async(store * st, uint32_t tid, uint32_t expert_idx, void * dst, size_t dst_size) {
+    if (!st || !dst || tid >= st->n_tensors) return -1;
+    const store_tensor_desc & t = st->index.get()[tid];
+    if (expert_idx >= t.n_experts || dst_size < t.data_bytes) return -1;
+
+    auto fallback = [&]() {
+        std::vector<std::byte> temp(t.data_bytes);
+        const ssize_t result = store_read_expert(st, tid, expert_idx, temp.data(), temp.size());
+        if (result < 0) return -1;
+        std::memcpy(dst, temp.data(), t.data_bytes);
+        st->async_data_bytes = t.data_bytes;
+        st->async_slice_bytes = 0;
+        return 0;
+    };
+
+    if (!st->uring_ok || !std::is_sufficiently_aligned<512>(dst) || dst_size < t.slice_bytes) {
+        return fallback();
+    }
+    struct io_uring_sqe * sqe = io_uring_get_sqe(&st->ring);
+    if (!sqe) {
+        return fallback();
     }
     st->async_tid = tid;
     st->async_expert = expert_idx;
-    struct io_uring_sqe * sqe = io_uring_get_sqe(&st->ring);
-    if (!sqe) {
-        return -1;
-    }
+    st->async_data_bytes = t.data_bytes;
+    st->async_slice_bytes = t.slice_bytes;
     const uint64_t off = store_expert_offset(st, tid, expert_idx);
-    io_uring_prep_read(sqe, st->fd, dst, st->index.get()[tid].slice_bytes, off);
-    io_uring_submit(&st->ring);
-    return 0;
+    io_uring_prep_read(sqe, st->fd, dst, t.slice_bytes, off);
+    return io_uring_submit(&st->ring) == 0 ? 0 : fallback();
 }
 
 ssize_t store_read_expert_wait(store * st) {
+    if (!st) {
+        return -1;
+    }
+    if (st->async_slice_bytes == 0) {
+        return static_cast<ssize_t>(st->async_data_bytes);
+    }
     if (!st->uring_ok) {
         return -1;
     }
@@ -248,7 +294,9 @@ ssize_t store_read_expert_wait(store * st) {
     }
     const int res = cqe->res;
     io_uring_cqe_seen(&st->ring, cqe);
-    return res < 0 ? -1 : res;
+    return res == static_cast<int>(st->async_slice_bytes)
+        ? static_cast<ssize_t>(st->async_data_bytes)
+        : -1;
 }
 
 std::expected<void, store_error> store_mkfs(

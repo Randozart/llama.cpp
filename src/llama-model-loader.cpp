@@ -14,6 +14,15 @@
 #include <future>
 #include <regex>
 
+bool vitriol_skip_host_read(struct ggml_tensor * cur);
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+bool vitriol_skip_host_read(struct ggml_tensor *) {
+    return false;
+}
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -1688,7 +1697,6 @@ bool llama_model_loader::load_all_data(
                 // from the raw-zone store (vitriol_ensure_expert_locked ->
                 // store_read_expert). Skip the GGUF read so the buffer stays
                 // empty for the store to populate (avoids the 84G mmap/read).
-                extern bool vitriol_skip_host_read(struct ggml_tensor * cur);
                 if (!vitriol_skip_host_read(cur)) {
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(cur->data, n_size);

@@ -2168,10 +2168,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
+    static bool s_dbg = getenv("VITRIOL_LRU_DBG") != nullptr;
+    static bool s_matmul_sync = getenv("VITRIOL_MATMUL_SYNC") != nullptr;
+    if (s_dbg) fprintf(stderr, "VITRIOL_LRU_DBG ne02=%lld nb02=%zu src0=%p first_slice=%p\n",
+            (long long)ne02, (size_t)nb02, src0_eff->data,
+            (const char*)src0_eff->data);
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
         if (tokens_per_expert[i02] == 0) {
             continue;
         }
+        if (s_dbg) fprintf(stderr, "VITRIOL_LRU_DBG   expert %lld off=%lld nb02=%zu\n",
+                (long long)i02, (long long)(i02*nb02), (size_t)nb02);
 
         ggml_tensor src0_slice = *src0_eff;
         src0_slice.ne[2]    = 1;
@@ -2214,7 +2221,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         CUdeviceptr expert_vram = 0;
         bool output_cache_hit = false;
         if (vitriol_route_lru) {
-            if (vitriol_lazy_lock_active()) {
+            if (vitriol_lazy_lock_active() && !vitriol_store_source_device()) {
                 vitriol_ensure_expert_locked(src0_eff->data, (int) i02, nb02);
             }
             expert_vram = vitriol_lru_ensure(src0_eff->data, (int) i02,
@@ -2237,6 +2244,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         if (!output_cache_hit) {
             ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
             CUDA_CHECK(cudaGetLastError());
+            if (vitriol_route_lru && s_matmul_sync) {
+                /* Diagnostic: drain the compute stream after each expert
+                 * matmul so overlap-based corruption cannot survive. */
+                cudaStreamSynchronize(stream);
+            }
         }
 
         if (vitriol_route_lru) {

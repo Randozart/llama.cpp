@@ -13,6 +13,7 @@
 #define VITRIOL_CUDA_INTEGRATION_H
 
 #include "ggml-cuda.h"
+#include "ggml-backend.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <cuda.h>
@@ -55,9 +56,21 @@ extern vitriol_config_t g_vitriol_config;
 /* Store backing path (host-only; null when VITRIOL_STORE unset). */
 const char * vitriol_store_path(void);
 
-/* Store-backed fill hooks (host-only; no-ops when store disabled). */
-void vitriol_store_register_tensor(const void * tensor_base, const char * name);
-void vitriol_store_set_handle(void * st);
+bool vitriol_store_register_buffer(
+        ggml_backend_buffer_t buffer,
+        void * store,
+        const void * base,
+        size_t size);
+void vitriol_store_release_buffer(
+        ggml_backend_buffer_t buffer,
+        const void * base,
+        size_t size);
+bool vitriol_store_bind_tensor(
+        ggml_backend_buffer_t buffer,
+        const void * tensor_base,
+        const char * name,
+        size_t tensor_bytes,
+        size_t row_bytes);
 
 void vitriol_cuda_init(void);
 
@@ -246,5 +259,9 @@ void vitriol_output_cache_print_stats(void);
 #ifdef __cplusplus
 }
 #endif
+
+bool vitriol_store_source_device(void);
+
+bool vitriol_skip_host_read(struct ggml_tensor * cur);
 
 #endif // VITRIOL_CUDA_INTEGRATION_H

@@ -102,13 +102,16 @@ uint64_t store_expert_offset(const store * st, uint32_t tid, uint32_t expert_idx
 
 // ---- hot read path (scalar returns, no expected) ---------------------------
 
-// Read one expert slice of tensor `tid`, expert index `expert_idx`, into dst
-// (slice_bytes). Returns bytes read, or -1. This is the hot MoE path - scalar.
-ssize_t store_read_expert(store * st, uint32_t tid, uint32_t expert_idx, void * dst)
+// Read one expert slice of tensor `tid`, expert index `expert_idx`, into dst.
+// dst_size must equal data_bytes. Returns data_bytes on success, or -1. This is
+// the hot MoE path - scalar.
+ssize_t store_read_expert(store * st, uint32_t tid, uint32_t expert_idx, void * dst, size_t dst_size)
     pre(st != nullptr)
     pre(dst != nullptr)
+    pre(dst_size > 0)
     pre(tid < store_tensor_count(st))
-    pre(expert_idx < store_tensor_desc_at(st, tid).n_experts);
+    pre(expert_idx < store_tensor_desc_at(st, tid).n_experts)
+    pre(dst_size == store_tensor_desc_at(st, tid).data_bytes);
 
 // Read a slice of the embed tensor. Sequential/random-row bulk path.
 // Returns bytes read, or -1.
@@ -116,11 +119,13 @@ ssize_t store_read_embed(store * st, uint64_t offset, std::span<std::byte> dst)
     pre(st != nullptr)
     pre(offset + dst.size() <= store_embed_bytes(st));
 
-// Asynchronous read of one expert slice via io_uring. Queues the op; wait
-// with store_read_expert_wait. Returns 0 queued, -1 error.
-int store_read_expert_async(store * st, uint32_t tid, uint32_t expert_idx, void * dst)
+// Asynchronous read of one expert slice via io_uring. The destination must be
+// 512-aligned and large enough for the padded on-disk slot. Returns 0 queued,
+// -1 otherwise.
+int store_read_expert_async(store * st, uint32_t tid, uint32_t expert_idx, void * dst, size_t dst_size)
     pre(st != nullptr)
     pre(dst != nullptr)
+    pre(dst_size > 0)
     pre(tid < store_tensor_count(st))
     pre(expert_idx < store_tensor_desc_at(st, tid).n_experts);
 

@@ -109,6 +109,7 @@ if (CUDAToolkit_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/vitriol_ce_d2b.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/vitriol_ce_spike.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/vitriol-store-test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vitriol-store-mkfs.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/vitriol_copy_engine.cpp)
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
@@ -288,6 +289,15 @@ if (CUDAToolkit_FOUND)
         message(STATUS "VITRIOL store: liburing found - io_uring async path enabled")
     else()
         message(STATUS "VITRIOL store: liburing not found - pread fallback")
+    endif()
+
+    # Rust streaming backend (vitriol-stream crate, optional). When
+    # VITRIOL_RUST_LIB points at libvitriol_stream.a, the LRU/store hot path
+    # can be routed through it at runtime with VITRIOL_RUST=1.
+    if (DEFINED ENV{VITRIOL_RUST_LIB} AND EXISTS "$ENV{VITRIOL_RUST_LIB}")
+        target_link_libraries(ggml-cuda PRIVATE "$ENV{VITRIOL_RUST_LIB}")
+        target_link_libraries(ggml-cuda PRIVATE pthread dl m)
+        message(STATUS "VITRIOL: Rust streaming backend linked from $ENV{VITRIOL_RUST_LIB}")
     endif()
 
     # VITRIOL store mkfs tool - standalone host binary (GGUF -> store).

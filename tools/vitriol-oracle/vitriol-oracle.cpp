@@ -34,12 +34,25 @@ struct capture_state {
     std::ofstream index;
     uint64_t offset = 0;
     int nodes = 0;
+    int seen = 0;    // graph order, counts every node visited
+    int cur = -1;    // graph order of the node currently claimed
 };
+
+// ORACLE_IDX_LO / ORACLE_IDX_HI bound the capture window in graph order.
+// Nodes outside the window are never claimed, so they never trigger a D2H.
+// That keeps the run close to unserialized while still letting us diff a
+// narrow slice of the graph.
+static int g_idx_lo = 0;
+static int g_idx_hi = 0x7fffffff;
 
 bool capture_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * st = (capture_state *) user_data;
     if (ask) {
-        // Claim every node so the callback fires again with data present.
+        st->cur = st->seen++;
+        if (st->cur < g_idx_lo || st->cur >= g_idx_hi) {
+            return false;
+        }
+        // Claim this node so the callback fires again with data present.
         return true;
     }
     if (!t || !t->data || t->view_src != nullptr) {
@@ -54,7 +67,7 @@ bool capture_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     char row[1024];
     snprintf(row, sizeof(row),
              "{\"i\":%d,\"name\":\"%s\",\"type\":\"%s\",\"ne\":[%lld,%lld,%lld,%lld],\"off\":%llu,\"n\":%llu}\n",
-             st->nodes, t->name, ggml_type_name(t->type),
+             st->cur, t->name, ggml_type_name(t->type),
              (long long) t->ne[0], (long long) t->ne[1],
              (long long) t->ne[2], (long long) t->ne[3],
              (unsigned long long) st->offset, (unsigned long long) nbytes);
@@ -80,6 +93,9 @@ int main(int argc, char ** argv) {
     const char * no_cb = getenv("ORACLE_NO_CB");
     if (!(no_cb && *no_cb)) params.cb_eval = capture_cb;
     params.cb_eval_user_data = st;
+
+    if (const char * lo = getenv("ORACLE_IDX_LO")) g_idx_lo = atoi(lo);
+    if (const char * hi = getenv("ORACLE_IDX_HI")) g_idx_hi = atoi(hi);
 
     LOG_INF("%s: capture start | model=%s n_gpu_layers=%d\n", __func__,
             params.model.path.c_str(), params.n_gpu_layers);
@@ -107,8 +123,14 @@ int main(int argc, char ** argv) {
     // decode is captured from offset 0.
     st->offset = 0;
     st->nodes = 0;
+    st->seen = 0;
+    st->cur = -1;
     st->data.seekp(0);
     st->index.seekp(0);
+    st->data.close();
+    st->index.close();
+    st->data.open(out_prefix + ".bin", std::ios::binary | std::ios::trunc);
+    st->index.open(out_prefix + ".idx", std::ios::trunc);
 
     std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
     llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
@@ -119,8 +141,9 @@ int main(int argc, char ** argv) {
     llama_synchronize(ctx);
 
     llama_token tok = common_sampler_sample(init->sampler(0), ctx, -1);
-    LOG_INF("%s: sampled token %d | nodes captured: %d | bytes: %llu\n",
-            __func__, tok, st->nodes, (unsigned long long) st->offset);
+    LOG_INF("%s: sampled token %d | nodes captured: %d | graph seen: %d | window: [%d,%d) | bytes: %llu\n",
+            __func__, tok, st->nodes, st->seen, g_idx_lo, g_idx_hi,
+            (unsigned long long) st->offset);
 
     st->data.close();
     st->index.close();
