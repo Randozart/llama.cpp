@@ -96,6 +96,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <set>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -1803,6 +1804,17 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    /* VITRIOL: fused gate/up reads the expert weights directly from
+     * src0->data. For VITRIOL-buffered weights that is the host-RAM buffer,
+     * which the fused kernel cannot stream - the weights must go through
+     * the LRU path (ggml_cuda_mul_mat_id) instead. */
+    if (ffn_up->src[0] && ffn_up->src[0]->buffer) {
+        extern bool vitriol_is_vitriol_buffer_type(ggml_backend_buffer_type_t);
+        if (vitriol_is_vitriol_buffer_type(ffn_up->src[0]->buffer->buft)) {
+            return false;
+        }
+    }
+
     const ggml_op expected_bias_op = is_mul_mat ? GGML_OP_ADD : GGML_OP_ADD_ID;
     const ggml_tensor * ffn_up_bias_src   = has_scale ? ffn_up_scale   : ffn_up;
     const ggml_tensor * ffn_gate_bias_src = has_scale ? ffn_gate_scale : ffn_gate;
@@ -2039,6 +2051,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    { /* O1 diagnostic: classify EVERY ffn MUL_MAT_ID src0 buffer, any path. */
+        static std::set<std::string> s_mmid_seen;
+        if (src0->name && strstr(src0->name, "ffn_")) {
+            const char * bt = src0->buffer
+                ? ggml_backend_buft_name(ggml_backend_buffer_get_type(src0->buffer))
+                : "(no buffer)";
+            std::string key = std::string(src0->name) + "|" + bt;
+            if (s_mmid_seen.insert(key).second) {
+                fprintf(stderr, "VITRIOL_MMID_SRC0 tensor=%s buft=%s\n",
+                        src0->name, bt);
+            }
+        }
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -5437,7 +5462,7 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 }
 
 // TODO: move these functions here
-static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+static bool ggml_backend_cuda_device_supports_op_inner(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
     // check if all the sources are allocated on this device
@@ -5449,6 +5474,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
     }
+
 
     // VITRIOL: host-streamed expert buffers only serve MUL_MAT_ID. Any other
     // op on a VITRIOL buffer would read host pointers as device pointers.
@@ -5973,6 +5999,24 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
+/* O1b probe wrapper: log the verdict for expert MUL_MAT_ID placement. */
+static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    const bool r = ggml_backend_cuda_device_supports_op_inner(dev, op);
+    static std::set<std::string> s_seen;
+    if (op->op == GGML_OP_MUL_MAT_ID && op->src[0] && op->src[0]->name &&
+        strstr(op->src[0]->name, "ffn_")) {
+        ggml_backend_cuda_device_context * dev_ctx =
+            (ggml_backend_cuda_device_context *) dev->context;
+        std::string key = std::string(op->src[0]->name) + "|dev" +
+            std::to_string(dev_ctx->device);
+        if (s_seen.insert(key).second) {
+            fprintf(stderr, "VITRIOL_SUP dev=%d tensor=%s supported=%d\n",
+                    dev_ctx->device, op->src[0]->name, (int) r);
+        }
+    }
+    return r;
+}
+
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .get_name                = */ ggml_backend_cuda_device_get_name,
     /* .get_description         = */ ggml_backend_cuda_device_get_description,
@@ -5983,6 +6027,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .get_buffer_type         = */ ggml_backend_cuda_device_get_buffer_type,
     /* .get_host_buffer_type    = */ ggml_backend_cuda_device_get_host_buffer_type,
     /* .buffer_from_host_ptr    = */ NULL,
+
     /* .supports_op             = */ ggml_backend_cuda_device_supports_op,
     /* .supports_buft           = */ ggml_backend_cuda_device_supports_buft,
     /* .offload_op              = */ ggml_backend_cuda_device_offload_op,
