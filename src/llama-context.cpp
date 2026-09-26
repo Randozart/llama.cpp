@@ -232,22 +232,20 @@ llama_context::llama_context(
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
     cparams.fused_gdn_ar = true;
-    /* VITRIOL: the fused chunked GDN kernel breaks under the server's sched
-     * at n_tokens >= 16 (first request collapses to token-0 spam; oracle
-     * cb_eval graphs and plain CPU/-ngl4 runs are unaffected). Route the
-     * chunked path through build_delta_net_chunking until the kernel is
-     * fixed. */
-    cparams.fused_gdn_ch = getenv("VITRIOL_FUSED_GDN_CH") != nullptr;
+    /* VITRIOL: bisection gate for the 16-token cliff hunt (qwen4exp).
+     * Default ON (upstream); VITRIOL_NO_FUSED_GDN_CH=1 routes the chunked
+     * path through build_delta_net_chunking for A/B runs. */
+    cparams.fused_gdn_ch = getenv("VITRIOL_NO_FUSED_GDN_CH") == nullptr;
     cparams.auto_fgdn    = false;
 
     cparams.fused_lid = true;
     cparams.auto_flid = false;
 
-    /* VITRIOL: collapse bisection - the 16-token cliff survives GDN-CH off;
-     * gate the DSV4 HC fused ops next (hc_ nodes, chunked combine). */
-    cparams.fused_dsv4_hc_pre  = getenv("VITRIOL_FUSED_DSV4_HC") != nullptr;
-    cparams.fused_dsv4_hc_comb = getenv("VITRIOL_FUSED_DSV4_HC") != nullptr;
-    cparams.fused_dsv4_hc_post = getenv("VITRIOL_FUSED_DSV4_HC") != nullptr;
+    /* VITRIOL: bisection gate (16-token cliff hunt, qwen4exp). Default ON
+     * (upstream); VITRIOL_NO_FUSED_DSV4_HC=1 disables for A/B runs. */
+    cparams.fused_dsv4_hc_pre  = getenv("VITRIOL_NO_FUSED_DSV4_HC") == nullptr;
+    cparams.fused_dsv4_hc_comb = getenv("VITRIOL_NO_FUSED_DSV4_HC") == nullptr;
+    cparams.fused_dsv4_hc_post = getenv("VITRIOL_NO_FUSED_DSV4_HC") == nullptr;
     cparams.auto_fhc           = true;
 
     // with causal attention, the batch size is limited by the context size
