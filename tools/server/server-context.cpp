@@ -874,6 +874,12 @@ public:
         metrics.reset_bucket();
     }
 
+    /* VITRIOL session routing: whether a slot is mid-generation. Read from
+     * the HTTP thread by the session router before evicting its state. */
+    bool slot_processing(int id) const {
+        return id >= 0 && id < (int) slots.size() && slots[id].is_processing();
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -4243,10 +4249,17 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
-            const json & data,
+            const json & data_in,
             const std::vector<raw_buffer> & files,
             task_response_type res_type) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
+
+    // VITRIOL: Optane-backed session LRU - map X-Session-Id onto a slot,
+    // persisting evicted sessions and restoring on demand. The rest of
+    // this function uses the routed copy via the `data` reference.
+    json data_routed = data_in;
+    route_session(data_routed, req);
+    const json & data = data_routed;
 
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
@@ -5260,6 +5273,155 @@ void server_routes::init_routes() {
         res->ok(result->to_json());
         return res;
     };
+}
+
+bool server_routes::route_session_save(int id_slot, const std::string & filename) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot  = id_slot;
+        task.slot_action.filename = filename;
+        task.slot_action.filepath = params.slot_save_path + filename;
+        rd.post_task(std::move(task));
+    }
+    auto result = rd.next([]{ return false; });
+    if (!result || result->is_error()) {
+        SRV_ERR("session router: failed to persist slot %d -> %s\n", id_slot, filename.c_str());
+        return false;
+    }
+    SRV_INF("session router: persisted slot %d -> %s\n", id_slot, filename.c_str());
+    return true;
+}
+
+bool server_routes::route_session_restore(int id_slot, const std::string & filename) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_RESTORE);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot  = id_slot;
+        task.slot_action.filename = filename;
+        task.slot_action.filepath = params.slot_save_path + filename;
+        rd.post_task(std::move(task));
+    }
+    auto result = rd.next([]{ return false; });
+    if (!result || result->is_error()) {
+        SRV_ERR("session router: failed to restore %s -> slot %d\n", filename.c_str(), id_slot);
+        return false;
+    }
+    SRV_INF("session router: restored %s -> slot %d\n", filename.c_str(), id_slot);
+    return true;
+}
+
+/* Pick the slot a new session claims: prefer slots without an assigned
+ * session, else the least-recently-used idle session (persisted first).
+ * keep_key protects the requesting session's own entry. Returns -1 when
+ * nothing can be evicted safely (all candidates mid-generation). */
+int server_routes::route_session_pick_victim(const std::string & keep_key) {
+    int victim = -1;
+    std::string victim_key;
+    int64_t oldest = LLONG_MAX;
+    for (int s = 0; s < (int) params.n_parallel; ++s) {
+        auto sit = slot_sessions.find(s);
+        if (sit == slot_sessions.end()) {
+            return s; // unclaimed slot: claim immediately
+        }
+        if (ctx_server.slot_processing(s)) {
+            continue; // never evict mid-generation
+        }
+        auto & se = sessions[sit->second];
+        if (se.last_used < oldest) {
+            oldest = se.last_used;
+            victim = s;
+            victim_key = sit->second;
+        }
+    }
+    if (victim < 0 || victim_key == keep_key) {
+        return -1;
+    }
+    auto & ve = sessions[victim_key];
+    if (ve.id_slot >= 0) {
+        if (!route_session_save(victim, ve.filename)) {
+            return -1; // could not persist: do not destroy resident state
+        }
+        ve.id_slot = -1;
+    }
+    slot_sessions.erase(victim);
+    return victim;
+}
+
+void server_routes::route_session(json & data, const server_http_req & req) {
+    if (params.slot_save_path.empty() || (int) params.n_parallel < 2) {
+        return;
+    }
+    if (data.contains("id_slot")) {
+        return; // explicit pinning wins over session affinity
+    }
+    std::string key;
+    for (const auto & [k, v] : req.headers) {
+        std::string lk;
+        lk.reserve(k.size());
+        for (char c : k) {
+            lk.push_back((char) tolower((unsigned char) c));
+        }
+        if (lk == "x-session-id" && !v.empty()) {
+            key = v;
+            break;
+        }
+    }
+    if (key.empty()) {
+        return;
+    }
+    std::string safe;
+    safe.reserve(key.size());
+    for (char c : key) {
+        safe.push_back(std::isalnum((unsigned char) c) || c == '-' || c == '_' || c == '.' ? c : '_');
+    }
+
+    const int64_t now = ggml_time_ms();
+
+    std::lock_guard<std::mutex> lock(mutex_sessions);
+    auto it = sessions.find(key);
+    if (it == sessions.end()) {
+        // new session: claim a slot (persisting the LRU victim if needed)
+        int victim = route_session_pick_victim("");
+        if (victim < 0) {
+            SRV_INF("session router: no evictable slot for new session %s, going unrouted\n", key.c_str());
+            return;
+        }
+        session_entry e;
+        e.id_slot   = victim;
+        e.filename  = "sess-" + safe + ".bin";
+        e.last_used = now;
+        sessions[key] = e;
+        slot_sessions[victim] = key;
+        data["id_slot"] = victim;
+        SRV_INF("session router: session %s -> slot %d (new)\n", key.c_str(), victim);
+        return;
+    }
+
+    auto & e = it->second;
+    e.last_used = now;
+    if (e.id_slot >= 0) {
+        slot_sessions[e.id_slot] = key;
+        data["id_slot"] = e.id_slot;
+        return;
+    }
+
+    // session state is persisted: claim a slot and restore it
+    int victim = route_session_pick_victim(key);
+    if (victim < 0) {
+        return; // unrouted: fresh prefill this once
+    }
+    if (!route_session_restore(victim, e.filename)) {
+        return; // restore failed: run fresh rather than fail the request
+    }
+    e.id_slot = victim;
+    slot_sessions[victim] = key;
+    data["id_slot"] = victim;
+    SRV_INF("session router: session %s restored -> slot %d\n", key.c_str(), victim);
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {

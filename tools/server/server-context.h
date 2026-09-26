@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <set>
 
 struct server_context_impl; // private implementation
@@ -190,4 +191,21 @@ private:
     bool           should_reset_buckets = false;
     // call right before sleep to update the cached responses
     void update_cached_responses(bool is_sleeping);
+
+    // VITRIOL: Optane-backed session LRU (milestone B). Maps X-Session-Id
+    // headers onto slots, persisting evicted session state (KV + recurrent)
+    // under slot_save_path and restoring it on demand, so switching sessions
+    // skips re-prefill entirely.
+    struct session_entry {
+        int         id_slot   = -1;     // resident slot, -1 = persisted only
+        std::string filename;           // state file under slot_save_path
+        int64_t     last_used = 0;
+    };
+    std::mutex                           mutex_sessions;
+    std::map<std::string, session_entry> sessions;      // session key -> entry
+    std::map<int, std::string>           slot_sessions; // slot id -> session key
+    void route_session(json & data, const server_http_req & req);
+    bool route_session_save(int id_slot, const std::string & filename);
+    bool route_session_restore(int id_slot, const std::string & filename);
+    int  route_session_pick_victim(const std::string & keep_key);
 };
