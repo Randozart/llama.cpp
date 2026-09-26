@@ -34,6 +34,9 @@ bool vitriol_rust_enabled(void) {
 
 #include <cstring>
 #include <unordered_map>
+#include <set>
+#include <map>
+#include <array>
 #include <list>
 #include <mutex>
 #include <algorithm>
@@ -113,6 +116,12 @@ struct LRUKeyHash {
  * and excluded from victim selection. */
 static std::unordered_map<LRUKey, int, LRUKeyHash> g_lru_map[GGML_CUDA_MAX_DEVICES];
 static std::list<LRUKey> g_lru_order[GGML_CUDA_MAX_DEVICES];
+/* Next never-allocated slot index per device. Slots are only retired by
+ * eviction (whose slot is immediately reused by the evicting key), so a
+ * fresh slot must come from this monotonic counter - NOT from
+ * lru_map.size(), which drops below num_slots after the first eviction
+ * and would alias a new key onto a still-occupied slot. */
+static int g_lru_next_fresh_slot[GGML_CUDA_MAX_DEVICES];
 static std::vector<bool> g_lru_compute_pending[GGML_CUDA_MAX_DEVICES];
 static std::mutex        g_lru_mtx;
 
@@ -1375,7 +1384,61 @@ CUdeviceptr vitriol_lru_ensure(
     if (store_device && (!tensor_base || expert_size == 0))
         GGML_ABORT("VITRIOL store H2D called with invalid geometry");
 
+    /* VITRIOL_NO_LRU=1: diagnostic kill-switch - bypass the VRAM pool and
+     * let every slice read straight from the host page. Isolates pool
+     * (hit/miss/evict) bugs from sync-loop bugs. */
+    static const bool no_lru = getenv("VITRIOL_NO_LRU") != nullptr;
+    if (no_lru)
+        return 0;
+
     int dev = vitriol_current_device();
+
+    /* VITRIOL_LRU_TRACE=1 with VITRIOL_LRU_TRACE_KEY=tensor:expert[,expert...]:
+     * log branch/slot/fill for one key. Diagnostic for zero-slot reads. */
+    static const bool trace = getenv("VITRIOL_LRU_TRACE") != nullptr;
+    static const unsigned long long trace_base = [] {
+        const char* e = getenv("VITRIOL_LRU_TRACE_BASE");
+        return e ? strtoull(e, nullptr, 0) : 0ull;
+    }();
+    auto trace_log = [&](const char* what, int slot, CUdeviceptr dst, unsigned got) {
+        fprintf(stderr, "VITRIOL_TRACE %s dev=%d expert=%d slot=%d dst=%llx first=%08x\n",
+                what, dev, expert_idx, slot, (unsigned long long) dst, got);
+    };
+    if (trace && (!trace_base || (uintptr_t) tensor_base == trace_base)) {
+        static const char* te = getenv("VITRIOL_LRU_TRACE_EXPERTS");
+        static std::set<int> experts;
+        if (te && experts.empty()) {
+            for (char* s = strdup(te); ; ) {
+                char* p = strchr(s, ','); if (p) *p = 0;
+                experts.insert(atoi(s));
+                if (!p) break; s = p + 1;
+            }
+        }
+        if (experts.empty() || experts.count(expert_idx)) {
+            /* VITRIOL_SENTINEL: pure-CPU ground truth. Capture the host
+             * bytes once (load time / first request - known good), then
+             * flag any divergence on later visits. Catches host-buffer
+             * zeroing that CUDA-side compares (src vs vram) cannot see
+             * because both sides go zero together. */
+            static std::map<std::pair<uintptr_t,int>, std::array<unsigned char,12>> g_sent;
+            auto sk = std::make_pair((uintptr_t) tensor_base, expert_idx);
+            auto sit = g_sent.find(sk);
+            if (sit == g_sent.end()) {
+                std::array<unsigned char,12> b{};
+                memcpy(b.data(), expert_data, b.size());
+                g_sent.emplace(sk, b);
+            } else if (memcmp(sit->second.data(), expert_data, sit->second.size()) != 0) {
+                fprintf(stderr, "VITRIOL_SENTINEL DIVERGED tensor=%p expert=%d first=%02x%02x%02x want=%02x%02x%02x\n",
+                        tensor_base, expert_idx,
+                        ((const unsigned char*)expert_data)[0], ((const unsigned char*)expert_data)[1], ((const unsigned char*)expert_data)[2],
+                        sit->second[0], sit->second[1], sit->second[2]);
+            }
+            char hb[4] = {0};
+            cudaMemcpy(hb, expert_data, 4, cudaMemcpyHostToHost);
+            unsigned first; memcpy(&first, hb, 4);
+            trace_log("ENSURE-ENTER", -1, 0, first);
+        }
+    }
 
     if (!lru_ensure_stream(dev))
         GGML_ABORT("VITRIOL failed to create LRU stream");
@@ -1411,7 +1474,24 @@ CUdeviceptr vitriol_lru_ensure(
             if ((int)g_lru_compute_pending[dev].size() > it->second) {
                 g_lru_compute_pending[dev][it->second] = true;
             }
-            return g_lru_pool[dev] + (size_t)it->second * g_lru_slot_size[dev];
+            CUdeviceptr hit_dst = g_lru_pool[dev] + (size_t)it->second * g_lru_slot_size[dev];
+            if (trace && (!trace_base || (uintptr_t) tensor_base == trace_base)) {
+                static const char* te = getenv("VITRIOL_LRU_TRACE_EXPERTS");
+                static std::set<int> experts;
+                if (te && experts.empty()) {
+                    for (char* s = strdup(te); ; ) {
+                        char* p = strchr(s, ','); if (p) *p = 0;
+                        experts.insert(atoi(s));
+                        if (!p) break; s = p + 1;
+                    }
+                }
+                if (experts.empty() || experts.count(expert_idx)) {
+                    unsigned first = 0;
+                    cuMemcpyDtoH(&first, hit_dst, 4);
+                    trace_log("HIT", it->second, hit_dst, first);
+                }
+            }
+            return hit_dst;
         }
     }
 
@@ -1421,14 +1501,15 @@ CUdeviceptr vitriol_lru_ensure(
     int slot;
     {
         std::lock_guard<std::mutex> lock(g_lru_mtx);
-        if ((int)lru_map.size() < g_lru_num_slots[dev]) {
-            slot = (int)lru_map.size();
+        if (g_lru_next_fresh_slot[dev] < g_lru_num_slots[dev]) {
+            slot = g_lru_next_fresh_slot[dev]++;
         } else {
             // PROVENANCE: inspiration — kimi-k3-in-c (Apache-2.0; re-derived, not copied).
             // Three-state cache principle: skip INFLIGHT slots in victim selection. Pick
             // the LRU candidate whose last DMA has COMPLETED (cuEventQuery == SUCCESS)
             // instead of blindly evicting the LRU and stalling on its in-flight fill.
             LRUKey evict = lru_order.back();
+            bool found = false;
             for (auto it = std::prev(lru_order.end()); it != lru_order.begin(); --it) {
                 auto mit = lru_map.find(*it);
                 int s = (mit != lru_map.end()) ? mit->second : -1;
@@ -1437,8 +1518,20 @@ CUdeviceptr vitriol_lru_ensure(
                 if (s >= 0 && s < g_lru_num_slots[dev] && !pending &&
                     cuEventQuery(g_lru_slot_events[dev][s]) == CUDA_SUCCESS) {
                     evict = *it;
+                    found = true;
                     break;
                 }
+            }
+            if (!found) {
+                /* Every slot's last-read event is still unfired: the compute
+                 * stream lags the host by more than the whole pool. Falling
+                 * back to lru_order.back() would overwrite a slot whose
+                 * reader kernels have not executed yet and feed torn weights
+                 * to the rest of the run. Drain the compute stream instead -
+                 * every pending reader completes, then the true LRU is safe
+                 * to refill. */
+                cuStreamSynchronize(cstream);
+                evict = lru_order.back();
             }
             lru_order.remove(evict);
             auto eit = lru_map.find(evict);
@@ -1495,7 +1588,10 @@ CUdeviceptr vitriol_lru_ensure(
     static const bool vram_hash_dbg = getenv("VITRIOL_LRU_VRAM_HASH") != nullptr;
     if (vram_hash_dbg) {
         /* Verify the DMA landed the exact bytes: block until the H2D is
-         * done, read the slot back over D2H, hash both sides. */
+         * done, read the slot back over D2H, hash all three sides:
+         * expected (host expert_data), copy_source (what the DMA read),
+         * and the VRAM slot. A bounce/overwrite race shows up as
+         * source != expected; a DMA failure as vram != source. */
         if (cuStreamSynchronize(g_lru_stream[dev]) != CUDA_SUCCESS)
             GGML_ABORT("VITRIOL vram-hash sync failed");
         std::vector<char> vbuf(expert_size);
@@ -1504,14 +1600,34 @@ CUdeviceptr vitriol_lru_ensure(
             GGML_ABORT("VITRIOL vram-hash D2H failed");
         unsigned long long vh = vitriol_fnv1a(vbuf.data(), expert_size);
         unsigned long long sh = vitriol_fnv1a(copy_source, expert_size);
-        fprintf(stderr, "VITRIOL_LRU_VRAM_HASH dev=%d tensor=%p expert=%d size=%zu src=%016llx vram=%016llx %s\n",
-                dev, tensor_base, expert_idx, expert_size, sh, vh,
-                sh == vh ? "OK" : "MISMATCH");
+        unsigned long long eh = vitriol_fnv1a(expert_data, expert_size);
+        const char * verdict = (sh == eh) ?
+            (vh == eh ? "OK" : "VRAM_BAD") : "SRC_BAD";
+        if (strcmp(verdict, "OK") != 0)
+            fprintf(stderr, "VITRIOL_VHASH %s dev=%d tensor=%p expert=%d size=%zu exp=%016llx src=%016llx vram=%016llx\n",
+                    verdict, dev, tensor_base, expert_idx, expert_size, eh, sh, vh);
     }
 
     r = cuStreamWaitEvent(cstream, g_lru_slot_events[dev][slot], 0);
     if (r != CUDA_SUCCESS)
         GGML_ABORT("VITRIOL LRU compute wait failed");
+
+    if (trace && (!trace_base || (uintptr_t) tensor_base == trace_base)) {
+        static const char* te = getenv("VITRIOL_LRU_TRACE_EXPERTS");
+        static std::set<int> experts;
+        if (te && experts.empty()) {
+            for (char* s = strdup(te); ; ) {
+                char* p = strchr(s, ','); if (p) *p = 0;
+                experts.insert(atoi(s));
+                if (!p) break; s = p + 1;
+            }
+        }
+        if (experts.empty() || experts.count(expert_idx)) {
+            unsigned first = 0;
+            cuMemcpyDtoH(&first, dst, 4);
+            trace_log("MISS-FILLED", slot, dst, first);
+        }
+    }
 
     if (vitriol_lru_strict()) {
         r = cuStreamSynchronize(g_lru_stream[dev]);
@@ -1558,8 +1674,8 @@ static void vitriol_lru_prefetch_async(
     int slot;
     {
         std::lock_guard<std::mutex> lock(g_lru_mtx);
-        if ((int)lru_map.size() < g_lru_num_slots[dev]) {
-            slot = (int)lru_map.size();
+        if (g_lru_next_fresh_slot[dev] < g_lru_num_slots[dev]) {
+            slot = g_lru_next_fresh_slot[dev]++;
         } else {
             LRUKey evict = lru_order.back();
             lru_order.pop_back();

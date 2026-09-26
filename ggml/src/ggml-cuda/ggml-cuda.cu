@@ -2063,6 +2063,24 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                         src0->name, bt);
             }
         }
+        /* Pointer-identity probe: if src0->data changes across decodes for
+         * the same tensor name, the LRU keys change too (0 hits forever) and
+         * the ensure-DMA reads a sched-copy region that the next decode's
+         * selective-copy overwrites. */
+        static std::set<std::string> s_ptr_seen;
+        if (src0->name && strstr(src0->name, "ffn_")) {
+            cudaPointerAttributes att{};
+            const char * where = "?";
+            if (cudaPointerGetAttributes(&att, src0->data) == cudaSuccess) {
+                where = att.type == cudaMemoryTypeDevice ? "DEVICE" :
+                        att.type == cudaMemoryTypeHost ? "HOST" : "MANAGED/UNREGISTERED";
+            }
+            std::string key = std::string(src0->name) + "@" + where;
+            if (s_ptr_seen.insert(key).second) {
+                fprintf(stderr, "VITRIOL_MMID_PTR tensor=%s data=%p mem=%s\n",
+                        src0->name, src0->data, where);
+            }
+        }
     }
 
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -2253,6 +2271,26 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 (const char *) src0_eff->data + i02*nb02, nb02, stream);
             if (expert_vram) {
                 src0_slice.data = (char *) expert_vram;
+            }
+            /* VITRIOL_LRU_READBACK=1: synchronous D2H of the slot the kernel
+             * is about to read, compared against the expected bytes. Catches
+             * wrong-slot reads and between-fill overwrites at the moment of
+             * use. */
+            static const bool vrb = getenv("VITRIOL_LRU_READBACK") != nullptr;
+            static int vrb_bad = 0, vrb_ok = 0;
+            if (vrb && expert_vram) {
+                unsigned char got[12], exp[12];
+                if (cuMemcpyDtoH(got, (CUdeviceptr) src0_slice.data, sizeof(got)) == CUDA_SUCCESS) {
+                    memcpy(exp, (const char *) src0_eff->data + i02*nb02, sizeof(exp));
+                    if (memcmp(got, exp, sizeof(got)) != 0) {
+                        if (vrb_bad < 20)
+                            fprintf(stderr, "VITRIOL_READBACK BAD tensor=%s expert=%d exp=%02x%02x%02x%02x got=%02x%02x%02x%02x\n",
+                                    src0->name, (int) i02, exp[0],exp[1],exp[2],exp[3], got[0],got[1],got[2],got[3]);
+                        vrb_bad++;
+                    } else {
+                        vrb_ok++;
+                    }
+                }
             }
             /* Approximate output cache: single-token-per-expert decode only. */
             if (vitriol_output_cache_active() && tokens_per_expert[i02] == 1) {
@@ -4929,7 +4967,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
 #ifdef USE_CUDA_GRAPH
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
-    const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+    static const bool vitriol_no_graphs = getenv("VITRIOL_NO_GRAPHS") != nullptr;
+    const bool use_cuda_graph = !vitriol_no_graphs && ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
     GGML_UNUSED(cuda_ctx);
