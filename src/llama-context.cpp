@@ -232,7 +232,12 @@ llama_context::llama_context(
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
     cparams.fused_gdn_ar = true;
-    cparams.fused_gdn_ch = true;
+    /* VITRIOL: the fused chunked GDN kernel breaks under the server's sched
+     * at n_tokens >= 16 (first request collapses to token-0 spam; oracle
+     * cb_eval graphs and plain CPU/-ngl4 runs are unaffected). Route the
+     * chunked path through build_delta_net_chunking until the kernel is
+     * fixed. */
+    cparams.fused_gdn_ch = getenv("VITRIOL_FUSED_GDN_CH") != nullptr;
     cparams.auto_fgdn    = false;
 
     cparams.fused_lid = true;
