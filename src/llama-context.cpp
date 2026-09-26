@@ -243,9 +243,11 @@ llama_context::llama_context(
     cparams.fused_lid = true;
     cparams.auto_flid = false;
 
-    cparams.fused_dsv4_hc_pre  = true;
-    cparams.fused_dsv4_hc_comb = true;
-    cparams.fused_dsv4_hc_post = true;
+    /* VITRIOL: collapse bisection - the 16-token cliff survives GDN-CH off;
+     * gate the DSV4 HC fused ops next (hc_ nodes, chunked combine). */
+    cparams.fused_dsv4_hc_pre  = getenv("VITRIOL_FUSED_DSV4_HC") != nullptr;
+    cparams.fused_dsv4_hc_comb = getenv("VITRIOL_FUSED_DSV4_HC") != nullptr;
+    cparams.fused_dsv4_hc_post = getenv("VITRIOL_FUSED_DSV4_HC") != nullptr;
     cparams.auto_fhc           = true;
 
     // with causal attention, the batch size is limited by the context size
