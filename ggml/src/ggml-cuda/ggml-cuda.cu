@@ -2342,6 +2342,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    {
+        static const bool nh_probe = getenv("VITRIOL_NODE_HASH") != nullptr;
+        if (nh_probe) {
+            fprintf(stderr, "VITRIOL_NH_ENTER op=%s name=%s\n", ggml_op_name(dst->op), dst->name);
+        }
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -2700,6 +2706,30 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     if (err != cudaSuccess) {
         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
         CUDA_CHECK(err);
+    }
+
+    /* VITRIOL_NODE_HASH: cb-free per-node output hash. Synchronous on
+     * purpose. Server (bulk eval) vs oracle (cb_eval) runs of the same
+     * shape must produce identical hashes; first divergence names the
+     * poisoned node. */
+    {
+        static const int nh = [] {
+            const char * e = getenv("VITRIOL_NODE_HASH");
+            return e ? atoi(e) : 0;
+        }();
+        if (nh) {
+            cudaStreamSynchronize(ctx.stream());
+            const size_t nb = std::min(ggml_nbytes(dst), (size_t) 4096);
+            unsigned long long h = 14695981039346656037ULL;
+            const unsigned char * p = (const unsigned char *) dst->data;
+            for (size_t i = 0; i < nb; ++i) {
+                h = (h ^ p[i]) * 1099511628211ULL;
+            }
+            fprintf(stderr, "VITRIOL_NH %s op=%s ne=[%lld,%lld,%lld] hash=%016llx\n",
+                    dst->name, ggml_op_name(dst->op),
+                    (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2],
+                    h);
+        }
     }
 
     return true;
