@@ -64,10 +64,22 @@ bool capture_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
     st->data.write(buf.data(), nbytes);
 
-    char row[1024];
+    char row[2048];
+    /* O1 probe: record the op and the src0 tensor + its buffer type so the
+     * capture identifies exactly which op and which memory each node reads
+     * (answers the gate/up placement question). */
+    char src0desc[256] = "";
+    if (t->src[0]) {
+        const char * bn = "(none)";
+        if (t->src[0]->buffer) {
+            bn = ggml_backend_buffer_name(t->src[0]->buffer);
+        }
+        snprintf(src0desc, sizeof(src0desc), "%s|%s",
+                 t->src[0]->name ? t->src[0]->name : "?", bn);
+    }
     snprintf(row, sizeof(row),
-             "{\"i\":%d,\"name\":\"%s\",\"type\":\"%s\",\"ne\":[%lld,%lld,%lld,%lld],\"off\":%llu,\"n\":%llu}\n",
-             st->cur, t->name, ggml_type_name(t->type),
+             "{\"i\":%d,\"name\":\"%s\",\"op\":\"%s\",\"src0\":\"%s\",\"type\":\"%s\",\"ne\":[%lld,%lld,%lld,%lld],\"off\":%llu,\"n\":%llu}\n",
+             st->cur, t->name, ggml_op_name(t->op), src0desc, ggml_type_name(t->type),
              (long long) t->ne[0], (long long) t->ne[1],
              (long long) t->ne[2], (long long) t->ne[3],
              (unsigned long long) st->offset, (unsigned long long) nbytes);
@@ -83,6 +95,7 @@ bool capture_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 int main(int argc, char ** argv) {
     common_params params;
     params.n_predict = 1;
+    if (const char * np = getenv("ORACLE_N_PREDICT")) params.n_predict = atoi(np);
     params.prompt = "The capital of France is";
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
@@ -145,9 +158,69 @@ int main(int argc, char ** argv) {
             __func__, tok, st->nodes, st->seen, g_idx_lo, g_idx_hi,
             (unsigned long long) st->offset);
 
+    // Continue decoding so the capture also covers n_tokens=1 decode-step
+    // graphs - the request-2 collapse shows up there, not in the prefill.
+    for (int step = 1; step < params.n_predict; ++step) {
+        std::vector<llama_token> t1 = { tok };
+        llama_batch b1 = llama_batch_get_one(t1.data(), 1);
+        if (llama_decode(ctx, b1) != 0) {
+            LOG_ERR("%s: decode step %d failed\n", __func__, step);
+            return 1;
+        }
+        llama_synchronize(ctx);
+        tok = common_sampler_sample(init->sampler(0), ctx, -1);
+    }
+    LOG_INF("%s: shot-1 decode steps done (%d)\n", __func__, params.n_predict - 1);
+
     st->data.close();
     st->index.close();
-    LOG_INF("%s: wrote %s.bin and %s.idx\n", __func__, out_prefix.c_str(), out_prefix.c_str());
+
+    // ORACLE_EXTRA_PROMPT: run a second, different-length prompt in the SAME
+    // process (KV cleared between shots), capturing shot 2 separately. The
+    // request-2 collapse reproduces only when a new graph shape follows an
+    // earlier one; diffing shot 2 against a solo run of the same prompt
+    // localizes the first corrupted node.
+    const char * extra = getenv("ORACLE_EXTRA_PROMPT");
+    if (extra && *extra) {
+        const char * out2 = getenv("ORACLE_OUT2");
+        const std::string p2 = (out2 && *out2) ? out2 : "oracle-capture2";
+        st->data.open(p2 + ".bin", std::ios::binary | std::ios::trunc);
+        st->index.open(p2 + ".idx", std::ios::trunc);
+        if (!st->data || !st->index) {
+            LOG_ERR("%s: cannot open %s.bin/.idx\n", __func__, p2.c_str());
+            return 1;
+        }
+        st->offset = 0;
+        st->nodes = 0;
+        st->seen = 0;
+        st->cur = -1;
+
+        llama_memory_clear(llama_get_memory(ctx), false);
+        std::vector<llama_token> tokens2 = common_tokenize(ctx, extra, true);
+        llama_batch batch2 = llama_batch_get_one(tokens2.data(), tokens2.size());
+        if (llama_decode(ctx, batch2) != 0) {
+            LOG_ERR("%s: shot-2 decode failed\n", __func__);
+            return 1;
+        }
+        llama_synchronize(ctx);
+        llama_token tok2 = common_sampler_sample(init->sampler(0), ctx, -1);
+        LOG_INF("%s: shot-2 sampled token %d | nodes captured: %d | graph seen: %d | bytes: %llu\n",
+                __func__, tok2, st->nodes, st->seen, (unsigned long long) st->offset);
+        for (int step = 1; step < params.n_predict; ++step) {
+            std::vector<llama_token> t2 = { tok2 };
+            llama_batch b2 = llama_batch_get_one(t2.data(), 1);
+            if (llama_decode(ctx, b2) != 0) {
+                LOG_ERR("%s: shot-2 decode step %d failed\n", __func__, step);
+                return 1;
+            }
+            llama_synchronize(ctx);
+            tok2 = common_sampler_sample(init->sampler(0), ctx, -1);
+        }
+        LOG_INF("%s: shot-2 decode steps done (%d)\n", __func__, params.n_predict - 1);
+        st->data.close();
+        st->index.close();
+        LOG_INF("%s: wrote %s.bin and %s.idx\n", __func__, p2.c_str(), p2.c_str());
+    }
 
     llama_backend_free();
     delete st;
