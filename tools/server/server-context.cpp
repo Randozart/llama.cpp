@@ -5385,16 +5385,34 @@ void server_routes::route_session(json & data, const server_http_req & req) {
     std::lock_guard<std::mutex> lock(mutex_sessions);
     auto it = sessions.find(key);
     if (it == sessions.end()) {
-        // new session: claim a slot (persisting the LRU victim if needed)
+        // new session: claim a slot (persisting the LRU victim if needed).
+        // VITRIOL restart persistence: a state file left by a previous
+        // server run makes this a restore, not a fresh prefill.
+        session_entry e;
+        e.filename  = "sess-" + safe + ".bin";
+        e.last_used = now;
+        const bool has_state = std::filesystem::exists(
+                std::filesystem::path(params.slot_save_path) / e.filename);
+        if (has_state) {
+            int victim0 = route_session_pick_victim("");
+            if (victim0 >= 0 && route_session_restore(victim0, e.filename)) {
+                e.id_slot = victim0;
+                sessions[key] = e;
+                slot_sessions[victim0] = key;
+                data["id_slot"] = victim0;
+                SRV_INF("session router: session %s restored from previous run -> slot %d\n",
+                        key.c_str(), victim0);
+                return;
+            }
+            // no slot or restore failed: fall through to a fresh claim;
+            // the stale file gets overwritten by the next eviction save
+        }
         int victim = route_session_pick_victim("");
         if (victim < 0) {
             SRV_INF("session router: no evictable slot for new session %s, going unrouted\n", key.c_str());
             return;
         }
-        session_entry e;
-        e.id_slot   = victim;
-        e.filename  = "sess-" + safe + ".bin";
-        e.last_used = now;
+        e.id_slot = victim;
         sessions[key] = e;
         slot_sessions[victim] = key;
         data["id_slot"] = victim;
