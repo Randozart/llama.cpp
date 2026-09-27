@@ -3520,7 +3520,14 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    // fair-share (2026-09-27): cap each slot's chunk per
+                    // iteration at n_ubatch. Filling to n_batch (default
+                    // 2048) let one long prefill monopolize every iteration
+                    // and starve other slots (batch.size() >= n_batch skip)
+                    // until the whole prompt was done.
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens()
+                            && batch.size() < n_batch
+                            && batch.size() - n_tokens_prev < n_ubatch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
