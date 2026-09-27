@@ -523,19 +523,30 @@ ggml_backend_buffer_type_t vitriol_get_buffer_type_lazy(int device) {
  * ──────────────────────────────────────────────────────────────────*/
 ggml_backend_buffer_type_t * vitriol_cuda_get_extra_bufts(ggml_backend_dev_t dev) {
     if (g_vitriol_config.mode != VITRIOL_MODE_STREAM) return nullptr;
-    GGML_UNUSED(dev);
 
-    static ggml_backend_buffer_type_t extra_bufts[GGML_CUDA_MAX_DEVICES + 1];
+    /* Stage 4.5: honor the queried device. Returning the full array to every
+     * device made the loader bind all expert weights to one device's buft,
+     * collapsing every expert byte onto a single GPU (and a single LRU
+     * pool). Each device now sees only its own buft. */
+    static ggml_backend_buffer_type_t extra_all[GGML_CUDA_MAX_DEVICES + 1];
+    static ggml_backend_buffer_type_t extra_per_dev[GGML_CUDA_MAX_DEVICES][2];
     static bool extra_initialized = false;
     if (!extra_initialized) {
         const int n_devs = ggml_backend_cuda_get_device_count();
         for (int i = 0; i < n_devs && i < GGML_CUDA_MAX_DEVICES; i++) {
-            extra_bufts[i] = g_vitriol_config.max_locked_mb > 0
+            extra_all[i] = g_vitriol_config.max_locked_mb > 0
                 ? vitriol_get_buffer_type_lazy(i)
                 : vitriol_get_buffer_type(i);
         }
-        extra_bufts[n_devs] = nullptr;
+        extra_all[n_devs] = nullptr;
         extra_initialized = true;
     }
-    return extra_bufts;
+    for (int i = 0; i < GGML_CUDA_MAX_DEVICES && extra_all[i]; i++) {
+        if (ggml_backend_buft_get_device(extra_all[i]) == dev) {
+            extra_per_dev[i][0] = extra_all[i];
+            extra_per_dev[i][1] = nullptr;
+            return extra_per_dev[i];
+        }
+    }
+    return nullptr;
 }

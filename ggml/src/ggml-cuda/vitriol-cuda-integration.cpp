@@ -122,6 +122,10 @@ static std::list<LRUKey> g_lru_order[GGML_CUDA_MAX_DEVICES];
  * lru_map.size(), which drops below num_slots after the first eviction
  * and would alias a new key onto a still-occupied slot. */
 static int g_lru_next_fresh_slot[GGML_CUDA_MAX_DEVICES];
+/* Stage 4.5 hot-set protection: last-use ms timestamp per slot. Slots
+ * touched within VITRIOL_LRU_HOT_MS are skipped by victim selection while
+ * colder candidates exist, so a cold-expert burst cannot flush the hot set. */
+static std::vector<int64_t> g_lru_last_use[GGML_CUDA_MAX_DEVICES];
 static std::vector<bool> g_lru_compute_pending[GGML_CUDA_MAX_DEVICES];
 static std::mutex        g_lru_mtx;
 
@@ -1301,10 +1305,28 @@ static bool lru_init_pool(size_t min_expert_size, int device) {
     if (dev_env && dev_env[0]) {
         pool_env = dev_env;
     }
-    size_t pool_size = VITRIOL_LRU_POOL_SIZE;
+    /* Stage 4.5: default pool = free VRAM at init - reserve. The reserve
+     * (VITRIOL_POOL_RESERVE_MB, default 2300/device) keeps headroom for KV,
+     * dense weights and compute-buffer growth. An explicit VITRIOL_LRU_MB
+     * still pins an exact size; 0 or unset now means auto. */
+    size_t pool_size = 0;
     if (pool_env) {
         unsigned long mb = strtoul(pool_env, NULL, 10);
         if (mb >= 64) pool_size = mb * 1024ULL * 1024;
+    }
+    if (pool_size == 0) {
+        size_t free_b = 0, total_b = 0;
+        cudaSetDevice(device);
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            unsigned long reserve_mb = 2300;
+            const char* rsv = getenv("VITRIOL_POOL_RESERVE_MB");
+            if (rsv && rsv[0]) reserve_mb = strtoul(rsv, NULL, 10);
+            const size_t reserve_b = reserve_mb * 1024ULL * 1024;
+            pool_size = free_b > reserve_b ? free_b - reserve_b : 0;
+        }
+    }
+    if (pool_size == 0) {
+        pool_size = VITRIOL_LRU_POOL_SIZE; // fallback: legacy default
     }
 
     size_t needed_slot = (min_expert_size + 255) & ~(size_t)255;
@@ -1336,6 +1358,7 @@ static bool lru_init_pool(size_t min_expert_size, int device) {
     g_lru_pool_size[device]  = pool_size;
     g_lru_slot_size[device]  = needed_slot;
     g_lru_num_slots[device]  = needed_slots;
+    g_lru_last_use[device].assign(needed_slots, 0);
 
     if (g_vitriol_config.verbose)
         printf("VITRIOL: LRU pool %zu MB, %d slots x %zu bytes on GPU %d\n",
@@ -1469,6 +1492,9 @@ CUdeviceptr vitriol_lru_ensure(
             lru_order.remove(key);
             lru_order.push_front(key);
             g_lru_stats.hits++;
+            if ((int) g_lru_last_use[dev].size() > it->second) {
+                g_lru_last_use[dev][it->second] = ggml_time_ms(); // Stage 4.5 hot-set stamp
+            }
             /* Wait for any in-flight prefetch DMA on this slot */
             cuStreamWaitEvent(cstream, g_lru_slot_events[dev][it->second], 0);
             if ((int)g_lru_compute_pending[dev].size() > it->second) {
@@ -1510,6 +1536,10 @@ CUdeviceptr vitriol_lru_ensure(
             // instead of blindly evicting the LRU and stalling on its in-flight fill.
             LRUKey evict = lru_order.back();
             bool found = false;
+            int lru_fallback = -1;
+            unsigned long hot_ms = 5000;
+            if (const char* hm = getenv("VITRIOL_LRU_HOT_MS")) hot_ms = strtoul(hm, NULL, 10);
+            const int64_t hot_cutoff = ggml_time_ms() - (int64_t) hot_ms;
             for (auto it = std::prev(lru_order.end()); it != lru_order.begin(); --it) {
                 auto mit = lru_map.find(*it);
                 int s = (mit != lru_map.end()) ? mit->second : -1;
@@ -1517,9 +1547,27 @@ CUdeviceptr vitriol_lru_ensure(
                     g_lru_compute_pending[dev][s];
                 if (s >= 0 && s < g_lru_num_slots[dev] && !pending &&
                     cuEventQuery(g_lru_slot_events[dev][s]) == CUDA_SUCCESS) {
-                    evict = *it;
-                    found = true;
-                    break;
+                    /* Stage 4.5 hot protection: prefer candidates idle
+                     * longer than VITRIOL_LRU_HOT_MS; remember the plain
+                     * LRU fallback in case every candidate is hot. */
+                    if (lru_fallback < 0) lru_fallback = s;
+                    int64_t lu = (s < (int) g_lru_last_use[dev].size()) ?
+                        g_lru_last_use[dev][s] : 0;
+                    if (lu <= hot_cutoff) {
+                        evict = *it;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found && lru_fallback >= 0) {
+                for (auto it2 = lru_order.begin(); it2 != lru_order.end(); ++it2) {
+                    auto mit2 = lru_map.find(*it2);
+                    if (mit2 != lru_map.end() && mit2->second == lru_fallback) {
+                        evict = *it2;
+                        found = true;
+                        break;
+                    }
                 }
             }
             if (!found) {
@@ -1545,6 +1593,9 @@ CUdeviceptr vitriol_lru_ensure(
         }
         lru_map[key] = slot;
         lru_order.push_front(key);
+        if ((int) g_lru_last_use[dev].size() > slot) {
+            g_lru_last_use[dev][slot] = ggml_time_ms(); // Stage 4.5 hot-set stamp
+        }
         if ((int)g_lru_compute_pending[dev].size() > slot) {
             g_lru_compute_pending[dev][slot] = true;
         }
