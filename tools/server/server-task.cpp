@@ -11,6 +11,12 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <dirent.h>
+#include <thread>
+#include <sys/stat.h>
 
 //
 // task_params
@@ -1590,6 +1596,10 @@ std::string server_task_result_metrics::to_metrics() {
             "kv_ejected_total",
             "VITRIOL sparse-KV: KV cells ejected since boot (attention-scored eviction + eager floor sweep)",
             (double) metrics.n_kv_ejected
+        }, {
+            "kv_cache_spill_total",
+            "VITRIOL Optane tier: prompt-cache states mirrored to disk since boot",
+            (double) metrics.n_kv_cache_spills
         },
     };
 
@@ -1786,8 +1796,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.checkpoints =*/ prompt.checkpoints,
         },
         /*.data   =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
+            /*.main =*/ std::make_shared<std::vector<uint8_t>>(std::move(state_data_tgt)),
+            /*.drft =*/ std::make_shared<std::vector<uint8_t>>(std::move(state_data_dft)),
         },
     });
 
@@ -1830,7 +1840,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
         {
-            auto & data = it_best->data.main;
+            auto & data = *it_best->data.main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -1840,26 +1850,24 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            it_best->data.main.reset();
         }
 
         {
-            auto & data = it_best->data.drft;
+            auto & data_ptr = it_best->data.drft;
 
-            if (!data.empty()) {
+            if (data_ptr && !data_ptr->empty()) {
                 GGML_ASSERT(ctx_dft);
 
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                const size_t size = data_ptr->size();
+                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data_ptr->data(), size, id_slot, 0);
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
 
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                data_ptr.reset();
             }
         }
 
@@ -1901,5 +1909,282 @@ void server_prompt_cache::update() {
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+    }
+}
+
+//
+// server_prompt_cache::disk_spill / disk_load (VITRIOL Optane tier)
+//
+// Mirror admitted states under disk_dir so a server restart reloads them
+// instead of re-prefilling. The mirror is a superset of the RAM cache:
+// files are content-keyed (same prompt = same file) and trimmed by total
+// size only, so states evicted from RAM stay restorable until trimmed.
+//
+
+static const uint32_t SERVER_PROMPT_CACHE_DISK_MAGIC   = 0x63706767; // 'ggpc'
+static const uint32_t SERVER_PROMPT_CACHE_DISK_VERSION = 1;
+
+server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, const std::string & disk_dir) {
+    this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+    this->limit_tokens = limit_tokens;
+    if (!disk_dir.empty()) {
+        this->disk_dir = disk_dir.back() == '/' ? disk_dir : disk_dir + "/";
+    }
+}
+
+// FNV-1a over token count + head + tail: same prompt = same file name
+static std::string server_prompt_cache_disk_name(const server_tokens & tokens) {
+    const llama_tokens & t = tokens.get_tokens();
+    const size_t n = t.size();
+
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h] (uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    mix(n);
+    const size_t head = std::min<size_t>(n, 64);
+    for (size_t i = 0; i < head; i++) {
+        mix((uint64_t)(uint32_t) t[i]);
+    }
+    for (size_t i = n - std::min<size_t>(n, 64); i < n; i++) {
+        mix((uint64_t)(uint32_t) t[i]);
+    }
+
+    char buf[32]; // "cache-" + 16 hex + ".bin" + NUL
+    snprintf(buf, sizeof(buf), "cache-%016llx.bin", (unsigned long long) h);
+
+    return std::string(buf);
+}
+
+static bool server_prompt_cache_disk_write(const std::string & path, const server_tokens & tokens,
+        const std::vector<uint8_t> & data_main, const std::vector<uint8_t> & data_drft) {
+    std::vector<char> packed;
+    try {
+        packed = tokens.serialize();
+    } catch (const std::exception & e) {
+        SRV_WRN(" - disk spill: failed to serialize tokens: %s\n", e.what());
+        return false;
+    }
+
+    FILE * f = fopen((path + ".tmp").c_str(), "wb");
+    if (f == nullptr) {
+        return false;
+    }
+
+    const uint32_t magic   = SERVER_PROMPT_CACHE_DISK_MAGIC;
+    const uint32_t version = SERVER_PROMPT_CACHE_DISK_VERSION;
+    const uint64_t n_main  = data_main.size();
+    const uint64_t n_drft  = data_drft.size();
+    const uint64_t n_pack  = packed.size();
+
+    auto ok_write = [&f] (const void * p, size_t n) {
+        return n == 0 || fwrite(p, 1, n, f) == n;
+    };
+
+    bool ok = ok_write(&magic, 4) && ok_write(&version, 4) &&
+              ok_write(&n_main, 8) && ok_write(&n_drft, 8) && ok_write(&n_pack, 8) &&
+              ok_write(data_main.data(), n_main) && ok_write(data_drft.data(), n_drft) &&
+              ok_write(packed.data(), n_pack);
+
+    ok = fclose(f) == 0 && ok;
+
+    if (!ok) {
+        SRV_ERR(" - disk spill: short write on %s.tmp\n", path.c_str());
+        remove((path + ".tmp").c_str());
+        return false;
+    }
+
+    return rename((path + ".tmp").c_str(), path.c_str()) == 0;
+}
+
+static bool server_prompt_cache_disk_read(const std::string & path, server_prompt_cache_state & out) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return false;
+    }
+
+    uint32_t magic   = 0;
+    uint32_t version = 0;
+    uint64_t n_main  = 0;
+    uint64_t n_drft  = 0;
+    uint64_t n_pack  = 0;
+
+    auto ok_read = [&f] (void * p, size_t n) {
+        return n == 0 || fread(p, 1, n, f) == n;
+    };
+
+    bool ok = ok_read(&magic, 4) && ok_read(&version, 4) &&
+              ok_read(&n_main, 8) && ok_read(&n_drft, 8) && ok_read(&n_pack, 8);
+
+    ok = ok && magic == SERVER_PROMPT_CACHE_DISK_MAGIC && version == SERVER_PROMPT_CACHE_DISK_VERSION;
+    ok = ok && n_pack % sizeof(uint32_t) == 0 && n_pack <= (1ull << 30) &&
+         n_main <= (64ull << 30) && n_drft <= (8ull << 30);
+
+    if (!ok) {
+        fclose(f);
+        return false;
+    }
+
+    out.data.main = std::make_shared<std::vector<uint8_t>>(n_main);
+    out.data.drft = std::make_shared<std::vector<uint8_t>>(n_drft);
+    std::vector<llama_token> packed(n_pack / sizeof(uint32_t));
+
+    ok = ok_read(out.data.main->data(), n_main) &&
+         ok_read(out.data.drft->data(), n_drft) &&
+         ok_read(packed.data(), n_pack);
+    fclose(f);
+
+    if (!ok) {
+        return false;
+    }
+
+    try {
+        out.prompt.tokens = server_tokens::deserialize(packed, false);
+    } catch (const std::exception & e) {
+        SRV_WRN(" - disk load: %s: bad token blob: %s\n", path.c_str(), e.what());
+        return false;
+    }
+
+    return out.prompt.tokens.size() > 0;
+}
+
+// collect cache-*.bin entries, oldest first; returns total bytes
+struct server_prompt_cache_disk_file {
+    time_t mtime;
+    size_t size;
+    std::string name;
+};
+
+static size_t server_prompt_cache_disk_scan(const std::string & dir,
+        std::vector<server_prompt_cache_disk_file> & files) {
+    size_t total = 0;
+
+    DIR * d = opendir(dir.c_str());
+    if (d == nullptr) {
+        return 0;
+    }
+
+    dirent * e;
+    while ((e = readdir(d)) != nullptr) {
+        const std::string name(e->d_name);
+        if (name.rfind("cache-", 0) != 0 || name.size() < 10 ||
+                name.compare(name.size() - 4, 4, ".bin") != 0) {
+            continue;
+        }
+        struct stat st;
+        if (stat((dir + name).c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+            files.push_back({ st.st_mtime, (size_t) st.st_size, name });
+            total += st.st_size;
+        }
+    }
+    closedir(d);
+
+    std::sort(files.begin(), files.end(), [](const auto & a, const auto & b) {
+        if (a.mtime != b.mtime) {
+            return a.mtime < b.mtime;
+        }
+        return a.name < b.name;
+    });
+    return total;
+}
+
+static void server_prompt_cache_disk_trim(const std::string & dir, size_t limit_bytes, size_t incoming) {
+    if (limit_bytes == 0 || incoming > limit_bytes) {
+        return;
+    }
+
+    std::vector<server_prompt_cache_disk_file> files;
+    size_t total = server_prompt_cache_disk_scan(dir, files);
+
+    for (const auto & file : files) {
+        if (total + incoming <= limit_bytes) {
+            break;
+        }
+        if (remove((dir + file.name).c_str()) == 0) {
+            total -= file.size;
+        }
+    }
+}
+
+void server_prompt_cache::disk_spill(const server_prompt & prompt,
+        std::shared_ptr<std::vector<uint8_t>> data_main, std::shared_ptr<std::vector<uint8_t>> data_drft) {
+    if (disk_dir.empty() || prompt.tokens.has_mtmd || !data_main) {
+        return;
+    }
+
+    const size_t spill_size = data_main->size() + (data_drft ? data_drft->size() : 0);
+
+    server_prompt_cache_disk_trim(disk_dir, limit_size, spill_size);
+
+    const std::string name = server_prompt_cache_disk_name(prompt.tokens);
+    const std::string path = disk_dir + name;
+
+    // detached writer: dispatch hands off the bytes (shared, no copy) and
+    // returns immediately; a torn .tmp from a lost race is inert
+    std::thread([this, name, path, tokens = prompt.tokens.clone(), data_main, data_drft]() {
+        if (server_prompt_cache_disk_write(path, tokens, *data_main, data_drft ? *data_drft : std::vector<uint8_t>())) {
+            n_disk_spills++;
+            SRV_TRC(" - disk spill: %s (%.1f MiB)\n", name.c_str(), (data_main->size() + (data_drft ? data_drft->size() : 0)) / (1024.0 * 1024.0));
+        } else {
+            SRV_WRN(" - disk spill failed: %s\n", path.c_str());
+        }
+    }).detach();
+}
+
+void server_prompt_cache::disk_load() {
+    if (disk_dir.empty()) {
+        return;
+    }
+
+    std::vector<server_prompt_cache_disk_file> files;
+    server_prompt_cache_disk_scan(disk_dir, files);
+
+    // newest first: evolved (longer) prefixes load before their ancestors
+    std::sort(files.begin(), files.end(), [](const auto & a, const auto & b) {
+        if (a.mtime != b.mtime) {
+            return a.mtime > b.mtime;
+        }
+        return a.name > b.name;
+    });
+
+    size_t n_loaded = 0;
+    size_t n_dropped = 0;
+    for (const auto & file : files) {
+        server_prompt_cache_state st;
+        if (!server_prompt_cache_disk_read(disk_dir + file.name, st)) {
+            SRV_WRN(" - disk load: removing damaged state %s\n", file.name.c_str());
+            remove((disk_dir + file.name).c_str());
+            n_dropped++;
+            continue;
+        }
+
+        // skip entries fully contained in an already loaded (newer) entry
+        bool contained = false;
+        for (const auto & ex : states) {
+            if (ex.prompt.tokens.get_common_prefix(st.prompt.tokens) == (int) st.prompt.tokens.size()) {
+                contained = true;
+                break;
+            }
+        }
+        if (contained) {
+            n_dropped++;
+            continue;
+        }
+
+        if (limit_size > 0 && size() + st.size() > limit_size) {
+            // RAM pool full: file stays on disk for a future boot
+            SRV_TRC(" - disk load: %s kept on disk (RAM pool full)\n", file.name.c_str());
+            break;
+        }
+
+        states.push_back(std::move(st));
+        n_disk_restored++;
+        n_loaded++;
+    }
+
+    if (n_loaded > 0 || n_dropped > 0) {
+        SRV_WRN(" - disk load: restored %zu prompt states (%zu skipped) from %s\n",
+                n_loaded, n_dropped, disk_dir.c_str());
     }
 }

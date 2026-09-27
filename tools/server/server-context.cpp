@@ -314,10 +314,14 @@ struct server_slot {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main->data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft->data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+
+        // VITRIOL Optane tier: mirror the admitted state so a restart reloads
+        // it instead of re-prefilling. Detached writer: dispatch never blocks.
+        prompt_cache.disk_spill(prompt, cur->data.main, cur->data.drft);
 
         return true;
     }
@@ -867,6 +871,7 @@ public:
     server_metrics get_metrics() const {
         auto m = metrics;
         m.n_kv_ejected = ctx_tgt ? llama_kv_vitriol_evicted(ctx_tgt) : 0;
+        m.n_kv_cache_spills = prompt_cache ? prompt_cache->n_disk_spills.load() : 0;
         return m;
     }
 
@@ -1364,7 +1369,9 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.slot_save_path);
+            // VITRIOL Optane tier: reload states mirrored by a previous run
+            prompt_cache->disk_load();
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }

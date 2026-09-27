@@ -7,6 +7,8 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <atomic>
+#include <memory>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -586,11 +588,13 @@ struct server_prompt {
 };
 
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    // shared ownership: the Optane tier hands these to a detached writer
+    // thread, so dispatch never blocks on disk (and never copies)
+    std::shared_ptr<std::vector<uint8_t>> main;
+    std::shared_ptr<std::vector<uint8_t>> drft;
 
     size_t size() const {
-        return main.size() + drft.size();
+        return (main ? main->size() : 0) + (drft ? drft->size() : 0);
     }
 };
 
@@ -610,10 +614,10 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
-    }
+    // disk_dir enables the VITRIOL Optane tier: states admitted to the RAM
+    // cache are mirrored under disk_dir and reloaded on boot, so a restart
+    // re-prefills only the session delta. Empty = disabled.
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, const std::string & disk_dir = "");
 
     std::list<server_prompt_cache_state> states;
 
@@ -622,6 +626,18 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    std::string disk_dir;
+
+    // mirror one admitted state to disk via a detached writer thread
+    void disk_spill(const server_prompt & prompt, std::shared_ptr<std::vector<uint8_t>> data_main, std::shared_ptr<std::vector<uint8_t>> data_drft);
+
+    // load cached states from disk_dir into states, newest first
+    void disk_load();
+
+    // counters (atomic: read from the http thread)
+    std::atomic<uint64_t> n_disk_spills{0};
+    std::atomic<uint64_t> n_disk_restored{0};
 
     size_t size() const;
 

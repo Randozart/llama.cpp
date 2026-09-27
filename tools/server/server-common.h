@@ -478,6 +478,10 @@ struct server_metrics {
     // eviction + eager floor sweep) - surfaced as llamacpp:kv_ejected_total.
     uint64_t n_kv_ejected = 0;
 
+    // VITRIOL Optane tier: prompt-cache states mirrored to disk since boot
+    // - surfaced as llamacpp:kv_cache_spill_total.
+    uint64_t n_kv_cache_spills = 0;
+
     uint64_t n_draft_tokens      = 0; // Total draft tokens generated
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
