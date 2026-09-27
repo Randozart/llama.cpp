@@ -1836,6 +1836,31 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    if (it_best == states.end() && disk_fetch(tokens_new)) {
+        // Optane tier: a mirror file matched - rescan the (now bigger) RAM set
+        it_best = states.end();
+        f_keep_best = prompt.tokens.size() > 0 ? float(prompt.tokens.get_common_prefix(tokens_new)) / prompt.tokens.size() : -1.0f;
+        f_sim_best  = float(prompt.tokens.get_common_prefix(tokens_new)) / tokens_new.size();
+
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+
+            const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
+            const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+            if (f_keep_cur < 0.25f) {
+                continue;
+            }
+
+            if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+                f_keep_best = f_keep_cur;
+                f_sim_best  = f_sim_cur;
+
+                it_best = it;
+            }
+        }
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -2115,7 +2140,7 @@ void server_prompt_cache::disk_spill(const server_prompt & prompt,
 
     const size_t spill_size = data_main->size() + (data_drft ? data_drft->size() : 0);
 
-    server_prompt_cache_disk_trim(disk_dir, limit_size, spill_size);
+    server_prompt_cache_disk_trim(disk_dir, limit_size * 8, spill_size); // mirror keeps ~8x the RAM pool: evicted-from-RAM states stay fetchable
 
     const std::string name = server_prompt_cache_disk_name(prompt.tokens);
     const std::string path = disk_dir + name;
@@ -2130,6 +2155,138 @@ void server_prompt_cache::disk_spill(const server_prompt & prompt,
             SRV_WRN(" - disk spill failed: %s\n", path.c_str());
         }
     }).detach();
+}
+
+// cheap probe: read only the header + the trailing token blob of a mirror
+// file (the KV bytes are skipped with fseek), so candidate scanning never
+// touches gigabytes of state.
+static bool server_prompt_cache_disk_read_tokens(const std::string & path, server_tokens & out,
+        uint64_t & n_main, uint64_t & n_drft) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return false;
+    }
+
+    uint32_t magic   = 0;
+    uint32_t version = 0;
+    uint64_t n_pack  = 0;
+
+    auto ok_read = [&f] (void * p, size_t n) {
+        return n == 0 || fread(p, 1, n, f) == n;
+    };
+
+    bool ok = ok_read(&magic, 4) && ok_read(&version, 4) && ok_read(&n_main, 8) && ok_read(&n_drft, 8) && ok_read(&n_pack, 8);
+    ok = ok && magic == SERVER_PROMPT_CACHE_DISK_MAGIC && version == SERVER_PROMPT_CACHE_DISK_VERSION;
+    ok = ok && n_pack % sizeof(uint32_t) == 0 && n_pack > 0 && n_pack <= (1ull << 30);
+
+    if (!ok || fseek(f, -(long) n_pack, SEEK_END) != 0) {
+        fclose(f);
+        return false;
+    }
+
+    std::vector<llama_token> packed(n_pack / sizeof(uint32_t));
+    ok = ok_read(packed.data(), n_pack);
+    fclose(f);
+
+    if (!ok) {
+        return false;
+    }
+
+    try {
+        out = server_tokens::deserialize(packed, false);
+    } catch (const std::exception &) {
+        return false;
+    }
+
+    return out.size() > 0;
+}
+
+bool server_prompt_cache::disk_fetch(const server_tokens & tokens_new) {
+    if (disk_dir.empty() || tokens_new.size() == 0) {
+        return false;
+    }
+
+    std::vector<server_prompt_cache_disk_file> files;
+    server_prompt_cache_disk_scan(disk_dir, files);
+    // newest first: an evolved prefix beats its ancestors on ties
+    std::sort(files.begin(), files.end(), [](const auto & a, const auto & b) {
+        if (a.mtime != b.mtime) {
+            return a.mtime > b.mtime;
+        }
+        return a.name > b.name;
+    });
+
+    std::string best_path;
+    size_t best_size = 0;
+    float best_keep = 0.0f;
+    float best_sim  = 0.0f;
+
+    for (const auto & file : files) {
+        const std::string path = disk_dir + file.name;
+
+        server_tokens cand;
+        uint64_t n_main = 0;
+        uint64_t n_drft = 0;
+        if (!server_prompt_cache_disk_read_tokens(path, cand, n_main, n_drft)) {
+            continue;
+        }
+
+        // skip candidates already fully covered by a live RAM entry
+        bool contained = false;
+        for (const auto & ex : states) {
+            if (ex.prompt.tokens.get_common_prefix(cand) == (int) cand.size()) {
+                contained = true;
+                break;
+            }
+        }
+        if (contained) {
+            continue;
+        }
+
+        const int lcp = cand.get_common_prefix(tokens_new);
+        if (lcp <= 0) {
+            continue;
+        }
+
+        // same "do not trash large prompts" rule as the RAM scan
+        const float f_keep = float(lcp) / cand.size();
+        const float f_sim  = float(lcp) / tokens_new.size();
+        if (f_keep < 0.25f) {
+            continue;
+        }
+
+        if (f_keep > best_keep || (f_keep == best_keep && f_sim > best_sim)) {
+            best_keep = f_keep;
+            best_sim  = f_sim;
+            best_path = path;
+            best_size = (size_t) (n_main + n_drft);
+        }
+    }
+
+    if (best_path.empty()) {
+        return false;
+    }
+
+    // pull the winner fully into the RAM cache
+    server_prompt_cache_state st;
+    if (!server_prompt_cache_disk_read(best_path, st)) {
+        SRV_WRN(" - disk fetch: damaged state %s\n", best_path.c_str());
+        remove(best_path.c_str());
+        return false;
+    }
+
+    if (limit_size > 0 && size() + st.size() > limit_size) {
+        // make room the same way alloc() does (oldest first), never trim to zero
+        while (!states.empty() && size() + st.size() > limit_size) {
+            states.pop_front();
+        }
+    }
+
+    SRV_WRN(" - disk fetch: restored %.1f MiB state (%d tokens, keep %.2f) from %s\n",
+            st.size() / (1024.0 * 1024.0), st.prompt.n_tokens(), best_keep, best_path.c_str());
+    states.push_back(std::move(st));
+    n_disk_restored++;
+    return true;
 }
 
 void server_prompt_cache::disk_load() {

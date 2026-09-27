@@ -635,6 +635,10 @@ struct server_prompt_cache {
     // load cached states from disk_dir into states, newest first
     void disk_load();
 
+    // runtime disk fallback: find the mirror file with the best common
+    // prefix against tokens_new and pull it into states (RAM-miss rescue)
+    bool disk_fetch(const server_tokens & tokens_new);
+
     // counters (atomic: read from the http thread)
     std::atomic<uint64_t> n_disk_spills{0};
     std::atomic<uint64_t> n_disk_restored{0};
