@@ -2890,8 +2890,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // happens after model.build_graph() so builders keep their strict
     // last-node-expansion invariant. No-op unless armed.
     if (vitriol_probe::active()) {
-        vitriol_probe::push_capture(il, q, kq_scale);
-        vitriol_probe::set_source(const_cast<llama_kv_cache_context *>(mctx_cur));
+        vitriol_probe::push_capture(mctx_cur, il, q, kq_scale);
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);

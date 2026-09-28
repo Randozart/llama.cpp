@@ -294,10 +294,38 @@ if (CUDAToolkit_FOUND)
     # Rust streaming backend (vitriol-stream crate, optional). When
     # VITRIOL_RUST_LIB points at libvitriol_stream.a, the LRU/store hot path
     # can be routed through it at runtime with VITRIOL_RUST=1.
-    if (DEFINED ENV{VITRIOL_RUST_LIB} AND EXISTS "$ENV{VITRIOL_RUST_LIB}")
-        target_link_libraries(ggml-cuda PRIVATE "$ENV{VITRIOL_RUST_LIB}")
-        target_link_libraries(ggml-cuda PRIVATE pthread dl m)
-        message(STATUS "VITRIOL: Rust streaming backend linked from $ENV{VITRIOL_RUST_LIB}")
+    #
+    # This used to read $ENV{VITRIOL_RUST_LIB} inline. That is a footgun: the
+    # env var is not persisted, so any later reconfigure without it silently
+    # dropped the link and broke `llama-server` with undefined `vs_*` at link
+    # time (hit 2026-09-28). Seed a CACHE variable from the env once, so the
+    # choice survives reconfigures; allow an explicit -DVITRIOL_RUST_LIB=...
+    # override and fall back to the in-tree cargo target dir.
+    if (NOT DEFINED VITRIOL_RUST_LIB)
+        if (DEFINED ENV{VITRIOL_RUST_LIB} AND EXISTS "$ENV{VITRIOL_RUST_LIB}")
+            set(VITRIOL_RUST_LIB "$ENV{VITRIOL_RUST_LIB}" CACHE FILEPATH
+                "Path to libvitriol_stream.a (Rust streaming backend; empty = disabled)")
+        else()
+            set(_vitriol_rust_default "${CMAKE_SOURCE_DIR}/../vitriol-stream/target/release/libvitriol_stream.a")
+            if (EXISTS "${_vitriol_rust_default}")
+                set(VITRIOL_RUST_LIB "${_vitriol_rust_default}" CACHE FILEPATH
+                    "Path to libvitriol_stream.a (Rust streaming backend; empty = disabled)")
+            else()
+                set(VITRIOL_RUST_LIB "" CACHE FILEPATH
+                    "Path to libvitriol_stream.a (Rust streaming backend; empty = disabled)")
+            endif()
+        endif()
+    endif()
+
+    if (VITRIOL_RUST_LIB)
+        if (EXISTS "${VITRIOL_RUST_LIB}")
+            target_link_libraries(ggml-cuda PRIVATE "${VITRIOL_RUST_LIB}")
+            target_link_libraries(ggml-cuda PRIVATE pthread dl m)
+            message(STATUS "VITRIOL: Rust streaming backend linked from ${VITRIOL_RUST_LIB}")
+        else()
+            message(WARNING "VITRIOL: VITRIOL_RUST_LIB='${VITRIOL_RUST_LIB}' not found - Rust streaming backend disabled. "
+                            "Rebuild vitriol-stream (cargo build --release) or pass -DVITRIOL_RUST_LIB=<path>.")
+        endif()
     endif()
 
     # VITRIOL store mkfs tool - standalone host binary (GGUF -> store).

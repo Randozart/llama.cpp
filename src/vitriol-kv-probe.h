@@ -61,8 +61,11 @@ bool active();
 
 // -- graph-build side (called from llm_graph_context::build_attn) --
 
-void push_capture(int32_t il, ggml_tensor * q, float kq_scale);
-void set_source(llama_kv_cache_context * ctx);
+// Records one attention layer for scoring. `src` is the kv-cache context the
+// layer belongs to; `il` is only ever resolved against it. Passing nullptr src
+// or q is ignored. 2026-09-28: src is per capture (was a global "last seen"),
+// so a foreign il can never reach another memory's map_layer_ids.
+void push_capture(const llama_kv_cache_context * src, int32_t il, ggml_tensor * q, float kq_scale);
 
 // -- completion side (called from llama_context) --
 
@@ -70,6 +73,14 @@ void set_source(llama_kv_cache_context * ctx);
 // this build, marks the score output on the source kv-cache context, and
 // disarms. Returns false if nothing was appended (guards failed).
 bool append_scores(ggml_context * ctx, struct ggml_cgraph * gf);
+
+// Disarm and drop any captures collected for the current build.
+// Call when a capture-bearing build must NOT be scored (e.g. the depth gate
+// refuses the cache). build_attn pushes captures on active(); if that build
+// never reaches append_scores the captures orphan and leak into the next
+// graph, where they resolve get_k() against a different memory and throw
+// std::unordered_map::at (map_layer_ids miss). 2026-09-28.
+void cancel_batch();
 
 // Downloads the finished score tensor (GPU work is done by the time this is
 // called) and folds it into per-cell scores. Safe to call unconditionally.

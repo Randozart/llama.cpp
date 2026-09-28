@@ -52,6 +52,10 @@ const cfg & get_cfg() {
 }
 
 struct capture_rec {
+    // owning kv-cache context: il is only meaningful against this memory.
+    // Storing it per capture makes a foreign-memory lookup impossible, even if
+    // some future path builds two memories into one logical decode.
+    const llama_kv_cache_context * src;
     int32_t       il;
     ggml_tensor * q;
     float         kq_scale;
@@ -61,8 +65,7 @@ struct capture_rec {
 std::atomic<uint64_t> g_step { 0 };
 std::atomic<bool>     g_armed { false };
 
-llama_kv_cache_context * g_source  = nullptr;
-llama_kv_cache_context * g_pending = nullptr;
+const llama_kv_cache_context * g_pending = nullptr;
 std::vector<capture_rec> g_captures;
 
 } // namespace
@@ -84,6 +87,11 @@ float min_fill() {
 }
 
 void begin_batch(const bool is_single_token) {
+    // Stale captures must never cross into this decode: append_scores is the
+    // normal clear point, but a capture-bearing build can be skipped by the
+    // depth gate (see cancel_batch). 2026-09-28.
+    g_captures.clear();
+
     if (!enabled()) {
         g_armed.store(false, std::memory_order_relaxed);
         return;
@@ -107,27 +115,29 @@ bool active() {
     return g_armed.load(std::memory_order_relaxed);
 }
 
-void push_capture(const int32_t il, ggml_tensor * q, const float kq_scale) {
-    g_captures.push_back({ il, q, kq_scale });
-}
-
-void set_source(llama_kv_cache_context * ctx) {
-    g_source = ctx;
+void push_capture(const llama_kv_cache_context * src, const int32_t il, ggml_tensor * q, const float kq_scale) {
+    if (src == nullptr || q == nullptr) {
+        return;
+    }
+    g_captures.push_back({ src, il, q, kq_scale });
 }
 
 bool append_scores(ggml_context * ctx, ggml_cgraph * gf) {
-    llama_kv_cache_context * src = g_source;
-    g_source = nullptr;
-
-    if (!active()) {
+    if (!active() || g_captures.empty()) {
+        g_armed.store(false, std::memory_order_relaxed);
         g_captures.clear();
         return false;
     }
 
-    if (!src || g_captures.empty()) {
-        g_armed.store(false, std::memory_order_relaxed);
-        g_captures.clear();
-        return false;
+    // every capture in a graph must come from the same memory; drop the batch
+    // otherwise (defensive: a foreign src would make cap.il meaningless).
+    const llama_kv_cache_context * src = g_captures.front().src;
+    for (const auto & cap : g_captures) {
+        if (cap.src != g_captures.front().src) {
+            g_armed.store(false, std::memory_order_relaxed);
+            g_captures.clear();
+            return false;
+        }
     }
 
     src->vitriol_probe_reset();
@@ -137,7 +147,8 @@ bool append_scores(ggml_context * ctx, ggml_cgraph * gf) {
 
     for (const auto & cap : g_captures) {
         // q: [dk, nh, 1] post-rope; fresh K view: [dk, nhk, n_kv, ns]
-        ggml_tensor * k = src->get_k(ctx, cap.il);
+        // resolve against the capture's own memory, never a global "last seen"
+        ggml_tensor * k = cap.src->get_k(ctx, cap.il);
         if (!k || k->ne[3] != 1 || k->ne[1] == 0) {
             continue;
         }
@@ -199,17 +210,18 @@ bool append_scores(ggml_context * ctx, ggml_cgraph * gf) {
     return ok;
 }
 
+void cancel_batch() {
+    g_armed.store(false, std::memory_order_relaxed);
+    g_captures.clear();
+}
+
 void finish_pending() {
     if (g_pending) {
-        llama_kv_cache_context * p = g_pending;
+        const llama_kv_cache_context * p = g_pending;
         g_pending = nullptr;
         p->vitriol_probe_finish();
     }
     g_armed.store(false, std::memory_order_relaxed);
-}
-
-bool has_pending_output() {
-    return active();
 }
 
 } // namespace vitriol_probe

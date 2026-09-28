@@ -1362,6 +1362,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         auto * kv_ctx = dynamic_cast<llama_kv_cache_context *>(mctx);
         if (!kv_ctx || kv_ctx->fill_ratio() < vitriol_probe::min_fill()) {
             vitriol_probe_armed = false;
+
+            // VITRIOL (2026-09-28): the global probe is still armed, so
+            // build_attn below would collect captures for a build that never
+            // reaches append_scores(). Those captures then leak into the next
+            // graph (e.g. the MTP draft context) and get_k() resolves their il
+            // against a different memory -> std::unordered_map::at. Disarm
+            // before building so no captures are collected.
+            vitriol_probe::cancel_batch();
         }
     }
 
