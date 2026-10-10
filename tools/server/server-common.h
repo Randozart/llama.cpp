@@ -482,6 +482,15 @@ struct server_metrics {
     // - surfaced as llamacpp:kv_cache_spill_total.
     uint64_t n_kv_cache_spills = 0;
 
+    // VITRIOL Optane tier (disk): restored/fetched/missed/rejected counters
+    uint64_t n_kv_cache_disk_restored   = 0;
+    uint64_t n_kv_cache_disk_fetched    = 0;
+    uint64_t n_kv_cache_disk_miss       = 0;
+    uint64_t n_kv_cache_disk_rejected   = 0;
+    uint64_t n_kv_cache_disk_unverified = 0;
+    uint64_t n_kv_cache_disk_pruned     = 0;
+    uint64_t n_kv_cache_mem_entries     = 0;
+
     uint64_t n_draft_tokens      = 0; // Total draft tokens generated
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model

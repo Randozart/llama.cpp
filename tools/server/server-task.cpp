@@ -1600,6 +1600,34 @@ std::string server_task_result_metrics::to_metrics() {
             "kv_cache_spill_total",
             "VITRIOL Optane tier: prompt-cache states mirrored to disk since boot",
             (double) metrics.n_kv_cache_spills
+        }, {
+            "kv_cache_disk_restored_total",
+            "VITRIOL Optane tier: disk states loaded into RAM (boot or fetch)",
+            (double) metrics.n_kv_cache_disk_restored
+        }, {
+            "kv_cache_disk_fetched_total",
+            "VITRIOL Optane tier: runtime disk fetches that restored a state",
+            (double) metrics.n_kv_cache_disk_fetched
+        }, {
+            "kv_cache_disk_miss_total",
+            "VITRIOL Optane tier: disk scans that found no usable mirror",
+            (double) metrics.n_kv_cache_disk_miss
+        }, {
+            "kv_cache_disk_rejected_total",
+            "VITRIOL Optane tier: disk states rejected for identity mismatch",
+            (double) metrics.n_kv_cache_disk_rejected
+        }, {
+            "kv_cache_disk_unverified_total",
+            "VITRIOL Optane tier: v1 disk states accepted without identity",
+            (double) metrics.n_kv_cache_disk_unverified
+        }, {
+            "kv_cache_disk_pruned_total",
+            "VITRIOL Optane tier: disk states removed (damaged or VITRIOL_KV_DISK_PRUNE=1)",
+            (double) metrics.n_kv_cache_disk_pruned
+        }, {
+            "kv_cache_mem_entries",
+            "VITRIOL Optane tier: prompt states currently held in the RAM cache",
+            (double) metrics.n_kv_cache_mem_entries
         },
     };
 
@@ -1836,27 +1864,22 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
-    if (it_best == states.end() && disk_fetch(tokens_new)) {
-        // Optane tier: a mirror file matched - rescan the (now bigger) RAM set
-        it_best = states.end();
-        f_keep_best = prompt.tokens.size() > 0 ? float(prompt.tokens.get_common_prefix(tokens_new)) / prompt.tokens.size() : -1.0f;
-        f_sim_best  = float(prompt.tokens.get_common_prefix(tokens_new)) / tokens_new.size();
-
-        for (auto it = states.begin(); it != states.end(); ++it) {
-            const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
-
-            const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-            const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
-
-            if (f_keep_cur < 0.25f) {
-                continue;
-            }
-
-            if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-                f_keep_best = f_keep_cur;
-                f_sim_best  = f_sim_cur;
-
-                it_best = it;
+    // Optane tier: compare the best disk mirror against the best RAM entry and
+    // take the better one, instead of consulting disk only when RAM is empty.
+    {
+        std::string disk_path;
+        float disk_keep = 0.0f;
+        float disk_sim  = 0.0f;
+        if (disk_find_best(tokens_new, disk_path, disk_keep, disk_sim)) {
+            const bool ram_has  = it_best != states.end();
+            const bool disk_wins = !ram_has ||
+                disk_keep > f_keep_best ||
+                (disk_keep == f_keep_best && disk_sim > f_sim_best);
+            if (disk_wins && disk_read_best(disk_path, disk_keep)) {
+                it_best = std::prev(states.end());
+                f_keep_best = disk_keep;
+                f_sim_best  = disk_sim;
+                SRV_TRC(" - disk fetch wins: f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
             }
         }
     }
@@ -1947,7 +1970,60 @@ void server_prompt_cache::update() {
 //
 
 static const uint32_t SERVER_PROMPT_CACHE_DISK_MAGIC   = 0x63706767; // 'ggpc'
-static const uint32_t SERVER_PROMPT_CACHE_DISK_VERSION = 1;
+static const uint32_t SERVER_PROMPT_CACHE_DISK_VERSION = 2; // v1 = no identity block, still readable
+
+static_assert(sizeof(server_prompt_cache_identity) == 48, "disk identity block must stay 48 bytes");
+
+// env flag: unset/empty = default; "0" = false; anything else = true
+static bool server_prompt_cache_env_flag(const char * name, bool def) {
+    const char * v = getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return def;
+    }
+    return !(v[0] == '0' && v[1] == '\0');
+}
+
+// verdict codes used by disk read/scan and the /cache endpoint
+enum server_prompt_cache_verdict {
+    SERVER_PROMPT_CACHE_VERDICT_UNKNOWN  = 0,
+    SERVER_PROMPT_CACHE_VERDICT_OK       = 1, // v2 and matches
+    SERVER_PROMPT_CACHE_VERDICT_MISMATCH = 2, // v2 but different model/config
+    SERVER_PROMPT_CACHE_VERDICT_V1       = 3, // no identity block
+};
+
+// hard incompatibility: KV layout or semantics differ
+static bool server_prompt_cache_identity_hard_ok(
+        const server_prompt_cache_identity & cur, const server_prompt_cache_identity & f) {
+    return f.type_k == cur.type_k && f.type_v == cur.type_v && f.n_stream == cur.n_stream;
+}
+
+static int server_prompt_cache_identity_verdict(
+        const server_prompt_cache_identity & cur, const server_prompt_cache_identity & f, uint32_t version) {
+    if (version < 2) {
+        return SERVER_PROMPT_CACHE_VERDICT_V1;
+    }
+    if (!server_prompt_cache_identity_hard_ok(cur, f)) {
+        return SERVER_PROMPT_CACHE_VERDICT_MISMATCH;
+    }
+    if (f.model_key != cur.model_key) {
+        // model differs; strict by default, relaxed when explicitly allowed
+        return server_prompt_cache_env_flag("VITRIOL_KV_DISK_ALLOW_MODEL_MISMATCH", false)
+            ? SERVER_PROMPT_CACHE_VERDICT_OK
+            : SERVER_PROMPT_CACHE_VERDICT_MISMATCH;
+    }
+    return SERVER_PROMPT_CACHE_VERDICT_OK;
+}
+
+static bool server_prompt_cache_verdict_accepts(int verdict) {
+    if (verdict == SERVER_PROMPT_CACHE_VERDICT_OK) {
+        return true;
+    }
+    if (verdict == SERVER_PROMPT_CACHE_VERDICT_V1) {
+        // v1 files carry no identity; accept unless strict mode is on
+        return !server_prompt_cache_env_flag("VITRIOL_KV_DISK_STRICT", false);
+    }
+    return false;
+}
 
 server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, const std::string & disk_dir) {
     this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -1957,8 +2033,8 @@ server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_to
     }
 }
 
-// FNV-1a over token count + head + tail: same prompt = same file name
-static std::string server_prompt_cache_disk_name(const server_tokens & tokens) {
+// FNV-1a over token count + head + tail: same prompt = same token hash
+static uint64_t server_prompt_cache_disk_token_hash(const server_tokens & tokens) {
     const llama_tokens & t = tokens.get_tokens();
     const size_t n = t.size();
 
@@ -1976,13 +2052,23 @@ static std::string server_prompt_cache_disk_name(const server_tokens & tokens) {
         mix((uint64_t)(uint32_t) t[i]);
     }
 
-    char buf[32]; // "cache-" + 16 hex + ".bin" + NUL
-    snprintf(buf, sizeof(buf), "cache-%016llx.bin", (unsigned long long) h);
+    return h;
+}
+
+// v2 name carries the model key so states from different models cannot collide.
+// The key is informational for pruning; validation always reads the file body.
+static std::string server_prompt_cache_disk_name(const server_tokens & tokens, uint64_t model_key) {
+    const uint64_t th = server_prompt_cache_disk_token_hash(tokens);
+
+    char buf[48]; // "cache-" + 16 + "-" + 16 + ".bin" + NUL
+    snprintf(buf, sizeof(buf), "cache-%016llx-%016llx.bin",
+            (unsigned long long) model_key, (unsigned long long) th);
 
     return std::string(buf);
 }
 
-static bool server_prompt_cache_disk_write(const std::string & path, const server_tokens & tokens,
+static bool server_prompt_cache_disk_write(const std::string & path,
+        const server_prompt_cache_identity & identity, const server_tokens & tokens,
         const std::vector<uint8_t> & data_main, const std::vector<uint8_t> & data_drft) {
     std::vector<char> packed;
     try {
@@ -2008,6 +2094,7 @@ static bool server_prompt_cache_disk_write(const std::string & path, const serve
     };
 
     bool ok = ok_write(&magic, 4) && ok_write(&version, 4) &&
+              ok_write(&identity, sizeof(identity)) &&
               ok_write(&n_main, 8) && ok_write(&n_drft, 8) && ok_write(&n_pack, 8) &&
               ok_write(data_main.data(), n_main) && ok_write(data_drft.data(), n_drft) &&
               ok_write(packed.data(), n_pack);
@@ -2023,7 +2110,61 @@ static bool server_prompt_cache_disk_write(const std::string & path, const serve
     return rename((path + ".tmp").c_str(), path.c_str()) == 0;
 }
 
-static bool server_prompt_cache_disk_read(const std::string & path, server_prompt_cache_state & out) {
+// reads the header + token blob only; skips the KV bytes with fseek.
+// identity_out is zeroed for v1 files. Returns false on a damaged header.
+static bool server_prompt_cache_disk_read_tokens(const std::string & path, server_tokens & out,
+        uint64_t & n_main, uint64_t & n_drft, server_prompt_cache_identity & identity_out, uint32_t & version_out) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return false;
+    }
+
+    uint32_t magic   = 0;
+    uint32_t version = 0;
+    uint64_t n_pack  = 0;
+
+    auto ok_read = [&f] (void * p, size_t n) {
+        return n == 0 || fread(p, 1, n, f) == n;
+    };
+
+    bool ok = ok_read(&magic, 4) && ok_read(&version, 4);
+    if (ok && version >= 2) {
+        ok = ok_read(&identity_out, sizeof(identity_out));
+    } else {
+        identity_out = {};
+    }
+    ok = ok && ok_read(&n_main, 8) && ok_read(&n_drft, 8) && ok_read(&n_pack, 8);
+
+    ok = ok && magic == SERVER_PROMPT_CACHE_DISK_MAGIC && version >= 1 && version <= SERVER_PROMPT_CACHE_DISK_VERSION;
+    ok = ok && n_pack % sizeof(uint32_t) == 0 && n_pack > 0 && n_pack <= (1ull << 30);
+    ok = ok && n_main <= (64ull << 30) && n_drft <= (8ull << 30);
+
+    std::vector<llama_token> packed;
+    if (ok) {
+        packed.resize(n_pack / sizeof(uint32_t));
+        ok = fseek(f, (long) (n_main + n_drft), SEEK_CUR) == 0 &&
+             ok_read(packed.data(), n_pack);
+    }
+    fclose(f);
+
+    if (!ok) {
+        return false;
+    }
+
+    version_out = version;
+
+    try {
+        out = server_tokens::deserialize(packed, false);
+    } catch (const std::exception & e) {
+        SRV_WRN(" - disk load: %s: bad token blob: %s\n", path.c_str(), e.what());
+        return false;
+    }
+
+    return out.size() > 0;
+}
+
+static bool server_prompt_cache_disk_read(const std::string & path, server_prompt_cache_state & out,
+        server_prompt_cache_identity & identity_out, uint32_t & version_out) {
     FILE * f = fopen(path.c_str(), "rb");
     if (f == nullptr) {
         return false;
@@ -2039,10 +2180,15 @@ static bool server_prompt_cache_disk_read(const std::string & path, server_promp
         return n == 0 || fread(p, 1, n, f) == n;
     };
 
-    bool ok = ok_read(&magic, 4) && ok_read(&version, 4) &&
-              ok_read(&n_main, 8) && ok_read(&n_drft, 8) && ok_read(&n_pack, 8);
+    bool ok = ok_read(&magic, 4) && ok_read(&version, 4);
+    if (ok && version >= 2) {
+        ok = ok_read(&identity_out, sizeof(identity_out));
+    } else {
+        identity_out = {};
+    }
+    ok = ok && ok_read(&n_main, 8) && ok_read(&n_drft, 8) && ok_read(&n_pack, 8);
 
-    ok = ok && magic == SERVER_PROMPT_CACHE_DISK_MAGIC && version == SERVER_PROMPT_CACHE_DISK_VERSION;
+    ok = ok && magic == SERVER_PROMPT_CACHE_DISK_MAGIC && version >= 1 && version <= SERVER_PROMPT_CACHE_DISK_VERSION;
     ok = ok && n_pack % sizeof(uint32_t) == 0 && n_pack <= (1ull << 30) &&
          n_main <= (64ull << 30) && n_drft <= (8ull << 30);
 
@@ -2063,6 +2209,8 @@ static bool server_prompt_cache_disk_read(const std::string & path, server_promp
     if (!ok) {
         return false;
     }
+
+    version_out = version;
 
     try {
         out.prompt.tokens = server_tokens::deserialize(packed, false);
@@ -2142,13 +2290,14 @@ void server_prompt_cache::disk_spill(const server_prompt & prompt,
 
     server_prompt_cache_disk_trim(disk_dir, limit_size * 8, spill_size); // mirror keeps ~8x the RAM pool: evicted-from-RAM states stay fetchable
 
-    const std::string name = server_prompt_cache_disk_name(prompt.tokens);
+    const std::string name = server_prompt_cache_disk_name(prompt.tokens, identity.model_key);
     const std::string path = disk_dir + name;
+    const server_prompt_cache_identity id = identity;
 
     // detached writer: dispatch hands off the bytes (shared, no copy) and
     // returns immediately; a torn .tmp from a lost race is inert
-    std::thread([this, name, path, tokens = prompt.tokens.clone(), data_main, data_drft]() {
-        if (server_prompt_cache_disk_write(path, tokens, *data_main, data_drft ? *data_drft : std::vector<uint8_t>())) {
+    std::thread([this, name, path, id, tokens = prompt.tokens.clone(), data_main, data_drft]() {
+        if (server_prompt_cache_disk_write(path, id, tokens, *data_main, data_drft ? *data_drft : std::vector<uint8_t>())) {
             n_disk_spills++;
             SRV_TRC(" - disk spill: %s (%.1f MiB)\n", name.c_str(), (data_main->size() + (data_drft ? data_drft->size() : 0)) / (1024.0 * 1024.0));
         } else {
@@ -2157,51 +2306,9 @@ void server_prompt_cache::disk_spill(const server_prompt & prompt,
     }).detach();
 }
 
-// cheap probe: read only the header + the trailing token blob of a mirror
-// file (the KV bytes are skipped with fseek), so candidate scanning never
-// touches gigabytes of state.
-static bool server_prompt_cache_disk_read_tokens(const std::string & path, server_tokens & out,
-        uint64_t & n_main, uint64_t & n_drft) {
-    FILE * f = fopen(path.c_str(), "rb");
-    if (f == nullptr) {
-        return false;
-    }
-
-    uint32_t magic   = 0;
-    uint32_t version = 0;
-    uint64_t n_pack  = 0;
-
-    auto ok_read = [&f] (void * p, size_t n) {
-        return n == 0 || fread(p, 1, n, f) == n;
-    };
-
-    bool ok = ok_read(&magic, 4) && ok_read(&version, 4) && ok_read(&n_main, 8) && ok_read(&n_drft, 8) && ok_read(&n_pack, 8);
-    ok = ok && magic == SERVER_PROMPT_CACHE_DISK_MAGIC && version == SERVER_PROMPT_CACHE_DISK_VERSION;
-    ok = ok && n_pack % sizeof(uint32_t) == 0 && n_pack > 0 && n_pack <= (1ull << 30);
-
-    if (!ok || fseek(f, -(long) n_pack, SEEK_END) != 0) {
-        fclose(f);
-        return false;
-    }
-
-    std::vector<llama_token> packed(n_pack / sizeof(uint32_t));
-    ok = ok_read(packed.data(), n_pack);
-    fclose(f);
-
-    if (!ok) {
-        return false;
-    }
-
-    try {
-        out = server_tokens::deserialize(packed, false);
-    } catch (const std::exception &) {
-        return false;
-    }
-
-    return out.size() > 0;
-}
-
-bool server_prompt_cache::disk_fetch(const server_tokens & tokens_new) {
+bool server_prompt_cache::disk_find_best(const server_tokens & tokens_new, std::string & path_out,
+        float & f_keep_out, float & f_sim_out) {
+    path_out.clear();
     if (disk_dir.empty() || tokens_new.size() == 0) {
         return false;
     }
@@ -2216,8 +2323,7 @@ bool server_prompt_cache::disk_fetch(const server_tokens & tokens_new) {
         return a.name > b.name;
     });
 
-    std::string best_path;
-    size_t best_size = 0;
+    const bool prune = server_prompt_cache_env_flag("VITRIOL_KV_DISK_PRUNE", false);
     float best_keep = 0.0f;
     float best_sim  = 0.0f;
 
@@ -2227,8 +2333,36 @@ bool server_prompt_cache::disk_fetch(const server_tokens & tokens_new) {
         server_tokens cand;
         uint64_t n_main = 0;
         uint64_t n_drft = 0;
-        if (!server_prompt_cache_disk_read_tokens(path, cand, n_main, n_drft)) {
+        server_prompt_cache_identity id {};
+        uint32_t version = 0;
+        if (!server_prompt_cache_disk_read_tokens(path, cand, n_main, n_drft, id, version)) {
+            n_disk_damaged++;
+            if (prune) {
+                remove(path.c_str());
+                n_disk_pruned++;
+            }
             continue;
+        }
+
+        const int verdict = server_prompt_cache_identity_verdict(identity, id, version);
+        if (!server_prompt_cache_verdict_accepts(verdict)) {
+            if (verdict == SERVER_PROMPT_CACHE_VERDICT_MISMATCH) {
+                if (server_prompt_cache_identity_hard_ok(identity, id)) {
+                    n_disk_rejected_model++;
+                } else {
+                    n_disk_rejected_config++;
+                }
+            }
+            SRV_WRN(" - disk fetch: skip %s (identity mismatch, key %016llx)\n",
+                    file.name.c_str(), (unsigned long long) id.model_key);
+            if (prune) {
+                remove(path.c_str());
+                n_disk_pruned++;
+            }
+            continue;
+        }
+        if (verdict == SERVER_PROMPT_CACHE_VERDICT_V1) {
+            n_disk_unverified++;
         }
 
         // skip candidates already fully covered by a live RAM entry
@@ -2240,6 +2374,7 @@ bool server_prompt_cache::disk_fetch(const server_tokens & tokens_new) {
             }
         }
         if (contained) {
+            n_disk_skipped_contained++;
             continue;
         }
 
@@ -2258,20 +2393,37 @@ bool server_prompt_cache::disk_fetch(const server_tokens & tokens_new) {
         if (f_keep > best_keep || (f_keep == best_keep && f_sim > best_sim)) {
             best_keep = f_keep;
             best_sim  = f_sim;
-            best_path = path;
-            best_size = (size_t) (n_main + n_drft);
+            path_out  = path;
         }
     }
 
-    if (best_path.empty()) {
+    if (path_out.empty()) {
+        n_disk_miss++;
+        SRV_TRC(" - disk fetch: no usable mirror for %zu tokens\n", tokens_new.size());
         return false;
     }
 
-    // pull the winner fully into the RAM cache
+    f_keep_out = best_keep;
+    f_sim_out  = best_sim;
+    return true;
+}
+
+bool server_prompt_cache::disk_read_best(const std::string & path, float f_keep) {
     server_prompt_cache_state st;
-    if (!server_prompt_cache_disk_read(best_path, st)) {
-        SRV_WRN(" - disk fetch: damaged state %s\n", best_path.c_str());
-        remove(best_path.c_str());
+    server_prompt_cache_identity id {};
+    uint32_t version = 0;
+    if (!server_prompt_cache_disk_read(path, st, id, version)) {
+        SRV_WRN(" - disk fetch: damaged state %s\n", path.c_str());
+        n_disk_damaged++;
+        remove(path.c_str());
+        return false;
+    }
+
+    const int verdict = server_prompt_cache_identity_verdict(identity, id, version);
+    if (!server_prompt_cache_verdict_accepts(verdict)) {
+        n_disk_rejected_model++;
+        SRV_WRN(" - disk fetch: rejecting %s (identity mismatch, key %016llx)\n",
+                path.c_str(), (unsigned long long) id.model_key);
         return false;
     }
 
@@ -2282,11 +2434,23 @@ bool server_prompt_cache::disk_fetch(const server_tokens & tokens_new) {
         }
     }
 
-    SRV_WRN(" - disk fetch: restored %.1f MiB state (%d tokens, keep %.2f) from %s\n",
-            st.size() / (1024.0 * 1024.0), st.prompt.n_tokens(), best_keep, best_path.c_str());
+    SRV_WRN(" - disk fetch: restored %.1f MiB state (%d tokens, keep %.2f, key %016llx) from %s\n",
+            st.size() / (1024.0 * 1024.0), st.prompt.n_tokens(), f_keep,
+            (unsigned long long) id.model_key, path.c_str());
     states.push_back(std::move(st));
     n_disk_restored++;
+    n_disk_fetched++;
     return true;
+}
+
+bool server_prompt_cache::disk_fetch(const server_tokens & tokens_new) {
+    std::string path;
+    float f_keep = 0.0f;
+    float f_sim  = 0.0f;
+    if (!disk_find_best(tokens_new, path, f_keep, f_sim)) {
+        return false;
+    }
+    return disk_read_best(path, f_keep);
 }
 
 void server_prompt_cache::disk_load() {
@@ -2305,15 +2469,42 @@ void server_prompt_cache::disk_load() {
         return a.name > b.name;
     });
 
-    size_t n_loaded = 0;
-    size_t n_dropped = 0;
+    const bool prune = server_prompt_cache_env_flag("VITRIOL_KV_DISK_PRUNE", false);
+    size_t n_loaded    = 0;
+    size_t n_dropped   = 0;
+    size_t n_rejected  = 0;
+    size_t n_unverified = 0;
     for (const auto & file : files) {
         server_prompt_cache_state st;
-        if (!server_prompt_cache_disk_read(disk_dir + file.name, st)) {
+        server_prompt_cache_identity id {};
+        uint32_t version = 0;
+        if (!server_prompt_cache_disk_read(disk_dir + file.name, st, id, version)) {
             SRV_WRN(" - disk load: removing damaged state %s\n", file.name.c_str());
             remove((disk_dir + file.name).c_str());
+            n_disk_damaged++;
             n_dropped++;
             continue;
+        }
+
+        const int verdict = server_prompt_cache_identity_verdict(identity, id, version);
+        if (!server_prompt_cache_verdict_accepts(verdict)) {
+            if (server_prompt_cache_identity_hard_ok(identity, id)) {
+                n_disk_rejected_model++;
+            } else {
+                n_disk_rejected_config++;
+            }
+            SRV_WRN(" - disk load: skip %s (identity mismatch, key %016llx)\n",
+                    file.name.c_str(), (unsigned long long) id.model_key);
+            if (prune) {
+                remove((disk_dir + file.name).c_str());
+                n_disk_pruned++;
+            }
+            n_rejected++;
+            continue;
+        }
+        if (verdict == SERVER_PROMPT_CACHE_VERDICT_V1) {
+            n_disk_unverified++;
+            n_unverified++;
         }
 
         // skip entries fully contained in an already loaded (newer) entry
@@ -2325,14 +2516,16 @@ void server_prompt_cache::disk_load() {
             }
         }
         if (contained) {
+            n_disk_skipped_contained++;
             n_dropped++;
             continue;
         }
 
         if (limit_size > 0 && size() + st.size() > limit_size) {
-            // RAM pool full: file stays on disk for a future boot
+            // RAM pool full: keep scanning, a later (older, smaller) file may fit
             SRV_TRC(" - disk load: %s kept on disk (RAM pool full)\n", file.name.c_str());
-            break;
+            n_dropped++;
+            continue;
         }
 
         states.push_back(std::move(st));
@@ -2340,8 +2533,43 @@ void server_prompt_cache::disk_load() {
         n_loaded++;
     }
 
-    if (n_loaded > 0 || n_dropped > 0) {
-        SRV_WRN(" - disk load: restored %zu prompt states (%zu skipped) from %s\n",
-                n_loaded, n_dropped, disk_dir.c_str());
+    if (n_loaded > 0 || n_dropped > 0 || n_rejected > 0) {
+        SRV_WRN(" - disk load: restored %zu prompt states (%zu skipped, %zu rejected, %zu unverified) from %s\n",
+                n_loaded, n_dropped, n_rejected, n_unverified, disk_dir.c_str());
     }
+}
+
+std::vector<server_prompt_cache_disk_info> server_prompt_cache::disk_list() const {
+    std::vector<server_prompt_cache_disk_info> out;
+    if (disk_dir.empty()) {
+        return out;
+    }
+
+    std::vector<server_prompt_cache_disk_file> files;
+    server_prompt_cache_disk_scan(disk_dir, files);
+
+    for (const auto & file : files) {
+        server_prompt_cache_disk_info info;
+        info.name  = file.name;
+        info.size  = file.size;
+        info.mtime = file.mtime;
+
+        server_tokens cand;
+        uint64_t n_main = 0;
+        uint64_t n_drft = 0;
+        server_prompt_cache_identity id {};
+        uint32_t version = 0;
+        if (server_prompt_cache_disk_read_tokens(disk_dir + file.name, cand, n_main, n_drft, id, version)) {
+            info.n_tokens  = cand.size();
+            info.version   = version;
+            info.model_key = id.model_key;
+            info.verdict   = server_prompt_cache_identity_verdict(identity, id, version);
+        } else {
+            info.verdict = SERVER_PROMPT_CACHE_VERDICT_UNKNOWN;
+        }
+
+        out.push_back(std::move(info));
+    }
+
+    return out;
 }

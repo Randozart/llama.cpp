@@ -17,6 +17,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -871,8 +873,70 @@ public:
     server_metrics get_metrics() const {
         auto m = metrics;
         m.n_kv_ejected = ctx_tgt ? llama_kv_vitriol_evicted(ctx_tgt) : 0;
-        m.n_kv_cache_spills = prompt_cache ? prompt_cache->n_disk_spills.load() : 0;
+        if (prompt_cache) {
+            m.n_kv_cache_spills       = prompt_cache->n_disk_spills.load();
+            m.n_kv_cache_disk_restored   = prompt_cache->n_disk_restored.load();
+            m.n_kv_cache_disk_fetched    = prompt_cache->n_disk_fetched.load();
+            m.n_kv_cache_disk_miss       = prompt_cache->n_disk_miss.load();
+            m.n_kv_cache_disk_rejected   = prompt_cache->n_disk_rejected_config.load() +
+                                           prompt_cache->n_disk_rejected_model.load();
+            m.n_kv_cache_disk_unverified = prompt_cache->n_disk_unverified.load();
+            m.n_kv_cache_disk_pruned     = prompt_cache->n_disk_pruned.load();
+            m.n_kv_cache_mem_entries     = prompt_cache->states.size();
+        }
         return m;
+    }
+
+    // read-only view of the prompt cache (RAM entries + disk mirror with
+    // identity verdicts) for the /cache endpoint
+    json get_cache_info(const std::string & lookup_hash = "") const {
+        json res;
+        res["enabled"] = (bool) prompt_cache;
+        if (!prompt_cache) {
+            return res;
+        }
+
+        res["identity"] = {
+            {"model_key", string_format("%016llx", (unsigned long long) prompt_cache->identity.model_key)},
+            {"build_key", string_format("%016llx", (unsigned long long) prompt_cache->identity.build_key)},
+            {"n_ctx",     prompt_cache->identity.n_ctx},
+            {"type_k",    (int) prompt_cache->identity.type_k},
+            {"type_v",    (int) prompt_cache->identity.type_v},
+            {"n_stream",  prompt_cache->identity.n_stream},
+        };
+
+        json mem = json::array();
+        for (const auto & st : prompt_cache->states) {
+            mem.push_back({
+                {"n_tokens", st.prompt.n_tokens()},
+                {"bytes",    st.size()},
+            });
+        }
+        res["mem"] = mem;
+
+        json disk = json::array();
+        size_t disk_bytes = 0;
+        for (const auto & e : prompt_cache->disk_list()) {
+            disk_bytes += e.size;
+            const bool match = lookup_hash.empty() || e.name.find(lookup_hash) != std::string::npos;
+            if (!match || disk.size() >= 512) {
+                continue;
+            }
+            disk.push_back({
+                {"name",      e.name},
+                {"n_tokens",  e.n_tokens},
+                {"bytes",     e.size},
+                {"mtime",     e.mtime},
+                {"version",   e.version},
+                {"model_key", string_format("%016llx", (unsigned long long) e.model_key)},
+                {"verdict",   e.verdict},
+            });
+        }
+        res["disk"]       = disk;
+        res["disk_bytes"] = disk_bytes;
+        res["disk_dir"]   = prompt_cache->disk_dir;
+
+        return res;
     }
 
     void reset_metrics_bucket() {
@@ -1370,6 +1434,62 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.slot_save_path);
+
+            // VITRIOL Optane tier provenance: stamp the model/config identity so
+            // states from a different model or KV layout can be told apart.
+            {
+                server_prompt_cache_identity id;
+                id.n_ctx    = (uint32_t) n_ctx;
+                id.type_k   = (uint32_t) params_base.cache_type_k;
+                id.type_v   = (uint32_t) params_base.cache_type_v;
+                id.n_stream = params_base.kv_unified ? 1 : (uint32_t) std::max(1, params_base.n_parallel);
+
+                uint64_t h = 1469598103934665603ull;
+                auto mix = [&h](uint64_t v) {
+                    h ^= v;
+                    h *= 1099511628211ull;
+                };
+                auto mix_str = [&mix](const std::string & s) {
+                    for (unsigned char c : s) {
+                        mix((uint64_t) c + 1);
+                    }
+                    mix(s.size());
+                };
+
+                struct stat st;
+                if (stat(params_base.model.path.c_str(), &st) == 0) {
+                    mix((uint64_t) st.st_size);
+                    mix((uint64_t) st.st_mtime);
+                }
+                char desc[128] = {0};
+                llama_model_desc(model_tgt, desc, sizeof(desc));
+                mix_str(desc);
+                mix((uint64_t) llama_model_n_layer(model_tgt));
+                mix((uint64_t) llama_model_n_embd(model_tgt));
+                mix((uint64_t) llama_model_n_head(model_tgt));
+                mix((uint64_t) llama_model_n_head_kv(model_tgt));
+                mix((uint64_t) llama_model_n_ctx_train(model_tgt));
+                id.model_key = h;
+
+                uint64_t b = 1469598103934665603ull;
+                auto mixb = [&b](uint64_t v) {
+                    b ^= v;
+                    b *= 1099511628211ull;
+                };
+                mixb(id.type_k);
+                mixb(id.type_v);
+                mixb(id.n_stream);
+                mixb(id.n_ctx);
+                mixb(1); // llama state sequence format version
+                id.build_key = b;
+
+                prompt_cache->identity = id;
+
+                SRV_TRC("Optane tier identity: model_key=%016llx build_key=%016llx (ctx=%u kv=%d/%d stream=%u)\n",
+                        (unsigned long long) id.model_key, (unsigned long long) id.build_key,
+                        id.n_ctx, (int) id.type_k, (int) id.type_v, id.n_stream);
+            }
+
             // VITRIOL Optane tier: reload states mirrored by a previous run
             prompt_cache->disk_load();
         } else {
@@ -4725,6 +4845,14 @@ void server_routes::init_routes() {
         // depends on queue idleness.
         use_cached_metrics();
 
+        return res;
+    };
+
+    // VITRIOL Optane tier: read-only cache view. `?hash=<substr>` filters the
+    // disk list by filename (model key or token hash prefix).
+    this->get_cache = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        res->ok(ctx_server.get_cache_info(req.get_param("hash")));
         return res;
     };
 

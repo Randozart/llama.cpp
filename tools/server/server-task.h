@@ -613,6 +613,31 @@ struct server_prompt_cache_state {
     }
 };
 
+// Identity of the model/context that wrote a disk state. v1 files have none.
+// model_key is a hash of the model file (path stat) + arch/hparams; build_key
+// hashes the fields that change KV layout or semantics.
+struct server_prompt_cache_identity {
+    uint64_t model_key = 0;
+    uint64_t build_key = 0;
+    uint32_t n_ctx      = 0;
+    uint32_t type_k     = 0;
+    uint32_t type_v     = 0;
+    uint32_t n_stream   = 0;
+    uint32_t reserved[4] = {0, 0, 0, 0};
+};
+
+// one entry from a disk-tier scan, with cheap identity verdict
+struct server_prompt_cache_disk_info {
+    std::string name;
+    size_t      size  = 0;
+    int64_t     mtime = 0;
+    size_t      n_tokens = 0;
+    uint32_t    version  = 0;   // wrapper version (1 or 2)
+    uint64_t    model_key = 0;  // 0 when v1
+    // 0 = unknown/damaged, 1 = v2 matches current identity, 2 = v2 mismatch, 3 = v1 unverified
+    int         verdict = 0;
+};
+
 struct server_prompt_cache {
     // disk_dir enables the VITRIOL Optane tier: states admitted to the RAM
     // cache are mirrored under disk_dir and reloaded on boot, so a restart
@@ -620,6 +645,9 @@ struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, const std::string & disk_dir = "");
 
     std::list<server_prompt_cache_state> states;
+
+    // identity of the model/context this cache belongs to; set at server init.
+    server_prompt_cache_identity identity;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -639,9 +667,28 @@ struct server_prompt_cache {
     // prefix against tokens_new and pull it into states (RAM-miss rescue)
     bool disk_fetch(const server_tokens & tokens_new);
 
+    // scan-only: best disk candidate for tokens_new; returns false if none
+    // passes the keep gate. Does not load anything.
+    bool disk_find_best(const server_tokens & tokens_new, std::string & path_out,
+            float & f_keep_out, float & f_sim_out);
+
+    // pull a candidate found by disk_find_best into the RAM states
+    bool disk_read_best(const std::string & path, float f_keep);
+
+    // list disk entries with their identity verdict (for the /cache endpoint)
+    std::vector<server_prompt_cache_disk_info> disk_list() const;
+
     // counters (atomic: read from the http thread)
     std::atomic<uint64_t> n_disk_spills{0};
     std::atomic<uint64_t> n_disk_restored{0};
+    std::atomic<uint64_t> n_disk_fetched{0};
+    std::atomic<uint64_t> n_disk_miss{0};
+    std::atomic<uint64_t> n_disk_skipped_contained{0};
+    std::atomic<uint64_t> n_disk_rejected_config{0};
+    std::atomic<uint64_t> n_disk_rejected_model{0};
+    std::atomic<uint64_t> n_disk_unverified{0};
+    std::atomic<uint64_t> n_disk_pruned{0};
+    std::atomic<uint64_t> n_disk_damaged{0};
 
     size_t size() const;
 
