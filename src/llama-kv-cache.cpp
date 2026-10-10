@@ -144,6 +144,14 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
+    // cooperative-VRAM policy initial values (env, then runtime via /kv-policy)
+    {
+        const char * f = getenv("VITRIOL_KV_FLOOR");
+        const char * p = getenv("VITRIOL_KV_PROTECT");
+        v_floor_sc.store(f ? (float) atof(f) : 0.0f);
+        v_protect.store(p ? (int32_t) atoi(p) : 2048);
+    }
+
     const uint32_t n_layer = hparams.n_layer_all;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -3002,55 +3010,89 @@ void llama_kv_cache::vitriol_probe_finish() {
 
     // Eager ejection (owner request 2026-09-03, context lifecycle Stage 5):
     // "dump the moment it's certain not to be needed." A cell whose decayed
-    // score fell below VITRIOL_KV_FLOOR has been unattended for tens of
-    // decode steps - the model will not miss it. Sinks (first 4, matching
-    // the evict_sparse call site) and the recent window
-    // (VITRIOL_KV_PROTECT positions behind pos_max, default 2048) never
-    // sweep. Floor 0 = off (demand-driven eviction only, the pre-eager
-    // behavior). Sweeps ride the probe cadence.
-    {
-        static const float floor_sc = [] {
-            const char * f = getenv("VITRIOL_KV_FLOOR");
-            return f ? (float) atof(f) : 0.0f;
-        }();
-        static const int32_t protect = [] {
-            const char * p = getenv("VITRIOL_KV_PROTECT");
-            return p ? (int32_t) atoi(p) : 2048;
-        }();
-        if (floor_sc > 0.0f) {
-            int32_t pos_max = INT32_MIN;
-            for (uint32_t j = 0; j < cells.size(); ++j) {
-                if (!cells.is_empty(j)) {
-                    pos_max = std::max(pos_max, cells.pos_get(j));
-                }
-            }
-            if (pos_max != INT32_MIN) {
-                const int32_t recent_floor = pos_max - protect;
-                uint32_t swept = 0;
-                for (uint32_t j = 4; j < cells.size(); ++j) { // sinks, cf. evict_sparse call
-                    if (cells.is_empty(j)) {
-                        continue;
-                    }
-                    if (cells.pos_get(j) > recent_floor) {
-                        continue;
-                    }
-                    if (cells.score_get(j) < floor_sc) {
-                        cells.rm(j);
-                        swept++;
-                    }
-                }
-                if (swept > 0) {
-                    v_evicted_total += swept;
-                    static uint32_t s_sweeps = 0;
-                    if ((++s_sweeps & 0x07) == 1) {
-                        fprintf(stderr,
-                                "VITRIOL_KV_EAGER: swept %u cells below floor %.3f (protect %d)\n",
-                                swept, floor_sc, protect);
-                    }
-                }
-            }
+    // score fell below the floor has been unattended for tens of decode
+    // steps - the model will not miss it. Sweeps ride the probe cadence;
+    // floor/protect are runtime-settable (see vitriol_policy_sweep).
+    if (v_floor_sc.load() > 0.0f) {
+        vitriol_sweep_stream(v_probe_strm, v_floor_sc.load(), v_protect.load());
+    }
+}
+
+// one stream's eager sweep; returns swept cells. Sinks (first 4, matching
+// the evict_sparse call site) and the recent window (protect positions
+// behind pos_max) never sweep. Floor 0 = demand-driven eviction only.
+uint32_t llama_kv_cache::vitriol_sweep_stream(uint32_t s, float floor_sc, int32_t protect) {
+    auto & cells = v_cells[s];
+    int32_t pos_max = INT32_MIN;
+    for (uint32_t j = 0; j < cells.size(); ++j) {
+        if (!cells.is_empty(j)) {
+            pos_max = std::max(pos_max, cells.pos_get(j));
         }
     }
+    if (pos_max == INT32_MIN) {
+        return 0;
+    }
+    const int32_t recent_floor = pos_max - protect;
+    uint32_t swept = 0;
+    for (uint32_t j = 4; j < cells.size(); ++j) { // sinks, cf. evict_sparse call
+        if (cells.is_empty(j) || cells.pos_get(j) > recent_floor) {
+            continue;
+        }
+        if (cells.score_get(j) < floor_sc) {
+            cells.rm(j);
+            swept++;
+        }
+    }
+    if (swept > 0) {
+        v_evicted_total += swept;
+        static uint32_t s_sweeps = 0;
+        if ((++s_sweeps & 0x07) == 1) {
+            fprintf(stderr,
+                    "VITRIOL_KV_EAGER: swept %u cells below floor %.3f (protect %d)\n",
+                    swept, floor_sc, protect);
+        }
+    }
+    return swept;
+}
+
+// VITRIOL cooperative-VRAM (2026-10-10): runtime policy surface for the
+// governor. sweep()/resident_cells() must run on the server thread.
+void llama_kv_cache::vitriol_policy_set(float floor_score, int32_t protect_pos) {
+    v_floor_sc.store(floor_score);
+    v_protect.store(protect_pos);
+}
+
+void llama_kv_cache::vitriol_policy_get(float & floor_score, int32_t & protect_pos) const {
+    floor_score = v_floor_sc.load();
+    protect_pos = v_protect.load();
+}
+
+uint32_t llama_kv_cache::vitriol_policy_sweep() {
+    const float floor_sc = v_floor_sc.load();
+    if (floor_sc <= 0.0f) {
+        return 0;
+    }
+    uint32_t total = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        total += vitriol_sweep_stream(s, floor_sc, v_protect.load());
+    }
+    return total;
+}
+
+uint32_t llama_kv_cache::vitriol_resident_cells() const {
+    uint32_t n = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        n += v_cells[s].get_used();
+    }
+    return n;
+}
+
+size_t llama_kv_cache::vitriol_buffer_bytes() const {
+    size_t bytes = 0;
+    for (const auto & kv : ctxs_bufs) {
+        bytes += ggml_backend_buffer_get_size(kv.second.get());
+    }
+    return bytes;
 }
 
 // VITRIOL: evict low-importance cells to free slots for new tokens.

@@ -2815,6 +2815,30 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_KV_POLICY:
+                {
+                    // cooperative-VRAM governor: set the eager-sweep policy,
+                    // optionally run one sweep. Runs on the server thread
+                    // (deferred while decoding, like all non-metrics tasks).
+                    float   cur_floor   = 0.0f;
+                    int32_t cur_protect = 2048;
+                    llama_kv_vitriol_policy_get(ctx_tgt, &cur_floor, &cur_protect);
+                    if (task.kv_policy.protect >= 0) {
+                        cur_protect = task.kv_policy.protect;
+                    }
+                    llama_kv_vitriol_policy_set(ctx_tgt, task.kv_policy.floor, cur_protect);
+
+                    const uint32_t swept = task.kv_policy.sweep ? llama_kv_vitriol_sweep(ctx_tgt) : 0;
+
+                    auto res = std::make_unique<server_task_result_kv_policy>();
+                    res->id           = task.id;
+                    res->floor        = task.kv_policy.floor;
+                    res->protect      = cur_protect;
+                    res->swept        = swept;
+                    res->resident     = ctx_tgt ? llama_kv_vitriol_resident(ctx_tgt) : 0;
+                    res->buffer_bytes = ctx_tgt ? llama_kv_vitriol_buffer_bytes(ctx_tgt) : 0;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -4941,6 +4965,42 @@ void server_routes::init_routes() {
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    };
+
+    this->post_kv_policy = [this](const server_http_req & req) {
+        auto res = create_response();
+        json data;
+        try {
+            data = json::parse(req.body);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(std::string("Invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        server_task task(SERVER_TASK_TYPE_KV_POLICY);
+        task.id = res->rd.get_new_id();
+        if (data.contains("floor")) {
+            task.kv_policy.floor = data.at("floor").get<float>();
+        }
+        if (data.contains("protect")) {
+            task.kv_policy.protect = data.at("protect").get<int32_t>();
+        }
+        if (data.contains("sweep")) {
+            task.kv_policy.sweep = data.at("sweep").get<bool>();
+        }
+        res->rd.post_task(std::move(task));
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
         return res;
     };
 

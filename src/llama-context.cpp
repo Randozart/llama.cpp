@@ -4382,3 +4382,49 @@ uint64_t llama_kv_vitriol_evicted(const struct llama_context * ctx) {
     auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
     return kv ? kv->vitriol_evicted_total() : 0;
 }
+
+// VITRIOL cooperative-VRAM (2026-10-10): runtime eager-sweep policy surface
+// for the governor (see llama.h). Hybrid memories (non-kv-cache) report 0.
+void llama_kv_vitriol_policy_set(struct llama_context * ctx, float floor_score, int32_t protect_pos) {
+    if (!ctx) {
+        return;
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    if (kv) {
+        kv->vitriol_policy_set(floor_score, protect_pos);
+    }
+}
+
+void llama_kv_vitriol_policy_get(const struct llama_context * ctx, float * floor_score, int32_t * protect_pos) {
+    if (!ctx || !floor_score || !protect_pos) {
+        return;
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    if (kv) {
+        kv->vitriol_policy_get(*floor_score, *protect_pos);
+    }
+}
+
+uint32_t llama_kv_vitriol_sweep(struct llama_context * ctx) {
+    if (!ctx) {
+        return 0;
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    return kv ? kv->vitriol_policy_sweep() : 0;
+}
+
+uint32_t llama_kv_vitriol_resident(const struct llama_context * ctx) {
+    if (!ctx) {
+        return 0;
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    return kv ? kv->vitriol_resident_cells() : 0;
+}
+
+size_t llama_kv_vitriol_buffer_bytes(const struct llama_context * ctx) {
+    if (!ctx) {
+        return 0;
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    return kv ? kv->vitriol_buffer_bytes() : 0;
+}

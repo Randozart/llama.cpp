@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 
@@ -233,6 +234,16 @@ public:
     bool vitriol_probe_pending() const;
     void vitriol_probe_finish();
 
+    // VITRIOL cooperative-VRAM (2026-10-10): runtime eager-sweep policy.
+    // Initial values come from VITRIOL_KV_FLOOR / VITRIOL_KV_PROTECT; the
+    // governor overrides them live via the server /kv-policy endpoint.
+    // sweep() must run on the server thread (it mutates cells).
+    void     vitriol_policy_set(float floor_score, int32_t protect_pos);
+    void     vitriol_policy_get(float & floor_score, int32_t & protect_pos) const;
+    uint32_t vitriol_policy_sweep();
+    uint32_t vitriol_resident_cells() const;
+    size_t   vitriol_buffer_bytes() const;
+
     //
     // input API
     //
@@ -337,6 +348,13 @@ private:
     uint32_t      v_probe_layers  = 0;   // layers scored this pass
     uint32_t      v_probe_strm    = 0;   // kv stream of the scored sequence
     uint64_t      v_evicted_total = 0;   // cells ejected since boot
+
+    // cooperative-VRAM policy (see vitriol_policy_set)
+    std::atomic<float>   v_floor_sc {0.0f};
+    std::atomic<int32_t> v_protect {2048};
+
+    // eager sweep for one stream; server thread only (mutates cells)
+    uint32_t vitriol_sweep_stream(uint32_t s, float floor_sc, int32_t protect);
 
     std::vector<kv_layer> layers;
 

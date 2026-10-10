@@ -1698,6 +1698,19 @@ json server_task_result_slot_erase::to_json() {
 }
 
 //
+// server_task_result_kv_policy
+//
+json server_task_result_kv_policy::to_json() {
+    return json {
+        { "floor",        floor },
+        { "protect",      protect },
+        { "swept",        swept },
+        { "resident",     resident },
+        { "buffer_bytes", buffer_bytes },
+    };
+}
+
+//
 // server_task_result_get_lora
 //
 

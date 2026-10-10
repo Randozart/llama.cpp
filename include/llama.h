@@ -1631,6 +1631,19 @@ extern "C" {
     // the officina ejected-tokens gauge.
     LLAMA_API uint64_t llama_kv_vitriol_evicted(const struct llama_context * ctx);
 
+    // VITRIOL cooperative-VRAM (2026-10-10): runtime eager-sweep policy for
+    // the governor's /kv-policy endpoint. floor_score 0 = demand-driven
+    // eviction only (sweep disabled). protect_pos = recent-window size that
+    // never sweeps. Initial values: VITRIOL_KV_FLOOR / VITRIOL_KV_PROTECT.
+    LLAMA_API void     llama_kv_vitriol_policy_set(struct llama_context * ctx, float floor_score, int32_t protect_pos);
+    LLAMA_API void     llama_kv_vitriol_policy_get(const struct llama_context * ctx, float * floor_score, int32_t * protect_pos);
+    // one eager sweep across all streams; server thread only (mutates cells)
+    LLAMA_API uint32_t llama_kv_vitriol_sweep(struct llama_context * ctx);
+    // resident (non-evicted) cell count; server thread only
+    LLAMA_API uint32_t llama_kv_vitriol_resident(const struct llama_context * ctx);
+    // KV buffer bytes per allocation (stable after load; hybrid memories = 0)
+    LLAMA_API size_t   llama_kv_vitriol_buffer_bytes(const struct llama_context * ctx);
+
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,
