@@ -14,9 +14,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <dirent.h>
 #include <thread>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 //
 // task_params
@@ -2262,6 +2264,23 @@ static size_t server_prompt_cache_disk_scan(const std::string & dir,
     return total;
 }
 
+// mirror cap = multiplier x RAM pool. Was 8x; at cram=12288 the live mirror sat
+// at 95.7/96 GiB, so every spill silently deleted the oldest session and a
+// restart re-prefilled it from token 0. Override: VITRIOL_KV_DISK_TRIM_X (1..1024).
+static size_t server_prompt_cache_disk_trim_limit(size_t limit_size) {
+    int mult = 12;
+    const char * v = getenv("VITRIOL_KV_DISK_TRIM_X");
+    if (v != nullptr && v[0] != '\0') {
+        const int parsed = atoi(v);
+        if (parsed >= 1 && parsed <= 1024) {
+            mult = parsed;
+        } else {
+            SRV_WRN(" - disk trim: VITRIOL_KV_DISK_TRIM_X=%s out of range 1..1024, using %d\n", v, mult);
+        }
+    }
+    return limit_size * (size_t) mult;
+}
+
 static void server_prompt_cache_disk_trim(const std::string & dir, size_t limit_bytes, size_t incoming) {
     if (limit_bytes == 0 || incoming > limit_bytes) {
         return;
@@ -2270,14 +2289,29 @@ static void server_prompt_cache_disk_trim(const std::string & dir, size_t limit_
     std::vector<server_prompt_cache_disk_file> files;
     size_t total = server_prompt_cache_disk_scan(dir, files);
 
+    if (total + incoming <= limit_bytes) {
+        return;
+    }
+
+    SRV_WRN(" - disk trim: mirror at %.1f GiB + incoming %.1f GiB exceeds %.1f GiB limit, removing oldest files\n",
+            total / 1073741824.0, incoming / 1073741824.0, limit_bytes / 1073741824.0);
+
+    size_t n_removed = 0;
+    size_t bytes_removed = 0;
     for (const auto & file : files) {
         if (total + incoming <= limit_bytes) {
             break;
         }
         if (remove((dir + file.name).c_str()) == 0) {
             total -= file.size;
+            bytes_removed += file.size;
+            n_removed++;
+            SRV_WRN(" - disk trim: removed %s (%.2f GiB)\n", file.name.c_str(), file.size / 1073741824.0);
         }
     }
+
+    SRV_WRN(" - disk trim: freed %zu files (%.1f GiB), mirror now %.1f GiB\n",
+            n_removed, bytes_removed / 1073741824.0, total / 1073741824.0);
 }
 
 void server_prompt_cache::disk_spill(const server_prompt & prompt,
@@ -2288,7 +2322,7 @@ void server_prompt_cache::disk_spill(const server_prompt & prompt,
 
     const size_t spill_size = data_main->size() + (data_drft ? data_drft->size() : 0);
 
-    server_prompt_cache_disk_trim(disk_dir, limit_size * 8, spill_size); // mirror keeps ~8x the RAM pool: evicted-from-RAM states stay fetchable
+    server_prompt_cache_disk_trim(disk_dir, server_prompt_cache_disk_trim_limit(limit_size), spill_size); // mirror keeps ~12x the RAM pool: evicted-from-RAM states stay fetchable
 
     const std::string name = server_prompt_cache_disk_name(prompt.tokens, identity.model_key);
     const std::string path = disk_dir + name;
@@ -2327,8 +2361,16 @@ bool server_prompt_cache::disk_find_best(const server_tokens & tokens_new, std::
     float best_keep = 0.0f;
     float best_sim  = 0.0f;
 
+    // near-miss diagnostics: best candidate that failed the f_keep gate
+    int    rejected_keep  = 0;
+    float  worst_keep     = 0.0f;
+    float  worst_keep_sim = 0.0f;
+    size_t worst_keep_tok = 0;
+    size_t n_scanned      = 0;
+
     for (const auto & file : files) {
         const std::string path = disk_dir + file.name;
+        n_scanned++;
 
         server_tokens cand;
         uint64_t n_main = 0;
@@ -2387,6 +2429,12 @@ bool server_prompt_cache::disk_find_best(const server_tokens & tokens_new, std::
         const float f_keep = float(lcp) / cand.size();
         const float f_sim  = float(lcp) / tokens_new.size();
         if (f_keep < 0.25f) {
+            rejected_keep++;
+            if (f_keep > worst_keep) {
+                worst_keep     = f_keep;
+                worst_keep_sim = f_sim;
+                worst_keep_tok = cand.size();
+            }
             continue;
         }
 
@@ -2399,7 +2447,13 @@ bool server_prompt_cache::disk_find_best(const server_tokens & tokens_new, std::
 
     if (path_out.empty()) {
         n_disk_miss++;
-        SRV_TRC(" - disk fetch: no usable mirror for %zu tokens\n", tokens_new.size());
+        if (rejected_keep > 0) {
+            // a mirror of this conversation exists but the f_keep gate refused it
+            SRV_WRN(" - disk fetch: no usable mirror for %zu tokens (%zu files scanned, %d rejected below f_keep 0.25: best lcp kept %.2f of %zu tokens, f_sim %.2f)\n",
+                    tokens_new.size(), n_scanned, rejected_keep, worst_keep, worst_keep_tok, worst_keep_sim);
+        } else {
+            SRV_TRC(" - disk fetch: no usable mirror for %zu tokens (%zu files scanned)\n", tokens_new.size(), n_scanned);
+        }
         return false;
     }
 
@@ -2440,6 +2494,10 @@ bool server_prompt_cache::disk_read_best(const std::string & path, float f_keep)
     states.push_back(std::move(st));
     n_disk_restored++;
     n_disk_fetched++;
+
+    // refresh mtime so the oldest-first trim prefers least-recently-fetched
+    utimes(path.c_str(), nullptr);
+
     return true;
 }
 
