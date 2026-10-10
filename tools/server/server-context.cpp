@@ -1954,6 +1954,19 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        // restored states (disk mirror, slot file, idle-slot cache) carry no checkpoint ring,
+        // so the do_reset gate would force a full re-prefill on the first request after the
+        // restore; snapshot the restored KV range once so the ring is usable
+        if (params_base.n_ctx_checkpoints > 0 &&
+            slot.prompt.checkpoints.empty() &&
+            slot.prompt.n_tokens() > 0) {
+            const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+            const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            if (pos_min >= 0 && pos_max >= 0) {
+                create_checkpoint(slot, 0, pos_min, pos_max);
+            }
+        }
+
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
