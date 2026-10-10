@@ -28,6 +28,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_KV_POLICY,
+    SERVER_TASK_TYPE_CTX_RESIZE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -185,6 +186,9 @@ struct server_task {
         bool    sweep  = false; // run one sweep after applying the policy
     };
     kv_policy_action kv_policy;
+
+    // used by SERVER_TASK_TYPE_CTX_RESIZE (cooperative-VRAM governor)
+    uint32_t ctx_resize_n_ctx = 0;
 
     server_task() = default;
 
@@ -552,6 +556,15 @@ struct server_task_result_kv_policy : server_task_result {
     uint32_t swept;
     uint32_t resident;
     size_t   buffer_bytes;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_ctx_resize : server_task_result {
+    uint32_t n_ctx_old;
+    uint32_t n_ctx_new;
+    size_t   n_spooled;      // slots spooled into the prompt cache
+    size_t   n_tokens_spooled;
 
     virtual json to_json() override;
 };

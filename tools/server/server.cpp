@@ -288,6 +288,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
     // cooperative-VRAM governor (VITRIOL): runtime KV eviction policy
     ctx_http.post("/kv-policy",                ex_wrapper(routes.post_kv_policy));
+    // cooperative-VRAM governor (VITRIOL): live context resize (opt-in)
+    ctx_http.post("/ctx/resize",               ex_wrapper(routes.post_ctx_resize));
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h

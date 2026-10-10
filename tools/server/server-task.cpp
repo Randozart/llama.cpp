@@ -1711,6 +1711,18 @@ json server_task_result_kv_policy::to_json() {
 }
 
 //
+// server_task_result_ctx_resize
+//
+json server_task_result_ctx_resize::to_json() {
+    return json {
+        { "n_ctx_old",        n_ctx_old },
+        { "n_ctx_new",        n_ctx_new },
+        { "n_spooled",        n_spooled },
+        { "n_tokens_spooled", n_tokens_spooled },
+    };
+}
+
+//
 // server_task_result_get_lora
 //
 
@@ -1865,6 +1877,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+
+        // a state saved under a larger window cannot fit a smaller one
+        // (VITRIOL /ctx/resize: n_ctx left the identity, so fit is per-state)
+        if (identity.n_ctx > 0 && it->prompt.tokens.size() > identity.n_ctx) {
+            continue;
+        }
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {

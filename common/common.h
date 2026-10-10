@@ -928,6 +928,7 @@ struct common_sampler;
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
     common_init_result(common_params & params, bool model_only = false);
+    common_init_result(); // empty shell; use context_from_model to fill it
     ~common_init_result();
 
     llama_model * model();
@@ -938,9 +939,20 @@ struct common_init_result {
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
+    // VITRIOL cooperative-VRAM (2026-10-10): context-only (re)creation from
+    // an already-loaded model for the server /ctx/resize endpoint - skips
+    // model load and device fitting. Takes ownership of `model`.
+    static std::unique_ptr<common_init_result> context_from_model(common_params & params, llama_model * model);
+    // detach the model without freeing it (ownership moves to the caller);
+    // used when swapping to a context_from_model result
+    llama_model * release_model();
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    // context-creation tail shared by the load ctor and context_from_model
+    void init_context(common_params & params);
 };
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;

@@ -1337,6 +1337,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    init_context(params);
+}
+
+// VITRIOL: context-creation tail shared by the load ctor and
+// context_from_model (server /ctx/resize rebuild path).
+void common_init_result::init_context(common_params & params) {
+    llama_model * model = pimpl->model.get();
+    auto cparams = common_context_params_to_llama(params);
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
@@ -1406,6 +1415,25 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
+}
+
+
+common_init_result::common_init_result() : pimpl(new impl{}) {}
+
+llama_model * common_init_result::release_model() {
+    return pimpl->model.release();
+}
+
+common_init_result_ptr common_init_result::context_from_model(common_params & params, llama_model * model) {
+    common_init_result_ptr res(new common_init_result());
+    res->pimpl->model.reset(model);
+    // note: skips model load and device fitting on purpose - the caller
+    // swaps the context of a model that is already resident
+    res->init_context(params);
+    if (res->context() == nullptr) {
+        COM_ERR("%s", "failed to create context from existing model\n");
+    }
+    return res;
 }
 
 llama_model * common_init_result::model() {

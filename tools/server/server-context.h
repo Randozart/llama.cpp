@@ -135,6 +135,7 @@ struct server_routes {
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t post_kv_policy; // cooperative-VRAM governor
+    server_http_context::handler_t post_ctx_resize; // cooperative-VRAM governor
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;

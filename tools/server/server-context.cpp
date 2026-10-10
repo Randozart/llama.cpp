@@ -949,6 +949,12 @@ public:
         return id >= 0 && id < (int) slots.size() && slots[id].is_processing();
     }
 
+    // VITRIOL cooperative-VRAM: /ctx/resize opt-in (governor escalation tier)
+    bool ctx_resize_allowed = [] {
+        const char * v = getenv("VITRIOL_CTX_RESIZE");
+        return v && v[0] == '1';
+    }();
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -1479,7 +1485,10 @@ private:
                 mixb(id.type_k);
                 mixb(id.type_v);
                 mixb(id.n_stream);
-                mixb(id.n_ctx);
+                // note: n_ctx deliberately NOT hashed - KV states are
+                // position-addressed and fit any window >= their token count
+                // (VITRIOL /ctx/resize swaps windows without orphaning the
+                // mirror; per-state fit is checked at load time)
                 mixb(1); // llama state sequence format version
                 id.build_key = b;
 
@@ -2837,6 +2846,136 @@ private:
                     res->swept        = swept;
                     res->resident     = ctx_tgt ? llama_kv_vitriol_resident(ctx_tgt) : 0;
                     res->buffer_bytes = ctx_tgt ? llama_kv_vitriol_buffer_bytes(ctx_tgt) : 0;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_CTX_RESIZE:
+                {
+                    // VITRIOL cooperative-VRAM: swap the KV window without
+                    // reloading weights. Spools every idle slot into the
+                    // prompt cache (RAM tier; Optane mirror follows), frees
+                    // the target context, rebuilds it at the new size from
+                    // the resident model, and lets the next request
+                    // warm-restore from the cache.
+                    if (!ctx_resize_allowed) {
+                        send_error(task, "live context resize is not enabled (VITRIOL_CTX_RESIZE=1)", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (mctx != nullptr) {
+                        send_error(task, "context resize is not supported with a multimodal projector", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
+                    bool busy = false;
+                    for (const auto & slot : slots) {
+                        busy = busy || slot.is_processing();
+                    }
+                    if (busy) {
+                        SRV_DBG("slots busy, defer resize task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const uint32_t n_ctx_new  = task.ctx_resize_n_ctx;
+                    const uint32_t n_ctx_train = llama_model_n_ctx_train(model_tgt);
+                    if (n_ctx_new < 4096 || n_ctx_new > n_ctx_train) {
+                        send_error(task, string_format("n_ctx must be in [4096, %u]", n_ctx_train), ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    const uint32_t n_ctx_old = (uint32_t) n_ctx;
+                    if (n_ctx_new == n_ctx_old) {
+                        send_error(task, "context already at the requested size", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    // 1. spool every slot into the prompt cache
+                    size_t n_spooled = 0;
+                    size_t n_tokens_spooled = 0;
+                    for (auto & slot : slots) {
+                        if (slot.prompt.tokens.empty()) {
+                            continue;
+                        }
+                        n_tokens_spooled += slot.prompt.tokens.size();
+                        if (slot.prompt_save(*prompt_cache)) {
+                            n_spooled++;
+                        }
+                        slot.prompt_clear();
+                    }
+
+                    // 2. tear down contexts, keep the model resident
+                    const bool has_spec_saved = spec != nullptr;
+                    spec.reset();
+                    spec_init.reset();
+                    ctx_dft = nullptr;
+                    model_dft = nullptr;
+
+                    llama_model * model_keep = llama_init->release_model();
+                    llama_init.reset();
+                    ctx_tgt = nullptr;
+
+                    // 3. rebuild the target context at the new window
+                    params_base.n_ctx = (int32_t) n_ctx_new;
+                    llama_init = common_init_result::context_from_model(params_base, model_keep);
+                    ctx_tgt  = llama_init ? llama_init->context() : nullptr;
+                    model_tgt = ctx_tgt ? model_keep : nullptr;
+                    if (ctx_tgt == nullptr) {
+                        // the engine cannot serve until restarted; the model
+                        // was freed with the failed init
+                        SRV_ERR("%s", "context resize failed, engine requires restart\n");
+                        send_error(task, "context resize failed, engine requires restart", ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    n_ctx = llama_n_ctx(ctx_tgt);
+                    ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+
+                    // 4. rebuild the MTP draft context + speculative state
+                    if (has_spec_saved) {
+                        common_params params_dft = common_base_params_to_speculative(params_base);
+                        spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                        model_dft = spec_init ? spec_init->model() : nullptr;
+                        ctx_dft   = spec_init ? spec_init->context() : nullptr;
+                        if (ctx_dft == nullptr) {
+                            SRV_WRN("%s", "draft context rebuild failed after resize; continuing without speculative decoding\n");
+                            spec_init.reset();
+                            ctx_dft = nullptr;
+                            model_dft = nullptr;
+                            ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+                        } else {
+                            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                            params_base.speculative.draft.ctx_dft = ctx_dft;
+                            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+                            try {
+                                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                            } catch (const std::exception & e) {
+                                SRV_WRN("speculative decoding unavailable after resize: %s\n", e.what());
+                            }
+                            if (!spec) {
+                                SRV_WRN("%s", "speculative decoding unavailable after resize\n");
+                            }
+                        }
+                    }
+
+                    // 5. rebind slots + refresh the cache identity
+                    for (auto & slot : slots) {
+                        slot.ctx_tgt = ctx_tgt;
+                        slot.ctx_dft = ctx_dft;
+                        slot.mem.init(ctx_tgt, ctx_dft);
+                        slot.spec    = spec.get();
+                        slot.n_ctx   = n_ctx_slot();
+                    }
+                    if (prompt_cache) {
+                        prompt_cache->identity.n_ctx = n_ctx_new;
+                    }
+
+                    SRV_WRN("context resized %u -> %u (%zu slots spooled, %zu tokens) - next requests warm-restore from the prompt cache\n",
+                            n_ctx_old, n_ctx_new, n_spooled, n_tokens_spooled);
+
+                    auto res = std::make_unique<server_task_result_ctx_resize>();
+                    res->id               = task.id;
+                    res->n_ctx_old        = n_ctx_old;
+                    res->n_ctx_new        = n_ctx_new;
+                    res->n_spooled        = n_spooled;
+                    res->n_tokens_spooled = n_tokens_spooled;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
@@ -4989,6 +5128,42 @@ void server_routes::init_routes() {
         if (data.contains("sweep")) {
             task.kv_policy.sweep = data.at("sweep").get<bool>();
         }
+        res->rd.post_task(std::move(task));
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_ctx_resize = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!ctx_server.ctx_resize_allowed) {
+            res->error(format_error_response("This server does not support live context resize. Start it with VITRIOL_CTX_RESIZE=1", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        json data;
+        try {
+            data = json::parse(req.body);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(std::string("Invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!data.contains("n_ctx")) {
+            res->error(format_error_response("missing n_ctx", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        server_task task(SERVER_TASK_TYPE_CTX_RESIZE);
+        task.id = res->rd.get_new_id();
+        task.ctx_resize_n_ctx = data.at("n_ctx").get<uint32_t>();
         res->rd.post_task(std::move(task));
 
         auto result = res->rd.next(req.should_stop);
