@@ -332,6 +332,10 @@ struct server_slot {
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else {
+            // a whole-state restore is valid cache coverage for hybrid /
+            // recurrent memories (see the do_reset gate in update_slots)
+            prompt_restored = true;
         }
 
         return res;
@@ -347,6 +351,12 @@ struct server_slot {
 
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
+
+    // set when the prompt KV was restored as a whole state (prompt cache or
+    // slot file); the do_reset gate consumes it - for hybrid/recurrent
+    // memories seq_pos_min() can never return to 0, so a restored state must
+    // be trusted even though no checkpoint covers the front
+    bool prompt_restored = false;
 
     // sampling
     json json_schema;
@@ -2779,6 +2789,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->prompt_restored = true; // whole-state restore = cache coverage (hybrid/recurrent)
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3641,7 +3652,37 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                if (slot.prompt_restored) {
+                                    // a whole-state restore (prompt cache RAM/disk, slot
+                                    // file) IS cache coverage for hybrid/recurrent memories:
+                                    // seq_pos_min() is the max across components, so any
+                                    // session deeper than the SWA window reports pos_min > 0
+                                    // forever and no checkpoint can cover the front. The
+                                    // restored state is exact - but the pre_decode trim
+                                    // seq_rm(n_past) must stay within what the memory can
+                                    // actually roll back, else honest re-prefill.
+                                    slot.prompt_restored = false;
+                                    const int64_t tail = (int64_t) slot.prompt.tokens.size() - n_past;
+                                    bool rollback_ok = true;
+                                    switch (ctx_tgt_seq_rm_type) {
+                                        case COMMON_CONTEXT_SEQ_RM_TYPE_PART:
+                                            break;
+                                        case COMMON_CONTEXT_SEQ_RM_TYPE_RS:
+                                            rollback_ok = tail <= (int64_t) llama_n_rs_seq(ctx_tgt);
+                                            break;
+                                        case COMMON_CONTEXT_SEQ_RM_TYPE_FULL:
+                                        case COMMON_CONTEXT_SEQ_RM_TYPE_NO:
+                                            rollback_ok = tail == 0;
+                                            break;
+                                    }
+                                    if (rollback_ok) {
+                                        SLT_TRC(slot, "restored state accepted as cache coverage (n_past = %d)\n", n_past);
+                                    } else {
+                                        SLT_INF(slot, "restored state diverged beyond rollback depth (tail = %lld), re-processing\n", (long long) tail);
+                                        pos_next = 0;
+                                        n_past   = 0;
+                                    }
+                                } else if (pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),

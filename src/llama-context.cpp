@@ -12,6 +12,9 @@
 #include "llama-ext.h"
 #include "llama.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-sampler.h"
 #include "vitriol-kv-probe.h"
 
@@ -4384,47 +4387,81 @@ uint64_t llama_kv_vitriol_evicted(const struct llama_context * ctx) {
 }
 
 // VITRIOL cooperative-VRAM (2026-10-10): runtime eager-sweep policy surface
-// for the governor (see llama.h). Hybrid memories (non-kv-cache) report 0.
-void llama_kv_vitriol_policy_set(struct llama_context * ctx, float floor_score, int32_t protect_pos) {
-    if (!ctx) {
-        return;
+// for the governor (see llama.h). The daily driver uses an iswa cache
+// (base + SWA components) - fan out to both; plain caches get the direct
+// path; other memory types report 0.
+static llama_memory_t vitriol_memory(const llama_context * ctx) {
+    return ctx ? const_cast<llama_context *>(ctx)->get_memory() : nullptr;
+}
+
+// every KV cache component inside the context's memory, however it is
+// wrapped (plain, iswa, hybrid, hybrid-iswa). Recurrent/indexer components
+// have no VITRIOL policy surface.
+static std::vector<llama_kv_cache *> vitriol_kv_caches(const llama_context * ctx) {
+    std::vector<llama_kv_cache *> out;
+    llama_memory_t mem = vitriol_memory(ctx);
+    if (!mem) {
+        return out;
     }
-    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
-    if (kv) {
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        out.push_back(kv);
+        return out;
+    }
+    llama_kv_cache_iswa * iswa = nullptr;
+    if (auto * h = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        iswa = h->get_mem_attn();
+    } else if (auto * i = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        iswa = i;
+    }
+    if (iswa) {
+        if (auto * base = iswa->get_base()) {
+            out.push_back(base);
+        }
+        if (auto * swa = iswa->get_swa()) {
+            out.push_back(swa);
+        }
+        return out;
+    }
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        if (auto * attn = h->get_mem_attn()) {
+            out.push_back(attn);
+        }
+    }
+    return out;
+}
+
+void llama_kv_vitriol_policy_set(struct llama_context * ctx, float floor_score, int32_t protect_pos) {
+    for (auto * kv : vitriol_kv_caches(ctx)) {
         kv->vitriol_policy_set(floor_score, protect_pos);
     }
 }
 
 void llama_kv_vitriol_policy_get(const struct llama_context * ctx, float * floor_score, int32_t * protect_pos) {
-    if (!ctx || !floor_score || !protect_pos) {
-        return;
-    }
-    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
-    if (kv) {
+    if (auto * kv = vitriol_kv_caches(ctx).empty() ? nullptr : vitriol_kv_caches(ctx).front()) {
         kv->vitriol_policy_get(*floor_score, *protect_pos);
     }
 }
 
 uint32_t llama_kv_vitriol_sweep(struct llama_context * ctx) {
-    if (!ctx) {
-        return 0;
+    uint32_t total = 0;
+    for (auto * kv : vitriol_kv_caches(ctx)) {
+        total += kv->vitriol_policy_sweep();
     }
-    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
-    return kv ? kv->vitriol_policy_sweep() : 0;
+    return total;
 }
 
 uint32_t llama_kv_vitriol_resident(const struct llama_context * ctx) {
-    if (!ctx) {
-        return 0;
+    uint32_t total = 0;
+    for (auto * kv : vitriol_kv_caches(ctx)) {
+        total += kv->vitriol_resident_cells();
     }
-    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
-    return kv ? kv->vitriol_resident_cells() : 0;
+    return total;
 }
 
 size_t llama_kv_vitriol_buffer_bytes(const struct llama_context * ctx) {
-    if (!ctx) {
-        return 0;
+    size_t total = 0;
+    for (auto * kv : vitriol_kv_caches(ctx)) {
+        total += kv->vitriol_buffer_bytes();
     }
-    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
-    return kv ? kv->vitriol_buffer_bytes() : 0;
+    return total;
 }
