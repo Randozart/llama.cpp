@@ -41,7 +41,16 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+
+    // d2t: draft-to-target vocab mapping (FastMTP/d2t draft models have a
+    // trimmed output head; the d2t tensor maps draft rows to target token ids)
+    int64_t n_vocab_out = n_vocab;
+    const struct ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t");
+    if (d2t_meta) {
+        n_vocab_out = d2t_meta->ne[0];
+        d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_vocab_out }, 0);
+    }
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_out }, TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {

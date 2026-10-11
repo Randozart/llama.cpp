@@ -3,6 +3,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "gguf.h"
 #include "llama.h"
 #include "log.h"
 #include "ngram-cache.h"
@@ -1339,6 +1340,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     int32_t n_embd = 0;
 
+    // d2t: draft-to-target vocab mapping (FastMTP/d2t draft models have a
+    // trimmed output head; d2t maps draft row -> target token id)
+    std::vector<int32_t> d2t_table;
+
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
     //   chain_heads (step35): n_mtp_layers trained heads, one per draft step.
@@ -1391,6 +1396,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+
+        // load d2t mapping from the draft GGUF if present (FastMTP trimmed head)
+        if (!this->params.mparams.path.empty()) {
+            gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ nullptr };
+            gguf_context * gctx = gguf_init_from_file(this->params.mparams.path.c_str(), gp);
+            if (gctx) {
+                int64_t tid = gguf_find_tensor(gctx, "d2t");
+                if (tid >= 0) {
+                    int64_t ne = gguf_get_tensor_ne(gctx, tid)[0];
+                    size_t t_off = gguf_get_tensor_offset(gctx, tid);
+                    size_t d_off = gguf_get_data_offset(gctx);
+                    FILE * f = fopen(this->params.mparams.path.c_str(), "rb");
+                    if (f) {
+                        fseek(f, d_off + t_off, SEEK_SET);
+                        d2t_table.resize(ne);
+                        fread(d2t_table.data(), sizeof(int32_t), ne, f);
+                        fclose(f);
+                        SPC_TRC("loaded d2t mapping: %lld entries\n", (long long) ne);
+                    }
+                }
+                gguf_free(gctx);
+            }
+        }
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1680,7 +1708,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
+                if (!d2t_table.empty() && id >= 0 && (size_t) id < d2t_table.size()) {
+                    id = d2t_table[id];
+                }
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
