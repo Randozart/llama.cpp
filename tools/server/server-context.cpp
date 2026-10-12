@@ -3665,6 +3665,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
+                                bool restored_covered = false;
                                 if (slot.prompt_restored) {
                                     // a whole-state restore (prompt cache RAM/disk, slot
                                     // file) IS cache coverage for hybrid/recurrent memories:
@@ -3673,29 +3674,31 @@ private:
                                     // forever and no checkpoint can cover the front. The
                                     // restored state is exact - but the pre_decode trim
                                     // seq_rm(n_past) must stay within what the memory can
-                                    // actually roll back, else honest re-prefill.
+                                    // actually roll back; deeper divergence falls through to
+                                    // the checkpoint search below (the ring's rehydrated
+                                    // checkpoint covers the restored front and handles it
+                                    // cheaply), and if the ring is empty, honest re-prefill.
                                     slot.prompt_restored = false;
                                     const int64_t tail = (int64_t) slot.prompt.tokens.size() - n_past;
-                                    bool rollback_ok = true;
                                     switch (ctx_tgt_seq_rm_type) {
                                         case COMMON_CONTEXT_SEQ_RM_TYPE_PART:
+                                            restored_covered = true;
                                             break;
                                         case COMMON_CONTEXT_SEQ_RM_TYPE_RS:
-                                            rollback_ok = tail <= (int64_t) llama_n_rs_seq(ctx_tgt);
+                                            restored_covered = tail <= (int64_t) llama_n_rs_seq(ctx_tgt);
                                             break;
                                         case COMMON_CONTEXT_SEQ_RM_TYPE_FULL:
                                         case COMMON_CONTEXT_SEQ_RM_TYPE_NO:
-                                            rollback_ok = tail == 0;
+                                            restored_covered = tail == 0;
                                             break;
                                     }
-                                    if (rollback_ok) {
+                                    if (restored_covered) {
                                         SLT_TRC(slot, "restored state accepted as cache coverage (n_past = %d)\n", n_past);
                                     } else {
-                                        SLT_INF(slot, "restored state diverged beyond rollback depth (tail = %lld), re-processing\n", (long long) tail);
-                                        pos_next = 0;
-                                        n_past   = 0;
+                                        SLT_INF(slot, "restored state diverged beyond rollback depth (tail = %lld), trying checkpoint ring\n", (long long) tail);
                                     }
-                                } else if (pos_min >= pos_min_thold) {
+                                }
+                                if (!restored_covered && pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
