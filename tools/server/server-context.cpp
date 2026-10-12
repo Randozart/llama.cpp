@@ -880,6 +880,11 @@ public:
         }
     }
 
+    // invoked at the end of update_slots() on the task thread; used by the
+    // routes layer to refresh the cached /metrics copy without a queue wait
+    std::function<void()> callback_post_update_slots = nullptr;
+    int64_t t_last_metrics_refresh    = 0;
+
     server_metrics get_metrics() const {
         auto m = metrics;
         m.n_kv_ejected = ctx_tgt ? llama_kv_vitriol_evicted(ctx_tgt) : 0;
@@ -1564,6 +1569,14 @@ private:
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
+            // refresh the cached /metrics copy on the task thread (the
+            // counters are plain members; only this thread may read them
+            // consistently). Throttled: dashboards poll at ~1 Hz.
+            if (callback_post_update_slots
+                    && ggml_time_ms() - t_last_metrics_refresh >= 1000) {
+                t_last_metrics_refresh = ggml_time_ms();
+                callback_post_update_slots();
+            }
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -3742,12 +3755,29 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
+                        slot.prompt.tokens.keep_first(n_past);
+
+                        // truncate any tokens that are beyond n_past for this slot
+                        const llama_pos p0 = slot.prompt.tokens.pos_next();
+
+                        SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
+
+                        if (!slot.mem.seq_rm(slot.id, p0, -1)) {
+                            // Hybrid recurrent state can only roll back n_rs_seq
+                            // tokens; a denied rollback (e.g. the [TAG_PROMPT_LOGITS]
+                            // guard above rewinding more than that) leaves the
+                            // memory inconsistent with the kept prefix. Clear the
+                            // whole sequence and re-prefill the task from zero.
+                            SLT_WRN(slot, "memory_seq_rm [%d, end) failed - resetting sequence %d for full re-prefill\n", p0, slot.id);
+                            slot.mem.seq_rm(slot.id, -1, -1);
+                            slot.prompt.tokens.keep_first(0);
+                            n_past = 0;
+                        }
+
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
                         metrics.add_prompt_cached(n_past);
-
-                        slot.prompt.tokens.keep_first(n_past);
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -3771,13 +3801,6 @@ private:
                     // note: the prompt timing is advanced in post_decode(), so it does not cover
                     //       the tokens added to the batch below
                     slot.print_timings_pp();
-
-                    // truncate any tokens that are beyond n_past for this slot
-                    const llama_pos p0 = slot.prompt.tokens.pos_next();
-
-                    SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
-
-                    slot.mem.seq_rm(slot.id, p0, -1);
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -4888,6 +4911,15 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
     queue_tasks.on_sleeping_state([this](bool is_sleeping) {
         update_cached_responses(is_sleeping);
     });
+
+    // 2026-10-12: refresh the cached /metrics copy on task-thread iterations.
+    // The sleeping-state refresh never fires on always-on servers, which left
+    // every accumulated counter at zero in the served copy (only the live-read
+    // gauges moved). Throttled inside the hook.
+    this->ctx_server.callback_post_update_slots = [this]() {
+        std::unique_lock<std::mutex> lock(mutex_cache);
+        cached_metrics = this->ctx_server.get_metrics();
+    };
 }
 
 static json get_res_model_info(const server_context_meta & meta) {
