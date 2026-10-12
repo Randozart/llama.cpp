@@ -409,6 +409,30 @@ if __name__ == '__main__':
 
             lora_alpha: float
 
+            _reorder_v_heads_plain = staticmethod(getattr(model_class, "_reorder_v_heads", None))
+
+            @staticmethod
+            def _reorder_v_heads(tensor, dim, num_k_heads, num_v_per_k, head_dim):
+                if isinstance(tensor, LoraTorchTensor):
+                    if LoraModel._reorder_v_heads_plain is None:
+                        raise NotImplementedError
+                    shape = tensor.shape
+                    if dim < 0:
+                        dim += len(shape)
+                    if len(shape) == 2 and dim == 0:
+                        b = LoraModel._reorder_v_heads_plain(tensor._lora_B, 0, num_k_heads, num_v_per_k, head_dim)
+                        return LoraTorchTensor(tensor._lora_A, b)
+                    if len(shape) == 2 and dim == 1:
+                        a = tensor._lora_A
+                        r = a.shape[-2]
+                        a = a.reshape(r, num_k_heads, num_v_per_k, head_dim)
+                        a = a.permute(0, 2, 1, 3).contiguous().reshape(r, -1)
+                        return LoraTorchTensor(a, tensor._lora_B)
+                    raise NotImplementedError
+                if LoraModel._reorder_v_heads_plain is None:
+                    raise NotImplementedError
+                return LoraModel._reorder_v_heads_plain(tensor, dim, num_k_heads, num_v_per_k, head_dim)
+
             def __init__(self, *args, dir_lora_model: Path, lora_alpha: float, **kwargs):
 
                 super().__init__(*args, **kwargs)
